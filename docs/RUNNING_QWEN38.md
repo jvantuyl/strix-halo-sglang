@@ -64,10 +64,13 @@ python3 -m sglang.launch_server \
     --ple-offload-embedding \
     --ple-offload-backend file --ple-offload-dir /ple \
     --mem-fraction-static 0.85 --context-length 32768 \
+    --kv-cache-dtype fp8_e4m3 --max-total-tokens 262144 \
     --attention-backend triton --cuda-graph-max-bs-decode 8 \
     --mamba-ssm-dtype bfloat16 \
     --reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder
 ```
+
+with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the environment.
 
 with `SGLANG_FORCE_NATIVE_LAYERNORM=1 SGLANG_USE_AITER=0
 SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1 PYTORCH_TUNABLEOP_TUNING=0` in the
@@ -88,6 +91,7 @@ on local NVMe: it is random-read during decode.
 | `--ple-offload-backend file --ple-offload-dir /ple` | The table becomes a sparse file-backed `mmap`; rows are read through the page cache on demand and the resident set is trimmed (8 GiB cap by default). The first boot writes the table (~48 GiB) and arms a completion marker (`<table>.complete.json`, fingerprinted by the checkpoint index and PLE shard sizes); later boots skip the PLE shards while the marker matches. Delete the marker to force a rewrite. |
 | `SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1` | Upstream gates the file backend on `cudaDevAttrPageableMemoryAccessUsesHostPageTables` (GB10). Irrelevant here: patch 11 gathers on the CPU, the GPU never dereferences the mapping. |
 | `--attention-backend triton` | Same as every other model on this box; aiter's CK paths are CDNA-only. |
+| `--kv-cache-dtype fp8_e4m3 --max-total-tokens 262144` | fp8 KV halves the pool; the token cap keeps the saving as headroom instead of a larger pool (see Memory). `QWEN38_KV_DTYPE` / `QWEN38_MAX_TOTAL_TOKENS` override. |
 | `--cuda-graph-max-bs-decode 8` | Decode graphs for bs 1–8 (0.39 GB). Patch 14 fills the PLE prefetch buffer from the host before each replay. Note this upstream split the flag: a bare `--cuda-graph-max-bs` is rejected as ambiguous. `QWEN38_CUDA_GRAPH_MAX_BS` overrides. |
 | `--mamba-ssm-dtype bfloat16` | The GDN recurrent state is fp32 by default: 5.4 GB for 50 slots, which caps `max_running_requests` at 10 (5 slots per request). bf16 halves it to 20 requests in the same memory. Upstream's own suggestion in the startup log. |
 | `--reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder` | The chat template opens `<think>` in the generation prompt and asks for `<tool_call><function=...><parameter=...>` tool calls. Without these the thinking and the XML come back as plain `content`. |
@@ -136,18 +140,36 @@ which the PLE table must *not* fill; the file backend's RSS trimmer keeps it
 near the 8 GiB cap). Measure with `amdgpu_top --json --dump`
 (`VRAM.Total VRAM Usage`).
 
-Measured with the default flags: weights 75.9 GiB after `load_weights`,
-KV cache 6.1 GiB (267k tokens bf16; only the 12 full-attention layers hold
-KV, ~24 KB/token, so one full 262k-token request fits), GDN state 5.4 GiB in
-fp32 (50 slots → `max_running_requests` 10; 2.7 GiB / 20 requests with
-`--mamba-ssm-dtype bfloat16`), 93.8 GiB VRAM in use once serving.
+Measured: weights 75.9 GiB after `load_weights` (the vision tower is ~0.9
+GiB of that), KV cache 3.0 GiB (262,144 tokens fp8; only the 12
+full-attention layers hold KV, ~12 KB/token in fp8, so one full 262k-token
+request fits), GDN state 2.7 GiB in bf16 (~100 slots → 19–20 requests).
 Scheduler RSS ≈ 2.9 GB; host `buff/cache` holds the PLE pages.
 
-Note that torch reports a bogus total capacity on this ROCm build
-(`avail mem=11.9 GB` in the log while 20 GiB of VRAM is actually free); the
-KV/mamba pools were sized sensibly anyway with `--mem-fraction-static 0.85`.
-If you need more concurrent requests, raise `--max-mamba-cache-size` rather
-than `--mem-fraction-static`.
+The `avail mem` figure in the log is not headroom on this ROCm build:
+PyTorch sits at ~95 of 96 GiB once serving (a 1,650-token prefill under MTP
+OOMed with `avail mem=13 GB` printed). Lowering `--mem-fraction-static`
+does not create headroom either, the budget just moves into the KV/mamba
+pools. What does:
+
+| Change | Saves | Cost | Default |
+|---|---:|---|---|
+| `--kv-cache-dtype fp8_e4m3` | half the KV pool | none measured: identical greedy answers, exact needle recall in a 3,858-token prompt, decode 12.9 tok/s | on |
+| `--max-total-tokens 262144` | ~3.2 GiB vs the fraction-sized pool | one full-context request or 8 × 32k still fit | on |
+| `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | fragmentation | none | on |
+| vision tower off (`QWEN38_VISION=0` / `QWEN38_MODEL_OVERRIDE='{"language_model_only": true}'`) | ~0.9 GiB (333 tensors skipped) | no image input | off |
+| `--max-mamba-cache-size N` | 27 MB per slot (bf16) | 5 slots per request under MTP, 1 otherwise | fraction-sized |
+
+`--language-model-only` itself is whitelisted to three unrelated
+architectures in this upstream; the model code supports it, so the override
+sets `language_model_only` on the HF config instead.
+
+Not worth doing: pruning East Asian tokens from the vocabulary. 65,932 of
+248,077 tokens (26.6%) contain CJK, kana or hangul, but `embed_tokens` and
+`lm_head` are 1.18 GiB each in bf16, so the whole prune saves ~0.63 GiB.
+It also needs a checkpoint rewrite, BPE merge surgery, and, because the PLE
+n-gram table is indexed by hashes of token ids, an id-remap in front of the
+hash (or the 51B table is wrong for every renumbered token).
 
 ## Measured performance
 
@@ -215,6 +237,8 @@ concurrent streams, 6302-token prompt with radix-cache reuse.
 
 ## Known limitations
 
+- The "avail mem" log figure is not headroom; see Memory before adding
+  anything that allocates.
 - Prefill runs eager (upstream disables prefill graphs for this model).
 - First boot writes the 48 GiB PLE table; the `pinned` backend is not an
   option here (host RAM is the same pool).

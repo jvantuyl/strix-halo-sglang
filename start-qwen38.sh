@@ -29,6 +29,10 @@
 #     more.
 #   - The Triton/JIT kernel cache is persisted in $SGL_CACHE_DIR so restarts
 #     do not recompile every kernel.
+#   - KV cache is fp8_e4m3 (verified: identical answers, exact needle recall
+#     at 3.9k tokens, same decode speed) and capped at 262144 tokens so the
+#     halved pool becomes headroom (~3 GB) instead of a bigger pool. The
+#     allocator uses expandable segments; headroom on this box is thin.
 
 set -euo pipefail
 
@@ -44,6 +48,14 @@ SGL_CACHE_DIR="${SGL_CACHE_DIR:-$HOME/.cache/strix-halo-sglang-cache}"
 TUNABLEOP_TUNING="${SGLANG_TUNABLEOP_TUNING:-0}"
 MEM_FRAC="${SGLANG_MEM_FRAC:-0.85}"
 CONTEXT="${SGLANG_CONTEXT:-32768}"
+KV_DTYPE="${QWEN38_KV_DTYPE:-fp8_e4m3}"
+MAX_TOTAL_TOKENS="${QWEN38_MAX_TOTAL_TOKENS:-262144}"
+ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# QWEN38_VISION=0 skips the vision tower (~0.9 GB of weights, text-only API).
+MODEL_OVERRIDE='{}'
+if [ "${QWEN38_VISION:-1}" = "0" ]; then
+    MODEL_OVERRIDE='{"language_model_only": true}'
+fi
 
 test -d "$MODEL_DIR" || { echo "missing $MODEL_DIR (run tools/convert_ple_fp8.py first)" >&2; exit 1; }
 mkdir -p "$PLE_DIR" "$HF_CACHE" "$TUNABLE_DIR" "$SGL_CACHE_DIR"
@@ -66,6 +78,7 @@ exec docker run --name "$NAME" \
     -v "$SGL_CACHE_DIR:/root/.cache/sglang" \
     -e HF_TOKEN="${HF_TOKEN:-}" \
     -e PYTORCH_TUNABLEOP_TUNING="$TUNABLEOP_TUNING" \
+    -e PYTORCH_CUDA_ALLOC_CONF="$ALLOC_CONF" \
     -e SGLANG_FORCE_NATIVE_LAYERNORM=1 \
     -e SGLANG_USE_AITER=0 \
     -e SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1 \
@@ -79,6 +92,9 @@ exec docker run --name "$NAME" \
         --ple-offload-dir /ple \
         --mem-fraction-static "$MEM_FRAC" \
         --context-length "$CONTEXT" \
+        --kv-cache-dtype "$KV_DTYPE" \
+        --max-total-tokens "$MAX_TOTAL_TOKENS" \
+        --json-model-override-args "$MODEL_OVERRIDE" \
         --attention-backend triton \
         --cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS" \
         --mamba-ssm-dtype bfloat16 \

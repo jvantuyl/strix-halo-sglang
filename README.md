@@ -29,7 +29,7 @@ Tested on Fedora 43 host, ROCm 7.13 nightly, PyTorch 2.13.
 | `cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4` | ❌ | — | — | 4-bit (compressed-tensors wNa16) calls `gptq_marlin_repack`, which is NVIDIA-only — same wall as the GPTQ row below. Run the BF16 model above instead. |
 | `cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit` | ✅ | ✅ | ~23 GB | Mamba+MoE hybrid; needs `--max-total-tokens N --max-mamba-cache-size M` to fit. See [docs/RUNNING_AWQ_MOE.md](docs/RUNNING_AWQ_MOE.md). |
 | `Qwen/Qwen3.5-35B-A3B-GPTQ-Int4` | ❌ | — | — | GPTQ-on-MoE needs the `gptq_marlin` backend, which is NVIDIA-only today. Use the AWQ variant above instead. |
-| `cyankiwi/Qwen3.8-Flash-Next-AWQ-INT4` | ✅ | ✅ | ~94 GB + PLE on disk | Qwen4-Exp hybrid GDN + sparse attention MoE with a 51B n-gram (PLE) table. The table is converted to fp8 and read from a file on demand, never resident. Needs a 128 GB box with 96 GB VRAM carved out. 13 tps single-stream, 43 tps at 8 concurrent, ~500 tps prefill (decode CUDA graphs on). Chat, thinking, tool calls and vision verified. See [docs/RUNNING_QWEN38.md](docs/RUNNING_QWEN38.md). |
+| `cyankiwi/Qwen3.8-Flash-Next-AWQ-INT4` | ✅ | ✅ | ~91 GB + PLE on disk | Qwen4-Exp hybrid GDN + sparse attention MoE with a 51B n-gram (PLE) table. The table is converted to fp8 and read from a file on demand, never resident. Needs a 128 GB box with 96 GB VRAM carved out. 13 tps single-stream, 43 tps at 8 concurrent, ~500 tps prefill (decode CUDA graphs on). Chat, thinking, tool calls and vision verified. See [docs/RUNNING_QWEN38.md](docs/RUNNING_QWEN38.md). |
 
 Hardware tested: AMD Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 61.7 GB GTT. If you've run this on a different Strix Halo SKU please open an issue with results.
 

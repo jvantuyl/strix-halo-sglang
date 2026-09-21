@@ -71,6 +71,8 @@ services:
       # Tuning benchmarks every GEMM solution per new prompt length (14-20 s
       # of TTFT each); recorded tunings are still used with it off.
       PYTORCH_TUNABLEOP_TUNING: "${SGLANG_TUNABLEOP_TUNING:-0}"
+      # Headroom is thin (~95 of 96 GiB in use); avoid allocator fragmentation.
+      PYTORCH_CUDA_ALLOC_CONF: "${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
     volumes:
       - ${QWEN38_MODEL_DIR:-~/models/Qwen3.8-Flash-Next-AWQ-INT4-ple-fp8}:/models/qwen38:ro
       - ${QWEN38_PLE_DIR:-/opt/llm/ple-cache}:/ple
@@ -99,6 +101,14 @@ services:
       - "${QWEN38_MEM_FRAC:-0.85}"
       - --context-length
       - "${QWEN38_CONTEXT:-32768}"
+      # fp8 KV halves the pool; the cap turns that into ~3 GB of headroom.
+      - --kv-cache-dtype
+      - "${QWEN38_KV_DTYPE:-fp8_e4m3}"
+      - --max-total-tokens
+      - "${QWEN38_MAX_TOTAL_TOKENS:-262144}"
+      # QWEN38_MODEL_OVERRIDE='{"language_model_only": true}' drops the vision tower.
+      - --json-model-override-args
+      - '${QWEN38_MODEL_OVERRIDE:-{}}'
       - --attention-backend
       - triton
       - --cuda-graph-max-bs-decode
