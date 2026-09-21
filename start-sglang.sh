@@ -47,5 +47,5 @@ exec docker run -d --name "$NAME" \
         --mem-fraction-static "$MEM_FRAC" \
         --context-length "$CONTEXT" \
         --attention-backend triton \
-        --cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS" \
+        --cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS" \
         "$@"
