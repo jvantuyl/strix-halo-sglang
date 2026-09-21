@@ -18,6 +18,7 @@ group 32, asymmetric; vision tower unquantized). MTP is not used.
 | [11](../patches/11-qwen4-exp-rocm.md) | CPU-side PLE gather, Triton QSA decode route, safe top-k fallback, QSA smem schedule | GPU must not touch host memory; SM121-only kernel gates; JIT top-k reads OOB; 64 KB workgroup smem cap |
 | [12](../patches/12-wna16-triton-zp.md) | Pass zero points to the Triton WNA16 MoE kernel; load-time zp transpose; GC between MoE layers in post-load | Asymmetric AWQ; without it every expert weight is off by `(8 - zp) * scale`. Without the GC the old expert weights of every converted layer stay allocated (~1.4 GiB each) and the 48-layer load OOMs |
 | [13](../patches/13-ple-table-reuse.md) | Reuse the file-backed PLE table across boots | Upstream rewrites the 48 GiB table from the checkpoint on every start; a fingerprinted marker lets later boots skip the PLE shards |
+| [14](../patches/14-cuda-graph-ple.md) | Decode CUDA graphs with the CPU-side PLE gather | The host gather cannot be captured; fill the static PLE prefetch buffer from the host before each replay |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 
 Everything else (GDN, QSA prefill/indexer, HyperConnections, fused sigmoid-mul,
@@ -63,7 +64,7 @@ python3 -m sglang.launch_server \
     --ple-offload-embedding \
     --ple-offload-backend file --ple-offload-dir /ple \
     --mem-fraction-static 0.85 --context-length 32768 \
-    --attention-backend triton --disable-cuda-graph \
+    --attention-backend triton --cuda-graph-max-bs-decode 8 \
     --mamba-ssm-dtype bfloat16 \
     --reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder
 ```
@@ -87,7 +88,7 @@ on local NVMe: it is random-read during decode.
 | `--ple-offload-backend file --ple-offload-dir /ple` | The table becomes a sparse file-backed `mmap`; rows are read through the page cache on demand and the resident set is trimmed (8 GiB cap by default). The first boot writes the table (~48 GiB) and arms a completion marker (`<table>.complete.json`, fingerprinted by the checkpoint index and PLE shard sizes); later boots skip the PLE shards while the marker matches. Delete the marker to force a rewrite. |
 | `SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1` | Upstream gates the file backend on `cudaDevAttrPageableMemoryAccessUsesHostPageTables` (GB10). Irrelevant here: patch 11 gathers on the CPU, the GPU never dereferences the mapping. |
 | `--attention-backend triton` | Same as every other model on this box; aiter's CK paths are CDNA-only. |
-| `--disable-cuda-graph` | The CPU-side PLE gather does a D2H copy of the n-gram ids every step, which cannot be captured. Host-side id generation to re-enable graphs is a phase-2 item. |
+| `--cuda-graph-max-bs-decode 8` | Decode graphs for bs 1–8 (0.39 GB). Patch 14 fills the PLE prefetch buffer from the host before each replay. Note this upstream split the flag: a bare `--cuda-graph-max-bs` is rejected as ambiguous. `QWEN38_CUDA_GRAPH_MAX_BS` overrides. |
 | `--mamba-ssm-dtype bfloat16` | The GDN recurrent state is fp32 by default: 5.4 GB for 50 slots, which caps `max_running_requests` at 10 (5 slots per request). bf16 halves it to 20 requests in the same memory. Upstream's own suggestion in the startup log. |
 | `--reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder` | The chat template opens `<think>` in the generation prompt and asks for `<tool_call><function=...><parameter=...>` tool calls. Without these the thinking and the XML come back as plain `content`. |
 | `PYTORCH_TUNABLEOP_TUNING=0` | The image enables PyTorch TunableOp, which benchmarks every GEMM solution for each *new* M (= tokens in the prefill chunk). That is 14–20 s of TTFT for every novel prompt length (measured; the recorded results persist in `~/.cache/strix-halo-sglang-tunableop` so a repeated length is fast). With tuning off the recorded solutions are still used and untuned shapes take hipBLASLt's heuristic pick. `SGLANG_TUNABLEOP_TUNING=1 ./start-qwen38.sh` to deliberately record more. |
@@ -121,7 +122,7 @@ docker run -d --name mini --device=/dev/kfd --device=/dev/dri --group-add video 
     -e SGLANG_FORCE_NATIVE_LAYERNORM=1 -e SGLANG_USE_AITER=0 -e SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1 \
     strix-halo-sglang:dev python3 -m sglang.launch_server --model-path /models/mini --load-format dummy \
     --host 0.0.0.0 --port 30002 --ple-offload-embedding --ple-offload-backend file --ple-offload-dir /ple \
-    --mem-fraction-static 0.12 --context-length 4096 --attention-backend triton --disable-cuda-graph
+    --mem-fraction-static 0.12 --context-length 4096 --attention-backend triton --cuda-graph-max-bs-decode 8
 ```
 
 Output is noise (random weights) but every path runs: fp8 PLE file table,
@@ -148,7 +149,7 @@ KV/mamba pools were sized sensibly anyway with `--mem-fraction-static 0.85`.
 If you need more concurrent requests, raise `--max-mamba-cache-size` rather
 than `--mem-fraction-static`.
 
-## Measured performance (phase 1, eager)
+## Measured performance
 
 Single box, no other GPU tenant, PLE table on local NVMe, radix cache
 flushed before every prefill measurement (streaming client, `max_tokens`
@@ -156,33 +157,39 @@ flushed before every prefill measurement (streaming client, `max_tokens`
 
 | Prompt tokens | TTFT | Prefill | Decode (bs=1) |
 |---:|---:|---:|---:|
-| 183 | 1.5 s | 120 tok/s (fixed overhead dominates) | 11.2 tok/s |
-| 1,650 | 3.5 s | 474 tok/s | 10.9 tok/s |
-| 6,693 | 12.9 s | 519 tok/s | 11.2 tok/s |
-| 26,983 | 58.9 s | 458 tok/s | 10.8 tok/s |
+| 183 | 1.0 s | 192 tok/s (fixed overhead dominates) | 12.7 tok/s |
+| 1,650 | 3.1 s | 539 tok/s | 12.6 tok/s |
+| 6,693 | 13.3 s | 505 tok/s | 12.8 tok/s |
+| 26,983 (eager run) | 58.9 s | 458 tok/s | 10.8 tok/s |
 
 | Concurrency (short prompts, 200 tokens each) | Aggregate | Per stream | TTFT (max) |
 |---:|---:|---:|---:|
-| 4 | 24.9 tok/s | 6.7 tok/s | 2.3 s |
-| 8 | 42.9 tok/s | 5.7 tok/s | 2.4 s |
+| 4 | 25.9 tok/s | 6.7 tok/s | 1.4 s |
+| 8 | 42.9 tok/s | 5.6 tok/s | 1.9 s |
+
+Decode graphs (patch 14) took bs=1 from 11.2 to 12.7 tok/s; concurrency
+figures are unchanged from the eager run.
 
 The PLE gather costs about 1 s per 2048 cold tokens (32k rows faulted from
 NVMe, ~35 µs each); rows already in the page cache shave that off (440–520
-tok/s cold vs 550–585 warm). Decode is dispatch-bound at ~11 tok/s: 48
-layers in eager mode plus one D2H sync per step for the CPU gather. CUDA
-graphs are the phase-2 lever; nothing in this table is memory-bandwidth
-bound yet.
+tok/s cold vs 550–585 warm). Decode is GPU-bound at ~75 ms per token:
+with graphs on, ~98% of the scheduler's host time is the D2H copy of the
+n-gram ids waiting for the previous replay to finish. The next lever is
+kernel tuning, starting with the MoE Triton config (see below); nothing in
+this table is memory-bandwidth bound yet.
 
 Verified end to end: chat with thinking (`reasoning_content` split out),
 structured tool calls (`finish_reason: tool_calls`), vision (exact OCR of
 rendered text plus shape/color identification, 128 image tokens), 8
 concurrent streams, 6302-token prompt with radix-cache reuse.
 
-## Known limitations (phase 1)
+## Known limitations
 
-- No CUDA graphs (see above); decode is dispatch-bound at small batch.
+- Prefill runs eager (upstream disables prefill graphs for this model).
 - First boot writes the 48 GiB PLE table; the `pinned` backend is not an
   option here (host RAM is the same pool).
 - MoE Triton configs for `E=512, N=640, int4_w4a16` are not tuned yet
   (`Using default MoE kernel config` warning).
-- MTP / speculative decoding is untested.
+- MTP / speculative decoding (`--speculative-algorithm NEXTN`) is only
+  smoke-tested with dummy weights (graphs captured, requests complete); not
+  measured on the real checkpoint.

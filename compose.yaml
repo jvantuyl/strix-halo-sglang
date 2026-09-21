@@ -101,7 +101,8 @@ services:
       - "${QWEN38_CONTEXT:-32768}"
       - --attention-backend
       - triton
-      - --disable-cuda-graph
+      - --cuda-graph-max-bs-decode
+      - "${QWEN38_CUDA_GRAPH_MAX_BS:-8}"
       - --mamba-ssm-dtype
       - bfloat16
       - --reasoning-parser
