@@ -162,6 +162,13 @@ RUN python3 /tmp/patch_wna16_zp.py && rm /tmp/patch_wna16_zp.py
 COPY patches/patch_ple_table_reuse.py /tmp/patch_ple_table_reuse.py
 RUN python3 /tmp/patch_ple_table_reuse.py && rm /tmp/patch_ple_table_reuse.py
 
+# --- CUDA graphs with the CPU-side PLE gather (patch 14) ---
+# Patch 11's host gather cannot be recorded into a graph. Fill the static PLE
+# prefetch buffer from the host before each decode replay instead; the graph
+# only reads it. Anchors on patch 11. See patches/14-cuda-graph-ple.md.
+COPY patches/patch_cuda_graph_ple.py /tmp/patch_cuda_graph_ple.py
+RUN python3 /tmp/patch_cuda_graph_ple.py && rm /tmp/patch_cuda_graph_ple.py
+
 # --- idle scheduler sleeps instead of spinning a core (patch 10) ---
 # Upstream busy-polls its ZMQ sockets while idle, pinning one CPU core at 100%
 # forever (Tctl 38 -> 71 C on an idle Strix Halo). Default --sleep-on-idle to on;
