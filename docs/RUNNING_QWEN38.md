@@ -178,6 +178,36 @@ n-gram ids waiting for the previous replay to finish. The next lever is
 kernel tuning, starting with the MoE Triton config (see below); nothing in
 this table is memory-bandwidth bound yet.
 
+### Speculative decoding (MTP)
+
+The checkpoint ships one MTP layer; `--speculative-algorithm NEXTN` loads it
+as the draft model (+70 s load, 0.2 GB) and captures target-verify and draft
+graphs. It needs real headroom: the mamba pool grows a 2.3 GB
+`intermediate_ssm_state_cache` and the eager GDN prefill then OOMs on
+prompts over ~1k tokens at the default pool sizes (lowering
+`--mem-fraction-static` does not help, the budget just moves into the pools).
+Cap the pools instead:
+
+```bash
+./start-qwen38.sh --speculative-algorithm NEXTN --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+    --max-total-tokens 131072 --max-mamba-cache-size 30
+```
+
+| Prompt tokens | TTFT | Prefill | Decode (bs=1) |
+|---:|---:|---:|---:|
+| 183 | 1.2 s | 150 tok/s | 18.7 tok/s |
+| 1,650 | 3.3 s | 499 tok/s | 17.2 tok/s |
+| 6,693 | 13.9 s | 481 tok/s | 18.5 tok/s |
+| 26,983 | 59.8 s | 451 tok/s | 18.8 tok/s |
+
+Mean accept length 2.7 of 4 draft tokens (accept rate 0.55) on the summary
+prompts above; +45% single-stream decode over plain graphs. 4 concurrent:
+29.5 tok/s aggregate (vs 27.4). `--max-mamba-cache-size 30` allows 6
+concurrent requests (5 slots each), so 8 streams queue (31.5 tok/s
+aggregate, 32 s worst TTFT vs 43.0 tok/s without MTP). Not on by default:
+it trades concurrency for single-stream speed.
+
 Verified end to end: chat with thinking (`reasoning_content` split out),
 structured tool calls (`finish_reason: tool_calls`), vision (exact OCR of
 rendered text plus shape/color identification, 128 image tokens), 8
@@ -190,6 +220,4 @@ concurrent streams, 6302-token prompt with radix-cache reuse.
   option here (host RAM is the same pool).
 - MoE Triton configs for `E=512, N=640, int4_w4a16` are not tuned yet
   (`Using default MoE kernel config` warning).
-- MTP / speculative decoding (`--speculative-algorithm NEXTN`) is only
-  smoke-tested with dummy weights (graphs captured, requests complete); not
-  measured on the real checkpoint.
+- MTP needs the pool caps above; without them prefill OOMs past ~1k tokens.
