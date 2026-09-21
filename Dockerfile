@@ -155,6 +155,13 @@ RUN python3 /tmp/patch_qwen4_exp_rocm.py && rm /tmp/patch_qwen4_exp_rocm.py
 COPY patches/patch_wna16_zp.py /tmp/patch_wna16_zp.py
 RUN python3 /tmp/patch_wna16_zp.py && rm /tmp/patch_wna16_zp.py
 
+# --- reuse the file-backed PLE table across boots (patch 13) ---
+# Upstream rewrites the whole 48 GiB table from the checkpoint on every start.
+# Record a fingerprinted completion marker and skip the PLE shards when it
+# matches. See patches/13-ple-table-reuse.md.
+COPY patches/patch_ple_table_reuse.py /tmp/patch_ple_table_reuse.py
+RUN python3 /tmp/patch_ple_table_reuse.py && rm /tmp/patch_ple_table_reuse.py
+
 # --- idle scheduler sleeps instead of spinning a core (patch 10) ---
 # Upstream busy-polls its ZMQ sockets while idle, pinning one CPU core at 100%
 # forever (Tctl 38 -> 71 C on an idle Strix Halo). Default --sleep-on-idle to on;
