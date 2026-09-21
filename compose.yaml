@@ -102,6 +102,8 @@ services:
       - --attention-backend
       - triton
       - --disable-cuda-graph
+      - --mamba-ssm-dtype
+      - bfloat16
       - --reasoning-parser
       - qwen3-thinking
       - --tool-call-parser

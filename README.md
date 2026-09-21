@@ -117,10 +117,11 @@ Plus **patch 9**, which unlocks Quark/MXFP4 checkpoints on gfx1151:
 
 Together with [`tools/quantize_nonexpert.py`](tools/quantize_nonexpert.py) they take Qwen3.5-35B-A3B from **3.70 GB to 1.69 GB streamed per decode token** — just under Ollama's ~1.8 GB — and, with the [tuned MoE config](configs/moe/), single-stream from **23.4 → 39.6 tps (+69%)** and 8-stream from 127.0 → **199.3 tps (+52%)**. That brings single-stream to **parity with Ollama (1.06×)** and **4.76× at 8 concurrent**. Both engines re-measured in one session, one at a time. ⚠️ The single-stream margin is small and my checkpoint is quantized more aggressively than Ollama's Q4_K_M (21 GB vs 26 GB resident) with **no quality evaluation done** — treat it as parity, not a win.
 
-Plus **patches 11 and 12**, which bring Qwen3.8-Flash-Next (Qwen4-Exp) up on gfx1151:
+Plus **patches 11, 12 and 13**, which bring Qwen3.8-Flash-Next (Qwen4-Exp) up on gfx1151:
 
 11. **[Qwen4-Exp on ROCm](patches/11-qwen4-exp-rocm.md)** — the PLE n-gram table gather is moved to the CPU (the GPU must not dereference host memory here), QSA decode is routed to upstream's pure-Triton kernel (registry-gated to SM121) with a 64 KB shared-memory schedule, and the JIT top-k kernel (which reads out of bounds on RDNA 3.5 and poisons the HIP queue) is bypassed. Apply with [`patches/patch_qwen4_exp_rocm.py`](patches/patch_qwen4_exp_rocm.py).
 12. **[WNA16 Triton MoE zero points](patches/12-wna16-triton-zp.md)** — the ROCm compressed-tensors MoE path dropped the asymmetric zero points, so every expert weight was off by `(8 - zp) * scale`; the loader also left them untransposed, and post-load weight conversion leaked ~1.4 GiB of dead expert weights per MoE layer (OOM at layer ~14 of 48) until a GC is run between layers. Apply with [`patches/patch_wna16_zp.py`](patches/patch_wna16_zp.py).
+13. **[PLE table reuse](patches/13-ple-table-reuse.md)** — upstream rewrites the 48 GiB file-backed PLE table from the checkpoint on every start. A fingerprinted completion marker lets later boots skip the PLE shards entirely. Apply with [`patches/patch_ple_table_reuse.py`](patches/patch_ple_table_reuse.py).
 
 Note: with the current upstream pin, patch 1 (gfx1151 arch guard) and patch 4 (wave32 `WARP_SIZE`) are applied by upstream's own [`docker/patches/sgl-kernel-gfx1151.sh`](patches/sgl-kernel-gfx1151.sh) (vendored here), patch 3 is no longer needed (upstream auto-routes ROCm compressed-tensors MoE to the Triton path), and patch 5 was fixed upstream.
 

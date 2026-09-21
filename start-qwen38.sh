@@ -14,8 +14,11 @@
 #
 # Phase 1 notes:
 #   - CUDA graphs are off: the CPU-side PLE gather D2H-syncs every step.
-#   - The PLE table file (~48 GiB fp8, sparse) is rewritten on every boot and
-#     random-read during decode; keep $PLE_DIR on local NVMe.
+#   - The PLE table file (~48 GiB fp8, sparse) is written on the first boot,
+#     reused on later ones (patch 13) and random-read during decode; keep
+#     $PLE_DIR on local NVMe.
+#   - --mamba-ssm-dtype bfloat16 halves the GDN recurrent state (5.4 -> 2.7 GB
+#     for 50 slots), so 20 requests can run instead of 10.
 #   - TunableOp *tuning* is off by default (SGLANG_TUNABLEOP_TUNING=0): the
 #     image enables TunableOp, and tuning benchmarks every GEMM solution for
 #     each new prompt length, which cost 14-20 s of TTFT per novel length.
@@ -75,6 +78,7 @@ exec docker run --name "$NAME" \
         --context-length "$CONTEXT" \
         --attention-backend triton \
         --disable-cuda-graph \
+        --mamba-ssm-dtype bfloat16 \
         --reasoning-parser qwen3-thinking \
         --tool-call-parser qwen3_coder \
         "$@"
