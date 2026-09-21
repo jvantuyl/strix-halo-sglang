@@ -140,6 +140,13 @@ PYEOF
 RUN PIP_CONSTRAINT=/tmp/rocm-constraints.txt pip install --no-deps -e python \
     && (pip cache purge 2>/dev/null || true)
 
+# --- gfx1151 Qwen4-Exp fixes (patch 11) ---
+# CPU-side PLE gather (the UVA kernel would fault on Strix Halo), QSA decode
+# via the pure-Triton sm121 kernel, fast_topk fallback chain. See
+# patches/11-qwen4-exp-rocm.md.
+COPY patches/patch_qwen4_exp_rocm.py /tmp/patch_qwen4_exp_rocm.py
+RUN python3 /tmp/patch_qwen4_exp_rocm.py && rm /tmp/patch_qwen4_exp_rocm.py
+
 # --- idle scheduler sleeps instead of spinning a core (patch 10) ---
 # Upstream busy-polls its ZMQ sockets while idle, pinning one CPU core at 100%
 # forever (Tctl 38 -> 71 C on an idle Strix Halo). Default --sleep-on-idle to on;
