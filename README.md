@@ -29,6 +29,7 @@ Tested on Fedora 43 host, ROCm 7.13 nightly, PyTorch 2.13.
 | `cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4` | ❌ | — | — | 4-bit (compressed-tensors wNa16) calls `gptq_marlin_repack`, which is NVIDIA-only — same wall as the GPTQ row below. Run the BF16 model above instead. |
 | `cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit` | ✅ | ✅ | ~23 GB | Mamba+MoE hybrid; needs `--max-total-tokens N --max-mamba-cache-size M` to fit. See [docs/RUNNING_AWQ_MOE.md](docs/RUNNING_AWQ_MOE.md). |
 | `Qwen/Qwen3.5-35B-A3B-GPTQ-Int4` | ❌ | — | — | GPTQ-on-MoE needs the `gptq_marlin` backend, which is NVIDIA-only today. Use the AWQ variant above instead. |
+| `cyankiwi/Qwen3.8-Flash-Next-AWQ-INT4` | ✅ | ✅ | ~94 GB + PLE on disk | Qwen4-Exp hybrid GDN + sparse attention MoE with a 51B n-gram (PLE) table. The table is converted to fp8 and read from a file on demand, never resident. Needs a 128 GB box with 96 GB VRAM carved out. 11 tps single-stream, 44 tps at 8 concurrent, ~500 tps prefill (eager, no CUDA graphs). Chat, thinking, tool calls and vision verified. See [docs/RUNNING_QWEN38.md](docs/RUNNING_QWEN38.md). |
 
 Hardware tested: AMD Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 61.7 GB GTT. If you've run this on a different Strix Halo SKU please open an issue with results.
 
@@ -115,6 +116,13 @@ Plus **patch 9**, which unlocks Quark/MXFP4 checkpoints on gfx1151:
 9. **[aiter gfx1151 MXFP4 fix](patches/09-aiter-gfx1151-mxfp4.md)** — aiter's `is_fp4_avail()` only whitelists `gfx950`, and no gfx1151 GEMM configs are shipped (the `gfx950` ones need 100 KB shared memory, RDNA 3.5 only has 64 KB). Baked into the Dockerfile: allows `gfx1151` and generates clamped `gfx1151-*.json` configs from the `gfx950` ones. Verified with `Qwen3.5-27B-Quark-AWQ-MXFP4` on a Ryzen AI Max+ 395.
 
 Together with [`tools/quantize_nonexpert.py`](tools/quantize_nonexpert.py) they take Qwen3.5-35B-A3B from **3.70 GB to 1.69 GB streamed per decode token** — just under Ollama's ~1.8 GB — and, with the [tuned MoE config](configs/moe/), single-stream from **23.4 → 39.6 tps (+69%)** and 8-stream from 127.0 → **199.3 tps (+52%)**. That brings single-stream to **parity with Ollama (1.06×)** and **4.76× at 8 concurrent**. Both engines re-measured in one session, one at a time. ⚠️ The single-stream margin is small and my checkpoint is quantized more aggressively than Ollama's Q4_K_M (21 GB vs 26 GB resident) with **no quality evaluation done** — treat it as parity, not a win.
+
+Plus **patches 11 and 12**, which bring Qwen3.8-Flash-Next (Qwen4-Exp) up on gfx1151:
+
+11. **[Qwen4-Exp on ROCm](patches/11-qwen4-exp-rocm.md)** — the PLE n-gram table gather is moved to the CPU (the GPU must not dereference host memory here), QSA decode is routed to upstream's pure-Triton kernel (registry-gated to SM121) with a 64 KB shared-memory schedule, and the JIT top-k kernel (which reads out of bounds on RDNA 3.5 and poisons the HIP queue) is bypassed. Apply with [`patches/patch_qwen4_exp_rocm.py`](patches/patch_qwen4_exp_rocm.py).
+12. **[WNA16 Triton MoE zero points](patches/12-wna16-triton-zp.md)** — the ROCm compressed-tensors MoE path dropped the asymmetric zero points, so every expert weight was off by `(8 - zp) * scale`; the loader also left them untransposed, and post-load weight conversion leaked ~1.4 GiB of dead expert weights per MoE layer (OOM at layer ~14 of 48) until a GC is run between layers. Apply with [`patches/patch_wna16_zp.py`](patches/patch_wna16_zp.py).
+
+Note: with the current upstream pin, patch 1 (gfx1151 arch guard) and patch 4 (wave32 `WARP_SIZE`) are applied by upstream's own [`docker/patches/sgl-kernel-gfx1151.sh`](patches/sgl-kernel-gfx1151.sh) (vendored here), patch 3 is no longer needed (upstream auto-routes ROCm compressed-tensors MoE to the Triton path), and patch 5 was fixed upstream.
 
 Two more are documented but not part of the serving path:
 

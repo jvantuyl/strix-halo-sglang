@@ -44,3 +44,65 @@ services:
       - triton
       - --cuda-graph-max-bs
       - "${SGLANG_CUDA_GRAPH_MAX_BS:-8}"
+
+  # Qwen3.8-Flash-Next with the PLE table read from a file (docs/RUNNING_QWEN38.md).
+  # Needs the fp8-converted checkpoint (tools/convert_ple_fp8.py) and a 128 GB box.
+  # Create the host dirs first so they are not root-owned:
+  #   mkdir -p /opt/llm/ple-cache ~/.cache/strix-halo-sglang-cache
+  #   docker compose --profile qwen38 up -d qwen38
+  # Same flags as start-qwen38.sh; keep the two in sync.
+  qwen38:
+    profiles: ["qwen38"]
+    image: ${SGLANG_IMAGE:-strix-halo-sglang:dev}
+    container_name: sglang-qwen38
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    security_opt:
+      - seccomp:unconfined
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      SGLANG_FORCE_NATIVE_LAYERNORM: "1"
+      SGLANG_USE_AITER: "0"
+      SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK: "1"
+      # Tuning benchmarks every GEMM solution per new prompt length (14-20 s
+      # of TTFT each); recorded tunings are still used with it off.
+      PYTORCH_TUNABLEOP_TUNING: "${SGLANG_TUNABLEOP_TUNING:-0}"
+    volumes:
+      - ${QWEN38_MODEL_DIR:-~/models/Qwen3.8-Flash-Next-AWQ-INT4-ple-fp8}:/models/qwen38:ro
+      - ${QWEN38_PLE_DIR:-/opt/llm/ple-cache}:/ple
+      - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
+      - ${TUNABLE_DIR:-~/.cache/strix-halo-sglang-tunableop}:/root/.tunableop
+      # Triton / JIT kernel cache, so restarts do not recompile everything.
+      - ${SGL_CACHE_DIR:-~/.cache/strix-halo-sglang-cache}:/root/.cache/sglang
+    command:
+      - python3
+      - -m
+      - sglang.launch_server
+      - --model-path
+      - /models/qwen38
+      - --served-model-name
+      - qwen38-flash-next
+      - --host
+      - 0.0.0.0
+      - --port
+      - "${QWEN38_PORT:-30001}"
+      - --ple-offload-embedding
+      - --ple-offload-backend
+      - file
+      - --ple-offload-dir
+      - /ple
+      - --mem-fraction-static
+      - "${QWEN38_MEM_FRAC:-0.85}"
+      - --context-length
+      - "${QWEN38_CONTEXT:-32768}"
+      - --attention-backend
+      - triton
+      - --disable-cuda-graph
+      - --reasoning-parser
+      - qwen3-thinking
+      - --tool-call-parser
+      - qwen3_coder
