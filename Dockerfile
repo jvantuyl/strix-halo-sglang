@@ -147,6 +147,14 @@ RUN PIP_CONSTRAINT=/tmp/rocm-constraints.txt pip install --no-deps -e python \
 COPY patches/patch_qwen4_exp_rocm.py /tmp/patch_qwen4_exp_rocm.py
 RUN python3 /tmp/patch_qwen4_exp_rocm.py && rm /tmp/patch_qwen4_exp_rocm.py
 
+# --- WNA16 Triton MoE zero points (patch 12) ---
+# Upstream's ROCm auto-route drops the zero points of asymmetric
+# compressed-tensors checkpoints; the Triton kernel then silently computes
+# wrong MoE outputs (Qwen3.8-Flash-Next-AWQ-INT4 is symmetric: false, g32).
+# See patches/12-wna16-triton-zp.md.
+COPY patches/patch_wna16_zp.py /tmp/patch_wna16_zp.py
+RUN python3 /tmp/patch_wna16_zp.py && rm /tmp/patch_wna16_zp.py
+
 # --- idle scheduler sleeps instead of spinning a core (patch 10) ---
 # Upstream busy-polls its ZMQ sockets while idle, pinning one CPU core at 100%
 # forever (Tctl 38 -> 71 C on an idle Strix Halo). Default --sleep-on-idle to on;
