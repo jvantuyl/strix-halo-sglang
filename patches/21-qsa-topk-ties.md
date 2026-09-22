@@ -83,5 +83,13 @@ the reference scores and padding on tied rows, is bit-identical and captures
 into a CUDA graph; `qsa_stable_rows_topk` matches the reference scores with
 non-zero row starts, growing lengths and k = 512 / 64. Items 4 and 9 still
 pass. The stage-by-stage prefill probe is 0/11 differing at 1,475 and 8,192
-tokens with the patch. End-to-end numbers are in the runbook's determinism
-note.
+tokens with the patch.
+
+End to end on the DERISKED checkpoint, every run cold (`/flush_cache`,
+`temperature=0`, top-3 logprobs compared at every position): a ~1.5k-token
+prompt 4/4 identical, an 8.6k-token prompt 3/3 at 64 tokens and 4/4 at 200
+tokens (it diverged at step 37 before patch 20 and differed in the first
+logprob before this patch), 12 behaviour probes text-identical across two
+passes. Prefill throughput rose from 535 / 538 / 504 to 629 / 695 / 676
+tok/s at ~2k / ~10k / ~40k tokens; decode is unchanged (bs 1 14.5–14.8,
+8 / 16 / 20 streams 48.1 / 71.3 / 71.5 tok/s).

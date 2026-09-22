@@ -392,24 +392,41 @@ free VRAM after load than stock, same graph list and request cap. Verified: 12 g
 refused none of them either; the difference is in tone, not in refusals, for
 that set), identity unchanged, vision exact on the synthetic test image
 (160 image tokens). Greedy decode is bit-identical across cold runs since
-patch 18; before it, this checkpoint (and stock) drifted from the first
-decode token on, see below.
+patches 18, 20 and 21; before them, this checkpoint (and stock) drifted from
+the first decode token on, see below.
 
-| | Stock (cyankiwi g32) | DERISKED (g128) |
-|---|---:|---:|
-| Prefill 1.6k / 6.7k / 27k tokens | 535 / 554 / 475 tok/s | 535 / 538 / 504 tok/s |
-| Decode bs=1 | 14.5 tok/s | 14.3–15.0 tok/s |
-| 8 streams | 57.9 (sanity re-run 49.6) | 47.1 / 51.8 |
-| 16 streams | 99.4 (sanity re-run 89.5) | 70.6 / 73.9 / 72.7 |
-| 20 streams | 88–97 | 72.9 |
+| | Stock (cyankiwi g32) | DERISKED (g128), patches ≤ 18 | DERISKED (g128), patches ≤ 21 |
+|---|---:|---:|---:|
+| Prefill ~1.6k / ~7k / ~27k tokens | 535 / 554 / 475 tok/s | 535 / 538 / 504 tok/s | 629 / 695 / 676 tok/s (2.6k / 11k / 44.6k) |
+| Decode bs=1 | 14.5 tok/s | 14.3–15.0 tok/s | 14.5–14.8 tok/s |
+| 8 streams | 57.9 (sanity re-run 49.6) | 47.1 / 51.8 | 48.1 |
+| 16 streams | 99.4 (sanity re-run 89.5) | 70.6 / 73.9 / 72.7 | 71.3 |
+| 20 streams | 88–97 | 72.9 | 71.5 |
 
-Single-stream and prefill match; at 16–20 streams the abliterated build is
-~20% behind. The MoE tiles are ruled out (same kernel time on both group
-sizes, see above); the runs were not back to back with stock, and the
-stock 16-stream figure itself moved 99 → 90 between sessions, so treat the
-gap as partly run variance and partly open. Its logs show every decode step
-in a captured graph. The int4 attention projections are served as bf16
-(patch 16), so they cannot be slower than stock's bf16 ones.
+Single-stream matches stock, and prefill is now ~20–30% ahead of it: patch
+21 removed a per-query-row Python loop (one host sync per row) from the QSA
+indexer's block selection, which is worth ~1.4 s per 1.5k-token prefill
+across the 12 QSA layers. Stock would gain the same once re-measured on the
+current image. At 16–20 streams the abliterated build is ~20% behind. The
+MoE tiles are ruled out (same kernel time on both group sizes, see above);
+the runs were not back to back with stock, and the stock 16-stream figure
+itself moved 99 → 90 between sessions, so treat the gap as partly run
+variance and partly open. Its logs show every decode step in a captured
+graph. The int4 attention projections are served as bf16 (patch 16), so
+they cannot be slower than stock's bf16 ones.
+
+End-to-end determinism on the patches ≤ 21 image, every run cold (cache
+flushed between runs, `temperature=0`, top-3 logprobs compared at every
+position): 96-token completion of a short prompt 3/3 identical; ~430-token
+prompt (12 paragraphs) 3/3; ~1.5k-token prompt (20 paragraphs + question),
+48 tokens, 4/4; 8.6k-token prompt, 64 tokens 3/3 and 200 tokens 4/4 (this
+prompt diverged at step 37 before patch 20 and differed in the first
+logprob before patch 21). The 12 behaviour probes (up to 400 tokens each)
+are text-identical between two cold passes. Their texts differ from the
+patches ≤ 18 image on 9 of 12 probes, as expected: a different (now fixed)
+tie order in the block selection changes the rounding, and long greedy
+generations part at the next near-tie. Long-context concurrency stress
+(4 × 13k, 8 × 5k and 2 × 50k-token prompts) completed with no GPU faults.
 
 ## Known limitations
 
@@ -444,8 +461,9 @@ in a captured graph. The int4 attention projections are served as bf16
   chunk kernel, indexer logits, index expansion, sparse attention, GEMMs,
   MoE, HC mix) was bit-stable in repeat-and-compare tests at 1,475 and
   8,192 tokens. Patch 21 breaks ties toward the lower block with a stable
-  sort (prefill) or a top-k over unique score+index keys (decode). See the
-  end-to-end numbers below the DERISKED table.
+  sort (prefill) or a top-k over unique score+index keys (decode). End-to-end
+  numbers are below the DERISKED table: 8.6k-token prompt, 200 greedy
+  tokens, 4/4 cold runs identical to the logprob.
 - Fixed, kept for the record: eager decode above the largest captured graph
   used to fault the next replay (`Memory access fault by GPU node-1 ... Page
   not present`) after a `/flush_cache`. Two factors: upstream's QSA backend
