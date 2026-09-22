@@ -20,7 +20,11 @@ the table on every start, and it was most of the ~10 min load time.
    marker. `ple_only_weight_files` decides from the index which checkpoint
    files hold nothing but `…ngram_embedding.shard_N.weight` tensors; a
    checkpoint that interleaves the table with other tensors yields none and
-   simply gets upstream behaviour.
+   simply gets upstream behaviour. `tools/convert_ple_fp8.py --part-bytes`
+   exists for exactly that case: it splits a mixed file into PLE-only
+   `-pleNNN` parts and `-restNNN` parts and rewrites the index, so the
+   skip applies to e.g. the DERISKED requant's single 100 GiB
+   `model-mtp-merged.safetensors`.
 2. **`qwen4_exp.py`** — the host embedding remembers its table path. The
    model exposes `weight_files_to_skip(hf_folder, files)`: if every file-backed
    table has a marker matching the fingerprint, it logs
