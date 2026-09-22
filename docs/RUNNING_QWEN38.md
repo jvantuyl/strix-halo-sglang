@@ -66,7 +66,8 @@ python3 -m sglang.launch_server \
     --ple-offload-backend file --ple-offload-dir /ple \
     --mem-fraction-static 0.85 --context-length 32768 \
     --kv-cache-dtype fp8_e4m3 --max-total-tokens 262144 \
-    --attention-backend triton --cuda-graph-max-bs-decode 8 \
+    --attention-backend triton \
+    --cuda-graph-max-bs-decode 20 --max-running-requests 20 \
     --mamba-ssm-dtype bfloat16 \
     --reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder
 ```
@@ -93,7 +94,7 @@ on local NVMe: it is random-read during decode.
 | `SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1` | Upstream gates the file backend on `cudaDevAttrPageableMemoryAccessUsesHostPageTables` (GB10). Irrelevant here: patch 11 gathers on the CPU, the GPU never dereferences the mapping. |
 | `--attention-backend triton` | Same as every other model on this box; aiter's CK paths are CDNA-only. |
 | `--kv-cache-dtype fp8_e4m3 --max-total-tokens 262144` | fp8 KV halves the pool; the token cap keeps the saving as headroom instead of a larger pool (see Memory). `QWEN38_KV_DTYPE` / `QWEN38_MAX_TOTAL_TOKENS` override. |
-| `--cuda-graph-max-bs-decode 8` | Decode graphs for bs 1–8 (0.39 GB). Patch 14 fills the PLE prefetch buffer from the host before each replay. Note this upstream split the flag: a bare `--cuda-graph-max-bs` is rejected as ambiguous. `QWEN38_CUDA_GRAPH_MAX_BS` overrides. |
+| `--cuda-graph-max-bs-decode 20 --max-running-requests 20` | Decode graphs for bs 1, 2, 4, 8, 12, 16, 20. Patch 14 fills the PLE prefetch buffer from the host before each replay. The two numbers must match: a decode step that runs eager because the batch exceeds the largest captured graph is followed by a GPU page fault in the next replay (see Known limitations), so every batch size the scheduler can form has a graph. 20 is also the mamba-cache cap. `QWEN38_CUDA_GRAPH_MAX_BS` moves both. Note this upstream split the flag: a bare `--cuda-graph-max-bs` is rejected as ambiguous. |
 | `--mamba-ssm-dtype bfloat16` | The GDN recurrent state is fp32 by default: 5.4 GB for 50 slots, which caps `max_running_requests` at 10 (5 slots per request). bf16 halves it to 20 requests in the same memory. Upstream's own suggestion in the startup log. |
 | `--reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder` | The chat template opens `<think>` in the generation prompt and asks for `<tool_call><function=...><parameter=...>` tool calls. Without these the thinking and the XML come back as plain `content`. |
 | `PYTORCH_TUNABLEOP_TUNING=0` | The image enables PyTorch TunableOp, which benchmarks every GEMM solution for each *new* M (= tokens in the prefill chunk). That is 14–20 s of TTFT for every novel prompt length (measured; the recorded results persist in `~/.cache/strix-halo-sglang-tunableop` so a repeated length is fast). With tuning off the recorded solutions are still used and untuned shapes take hipBLASLt's heuristic pick. `SGLANG_TUNABLEOP_TUNING=1 ./start-qwen38.sh` to deliberately record more. |
@@ -190,8 +191,16 @@ flushed before every prefill measurement (streaming client, `max_tokens`
 | 4 | 33.3 tok/s | 8.8 tok/s | 1.3 s |
 | 8 | 57.9 tok/s | 7.5 tok/s | 1.2 s |
 
+| 12 | 77.5 tok/s | 6.9 tok/s | 2.3 s |
+| 16 | 99.4 tok/s | 6.7 tok/s | 2.6 s |
+| 20 | 97.3 tok/s | 5.1 tok/s | 2.2 s |
+
 How it got here, single stream / 8 streams: eager 11.2 / 42.9 tok/s; decode
-graphs (patch 14) 12.7 / 43.0; tuned MoE tiles (below) 14.5 / 57.9.
+graphs (patch 14) 12.7 / 43.0; tuned MoE tiles (below) 14.5 / 57.9. Graphs
+for bs 12–20 do not change throughput measurably against eager at those
+sizes (server-side peak +4% at bs 16, within run-to-run noise end to end);
+they are captured because of the fault described under Known limitations,
+not for speed. Run-to-run spread at 8 streams is about ±7%.
 
 The PLE gather costs about 1 s per 2048 cold tokens (32k rows faulted from
 NVMe, ~35 µs each); rows already in the page cache shave that off (440–520
@@ -262,32 +271,32 @@ docker cp "sglang-qwen38:/tmp/E=512,N=320,device_name=Radeon_8060S_Graphics,dtyp
 The checkpoint ships one MTP layer; `--speculative-algorithm NEXTN` loads it
 as the draft model (+70 s load, 0.2 GB) and captures target-verify and draft
 graphs. It needs real headroom: the mamba pool grows a 2.3 GB
-`intermediate_ssm_state_cache` and the eager GDN prefill then OOMs on
-prompts over ~1k tokens at the default pool sizes (lowering
-`--mem-fraction-static` does not help, the budget just moves into the pools).
-Cap the pools instead:
+`intermediate_ssm_state_cache`, and before the fp8 KV cache and the 262144
+token cap became the defaults the eager GDN prefill OOMed on prompts over
+~1k tokens (lowering `--mem-fraction-static` does not help, the budget just
+moves into the pools; `--max-total-tokens 131072 --max-mamba-cache-size 30`
+was the workaround). With the current defaults it fits as is:
 
 ```bash
 ./start-qwen38.sh --speculative-algorithm NEXTN --speculative-num-steps 3 \
-    --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-    --max-total-tokens 131072 --max-mamba-cache-size 30
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
 ```
 
 | Prompt tokens | TTFT | Prefill | Decode (bs=1) |
 |---:|---:|---:|---:|
-| 183 | 1.2 s | 150 tok/s | 18.7 tok/s |
-| 1,650 | 3.3 s | 499 tok/s | 17.2 tok/s |
-| 6,693 | 13.9 s | 481 tok/s | 18.5 tok/s |
-| 26,983 | 59.8 s | 451 tok/s | 18.8 tok/s |
+| 183 | 0.8 s | 223 tok/s | 20.1 tok/s |
+| 1,650 | 2.9 s | 578 tok/s | 22.8 tok/s |
+| 6,693 | 12.8 s | 522 tok/s | 21.8 tok/s |
+| 26,983 | 55.4 s | 487 tok/s | 22.9 tok/s |
 
-Mean accept length 2.7 of 4 draft tokens (accept rate 0.55) on the summary
-prompts above; +45% single-stream decode over plain graphs. (Measured before
-the MoE tile tuning; the draft and verify steps use the same MoE kernel, so
-expect both columns to move.) 4 concurrent:
-29.5 tok/s aggregate (vs 27.4). `--max-mamba-cache-size 30` allows 6
-concurrent requests (5 slots each), so 8 streams queue (31.5 tok/s
-aggregate, 32 s worst TTFT vs 43.0 tok/s without MTP). Not on by default:
-it trades concurrency for single-stream speed.
+Mean accept length 2.6 of 4 draft tokens (accept rate 0.53); +45–55%
+single-stream decode over plain graphs with the tuned MoE tiles. 4
+concurrent: 40.4 tok/s aggregate (vs 33.3); 8 concurrent: 58.9 (vs 57.9).
+The mamba pool caps `max_running_requests` at 10 (5 slots per request), so
+more than 10 streams queue. `--speculative-num-steps 2
+--speculative-num-draft-tokens 3` was tried: accept length 2.2, bs=1 18.4–19.7
+tok/s, 8 streams 60.0, 12 requests allowed; not better. Not on by default: it
+trades concurrency for single-stream speed.
 
 Verified end to end: chat with thinking (`reasoning_content` split out),
 structured tool calls (`finish_reason: tool_calls`), vision (exact OCR of
@@ -301,4 +310,15 @@ concurrent streams, 6302-token prompt with radix-cache reuse.
 - Prefill runs eager (upstream disables prefill graphs for this model).
 - First boot writes the 48 GiB PLE table; the `pinned` backend is not an
   option here (host RAM is the same pool).
-- MTP needs the pool caps above; without them prefill OOMs past ~1k tokens.
+- Eager decode above the largest captured graph faults. With graphs for
+  bs ≤ 8 and 12–16 concurrent streams (eager decode), the first graph replay
+  after the batch drained below 8 died with `Memory access fault by GPU
+  node-1 ... Page not present`, reproducibly within two rounds, with and
+  without the tuned MoE tiles and with and without expandable segments. Pure
+  eager (`--disable-cuda-graph`) and pure graph (graphs up to
+  `max_running_requests`) runs are clean over many rounds; under
+  `AMD_SERIALIZE_KERNEL=3` the fault surfaces at the first kernel after the
+  replay (the sampler's `argmax`), placing it inside the replay. Cause not yet
+  found (patch 14 or the upstream decode graph runner on this path). The
+  launchers tie `--max-running-requests` to `--cuda-graph-max-bs-decode`
+  so the eager decode path never runs; keep them equal if you change one.

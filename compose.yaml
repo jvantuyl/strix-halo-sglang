@@ -112,7 +112,9 @@ services:
       - --attention-backend
       - triton
       - --cuda-graph-max-bs-decode
-      - "${QWEN38_CUDA_GRAPH_MAX_BS:-8}"
+      - "${QWEN38_CUDA_GRAPH_MAX_BS:-20}"
+      - --max-running-requests
+      - "${QWEN38_CUDA_GRAPH_MAX_BS:-20}"
       - --mamba-ssm-dtype
       - bfloat16
       - --reasoning-parser

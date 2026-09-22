@@ -13,9 +13,14 @@
 #   SGLANG_PORT=30000 ./start-qwen38.sh
 #
 # Notes:
-#   - Decode CUDA graphs are on for bs 1-8 (patch 14 fills the PLE prefetch
-#     buffer from the host before each replay). QWEN38_CUDA_GRAPH_MAX_BS=0
-#     is not a switch; pass --disable-cuda-graph as an extra argument instead.
+#   - Decode CUDA graphs are on for bs 1-20 (patch 14 fills the PLE prefetch
+#     buffer from the host before each replay) and --max-running-requests is
+#     tied to the same number: a decode step that runs eager because the
+#     batch is larger than any captured graph is followed by a GPU page fault
+#     in the next replay (reproducible, cause not yet found; pure eager and
+#     pure graph runs are both clean). QWEN38_CUDA_GRAPH_MAX_BS moves both;
+#     20 is the mamba-cache cap anyway. QWEN38_CUDA_GRAPH_MAX_BS=0 is not a
+#     switch; pass --disable-cuda-graph as an extra argument instead.
 #   - The PLE table file (~48 GiB fp8, sparse) is written on the first boot,
 #     reused on later ones (patch 13) and random-read during decode; keep
 #     $PLE_DIR on local NVMe.
@@ -39,7 +44,7 @@ set -euo pipefail
 IMAGE="${SGLANG_IMAGE:-strix-halo-sglang:dev}"
 PORT="${SGLANG_PORT:-30001}"
 NAME="${SGLANG_CONTAINER:-sglang-qwen38}"
-CUDA_GRAPH_MAX_BS="${QWEN38_CUDA_GRAPH_MAX_BS:-8}"
+CUDA_GRAPH_MAX_BS="${QWEN38_CUDA_GRAPH_MAX_BS:-20}"
 MODEL_DIR="${MODEL_DIR:-$HOME/models/Qwen3.8-Flash-Next-AWQ-INT4-ple-fp8}"
 PLE_DIR="${PLE_DIR:-/opt/llm/ple-cache}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
@@ -97,6 +102,7 @@ exec docker run --name "$NAME" \
         --json-model-override-args "$MODEL_OVERRIDE" \
         --attention-backend triton \
         --cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS" \
+        --max-running-requests "$CUDA_GRAPH_MAX_BS" \
         --mamba-ssm-dtype bfloat16 \
         --reasoning-parser qwen3-thinking \
         --tool-call-parser qwen3_coder \
