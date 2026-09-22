@@ -213,6 +213,15 @@ RUN python3 /tmp/fix_aiter_gfx1151_mxfp4.py && rm /tmp/fix_aiter_gfx1151_mxfp4.p
 COPY patches/patch_moe_config_dir.py /tmp/patch_moe_config_dir.py
 RUN python3 /tmp/patch_moe_config_dir.py && rm /tmp/patch_moe_config_dir.py
 
+# --- deterministic HyperConnection mix at decode sizes (patch 18) ---
+# The sm_100 JIT mix is unavailable here, so every decode step used the
+# persistent Triton kernel whose split-K atomic_add made greedy decode differ
+# run to run (and whose software grid barrier assumes co-resident CTAs). Add a
+# two-launch variant (per-split partials, fixed-order reduction) and use it on
+# HIP. See patches/18-hc-mix-rocm.md.
+COPY patches/patch_hc_mix_rocm.py /tmp/patch_hc_mix_rocm.py
+RUN python3 /tmp/patch_hc_mix_rocm.py && rm /tmp/patch_hc_mix_rocm.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"

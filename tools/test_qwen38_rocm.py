@@ -23,6 +23,8 @@ Covers:
      and without actorder g_idx) vs a plain reference, plus F.linear output.
   6. patch 17 -- SGLANG_MOE_CONFIG_DIR search path (flat and
      configs/triton_<ver>/ layouts, missing directories, precedence).
+  7. patch 18 -- split (atomics-free) HyperConnection mix selected on HIP,
+     vs the fp32 reference, and bit-identical across repeated launches.
 """
 from __future__ import annotations
 
@@ -394,6 +396,39 @@ def test_moe_config_dir():
             reset_context()
 
 
+def test_hc_mix_deterministic():
+    """The split HC mix is selected on HIP, matches the reference, and repeats.
+
+    Model shape (4 x 2560 hidden, rank 320) at decode row counts. The
+    reference is the torch formula in fp32; tolerance covers bf16 rounding of
+    the intermediate mix weights (the persistent kernel sits at the same
+    distance from it).
+    """
+    import torch.nn.functional as F
+    from sglang.srt.layers import hc_mix_triton as m
+
+    check("hc_mix split variant selected on HIP", m._use_split_mix())
+
+    torch.manual_seed(0)
+    hc, hs, lowrank = 4, 2560, 320
+    dev = "cuda"
+    w_down = (torch.randn(lowrank, hc * hs, device=dev) * 0.02).to(torch.bfloat16)
+    w_up = (torch.randn(hc * hs, lowrank, device=dev) * 0.05).to(torch.bfloat16)
+    for rows in (1, 5, 16):
+        x = torch.randn(rows, hc * hs, device=dev).to(torch.bfloat16)
+        check(f"hc_mix rows={rows} fused path supported", m.fused_hc_mix_supported(x, w_down, w_up))
+        out = m.fused_hc_mix(x, w_down, w_up, hc, hs)
+        xf = x.float()
+        t = F.silu(F.linear(xf, w_down.float()) / hc)
+        gate = torch.sigmoid(F.linear(t, w_up.float())).unflatten(-1, (hc, hs))
+        ref = (gate * xf.unflatten(-1, (hc, hs))).mean(dim=-2)
+        err = (out.float() - ref).abs().max().item()
+        check(f"hc_mix rows={rows} vs fp32 reference", err < 2e-2, f"max abs err {err:.5f}")
+        repeats = 100
+        same = sum(int(torch.equal(m.fused_hc_mix(x, w_down, w_up, hc, hs), out)) for _ in range(repeats))
+        check(f"hc_mix rows={rows} bit-identical across launches", same == repeats, f"{same}/{repeats}")
+
+
 if __name__ == "__main__":
     test_ple_cpu_gather()
     test_qsa_decode()
@@ -401,6 +436,7 @@ if __name__ == "__main__":
     test_moe_zp()
     test_wna16_dense_dequant()
     test_moe_config_dir()
+    test_hc_mix_deterministic()
     print()
     if FAILURES:
         print("FAILED:", ", ".join(FAILURES))

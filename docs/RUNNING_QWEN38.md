@@ -22,6 +22,7 @@ group 32, asymmetric; vision tower unquantized). MTP is not used.
 | [15](../patches/15-qsa-graph-scratch.md) | Dedicated QSA packed-KV scratch for captured graphs | Upstream shares one growable scratch between graphs and eager decode; an eager step above the graph range re-allocates it and the graphs write into freed memory (GPU page fault after the next `empty_cache`). Not gfx1151-specific |
 | [16](../patches/16-wna16-rocm-dense.md) | Dense compressed-tensors int4 Linear on ROCm: dequantize to bf16 at load, serve with `F.linear` | The dense WNA16 scheme is Marlin-only and Marlin is CUDA-only (`NameError: gptq_marlin_repack`); needed by checkpoints that also quantize attention `q/k/v/o`, e.g. the [abliterated variant](#running-the-abliterated-variant-derisked) |
 | [17](../patches/17-moe-config-dir.md) | `SGLANG_MOE_CONFIG_DIR` searched before the builtin MoE tile tree (flat or tree layout, missing dirs skipped) | Upstream's knob replaces the tree and crashes on a missing dir; tuned tiles are now mounted per checkpoint instead of baked into the image |
+| [18](../patches/18-hc-mix-rocm.md) | Atomics-free two-launch HyperConnection mix for decode batches, used on HIP | The sm_100 JIT mix is unavailable, so every decode step ran the persistent kernel whose split-K `atomic_add` made greedy decode differ run to run (and whose software grid barrier assumes co-resident CTAs). Same speed, bit-identical |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
@@ -41,7 +42,7 @@ n-gram hashing) is pure Triton upstream and runs unmodified.
    ```
    Expect `ALL PARITY TESTS PASSED` (PLE gather bf16/fp8, QSA decode, top-k chain,
    MoE zero points incl. a negative control, dense WNA16 dequant, MoE config
-   search path).
+   search path, deterministic HC mix).
 3. Convert the PLE table to fp8 (halves the table to ~48 GiB and is the format
    the file backend expects to keep resident-free):
    ```bash
@@ -385,7 +386,9 @@ Loads in ~6 min (first boot writes its own 47.7 GiB table), ~1.5 GB more
 free VRAM after load than stock, same graph list and request cap. Verified: 12 greedy probes answered (the stock model
 refused none of them either; the difference is in tone, not in refusals, for
 that set), identity unchanged, vision exact on the synthetic test image
-(160 image tokens).
+(160 image tokens). Greedy decode is bit-identical across cold runs since
+patch 18; before it, this checkpoint (and stock) drifted from the first
+decode token on, see below.
 
 | | Stock (cyankiwi g32) | DERISKED (g128) |
 |---|---:|---:|
@@ -410,6 +413,20 @@ in a captured graph. The int4 attention projections are served as bf16
 - Prefill runs eager (upstream disables prefill graphs for this model).
 - First boot writes the 48 GiB PLE table; the `pinned` backend is not an
   option here (host RAM is the same pool).
+- Fixed, kept for the record: greedy decode was not repeatable. The same
+  prompt at `temperature=0` gave different top-1 logprobs from the first
+  decode token on (a handful of recurring values), and long completions
+  diverged on near-tie tokens; prefill was bit-identical. Graphs, overlap
+  scheduling, the radix cache and the PLE fusion were ruled out one by one,
+  as were the QSA, GDN, MoE and GEMM kernels by repeat-and-compare tests.
+  The cause was the HyperConnection mix: on ROCm every batch of ≤ 16 rows
+  ran upstream's persistent Triton kernel, which accumulates its split-K
+  down projection with device-scope atomics. Patch 18 replaces it on HIP
+  with a two-launch variant (per-split partials, fixed-order reduction, no
+  grid barrier) at the same speed; 96- and 512-token completions are now
+  bit-identical across cold runs. Sending the mix to the torch path instead
+  would have cost ~35% decode speed (the GEMM shapes are untuned under
+  TunableOp).
 - Fixed, kept for the record: eager decode above the largest captured graph
   used to fault the next replay (`Memory access fault by GPU node-1 ... Page
   not present`) after a `/flush_cache`. Two factors: upstream's QSA backend
