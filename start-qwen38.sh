@@ -12,6 +12,12 @@
 #   ./start-qwen38.sh [extra sglang args...]
 #   SGLANG_PORT=30000 ./start-qwen38.sh
 #
+# Another checkpoint of the same architecture (e.g. an abliterated variant,
+# see docs/RUNNING_QWEN38.md) is a matter of pointing MODEL_DIR at its
+# converted directory and giving it its own PLE_DIR (the table file name is
+# the same for every checkpoint, so two models must not share one), plus a
+# distinct SGLANG_CONTAINER / QWEN38_SERVED_NAME so results stay apart.
+#
 # Notes:
 #   - Decode CUDA graphs are on for bs 1-20 (patch 14 fills the PLE prefetch
 #     buffer from the host before each replay). QWEN38_CUDA_GRAPH_MAX_BS sets
@@ -34,6 +40,11 @@
 #     more.
 #   - The Triton/JIT kernel cache is persisted in $SGL_CACHE_DIR so restarts
 #     do not recompile every kernel.
+#   - Tuned fused-MoE tiles are not baked into the image: $MOE_CONFIG_DIR
+#     (default configs/moe/qwen38-flash-next, tuned on the cyankiwi g32
+#     checkpoint) is mounted at /moe-configs and searched first (patch 17).
+#     Point it at another profile for another checkpoint so tuning data stays
+#     per model; MOE_CONFIG_DIR= (empty) runs on upstream's generic tiles.
 #   - KV cache is fp8_e4m3 (verified: identical answers, exact needle recall
 #     at 3.9k tokens, same decode speed) and capped at 262144 tokens so the
 #     halved pool becomes headroom (~3 GB) instead of a bigger pool. The
@@ -41,9 +52,11 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="${SGLANG_IMAGE:-strix-halo-sglang:dev}"
 PORT="${SGLANG_PORT:-30001}"
 NAME="${SGLANG_CONTAINER:-sglang-qwen38}"
+SERVED_NAME="${QWEN38_SERVED_NAME:-qwen38-flash-next}"
 CUDA_GRAPH_MAX_BS="${QWEN38_CUDA_GRAPH_MAX_BS:-20}"
 MAX_RUNNING_REQUESTS="${QWEN38_MAX_RUNNING_REQUESTS:-$CUDA_GRAPH_MAX_BS}"
 # With the radix cache on, SGLang reserves 5 GDN state slots per request.
@@ -53,6 +66,8 @@ PLE_DIR="${PLE_DIR:-/opt/llm/ple-cache}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 TUNABLE_DIR="${TUNABLE_DIR:-$HOME/.cache/strix-halo-sglang-tunableop}"
 SGL_CACHE_DIR="${SGL_CACHE_DIR:-$HOME/.cache/strix-halo-sglang-cache}"
+# `-` not `:-`: an explicitly empty MOE_CONFIG_DIR disables the mount.
+MOE_CONFIG_DIR="${MOE_CONFIG_DIR-$SCRIPT_DIR/configs/moe/qwen38-flash-next}"
 TUNABLEOP_TUNING="${SGLANG_TUNABLEOP_TUNING:-0}"
 MEM_FRAC="${SGLANG_MEM_FRAC:-0.85}"
 CONTEXT="${SGLANG_CONTEXT:-131072}"
@@ -67,6 +82,13 @@ fi
 
 test -d "$MODEL_DIR" || { echo "missing $MODEL_DIR (run tools/convert_ple_fp8.py first)" >&2; exit 1; }
 mkdir -p "$PLE_DIR" "$HF_CACHE" "$TUNABLE_DIR" "$SGL_CACHE_DIR"
+
+MOE_ARGS=()
+if [ -n "$MOE_CONFIG_DIR" ]; then
+    test -d "$MOE_CONFIG_DIR" || { echo "missing $MOE_CONFIG_DIR (MOE_CONFIG_DIR= to run without tuned tiles)" >&2; exit 1; }
+    MOE_ARGS=(-v "$MOE_CONFIG_DIR:/moe-configs:ro" -e SGLANG_MOE_CONFIG_DIR=/moe-configs)
+fi
+# Extra `docker run` arguments (word-split), e.g. -e VAR=1 for engine env knobs.
 
 if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
     echo "Note: removing existing container '$NAME'." >&2
@@ -84,6 +106,7 @@ exec docker run --name "$NAME" \
     -v "$HF_CACHE:/root/.cache/huggingface" \
     -v "$TUNABLE_DIR:/root/.tunableop" \
     -v "$SGL_CACHE_DIR:/root/.cache/sglang" \
+    "${MOE_ARGS[@]}" \
     -e HF_TOKEN="${HF_TOKEN:-}" \
     -e PYTORCH_TUNABLEOP_TUNING="$TUNABLEOP_TUNING" \
     -e PYTORCH_CUDA_ALLOC_CONF="$ALLOC_CONF" \
@@ -93,7 +116,7 @@ exec docker run --name "$NAME" \
     "$IMAGE" \
     python3 -m sglang.launch_server \
         --model-path /models/qwen38 \
-        --served-model-name qwen38-flash-next \
+        --served-model-name "$SERVED_NAME" \
         --host 0.0.0.0 --port "$PORT" \
         --ple-offload-embedding \
         --ple-offload-backend file \

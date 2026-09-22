@@ -21,8 +21,9 @@ group 32, asymmetric; vision tower unquantized). MTP is not used.
 | [14](../patches/14-cuda-graph-ple.md) | Decode CUDA graphs with the CPU-side PLE gather | The host gather cannot be captured; fill the static PLE prefetch buffer from the host before each replay |
 | [15](../patches/15-qsa-graph-scratch.md) | Dedicated QSA packed-KV scratch for captured graphs | Upstream shares one growable scratch between graphs and eager decode; an eager step above the graph range re-allocates it and the graphs write into freed memory (GPU page fault after the next `empty_cache`). Not gfx1151-specific |
 | [16](../patches/16-wna16-rocm-dense.md) | Dense compressed-tensors int4 Linear on ROCm: dequantize to bf16 at load, serve with `F.linear` | The dense WNA16 scheme is Marlin-only and Marlin is CUDA-only (`NameError: gptq_marlin_repack`); needed by checkpoints that also quantize attention `q/k/v/o`, e.g. the [abliterated variant](#running-the-abliterated-variant-derisked) |
+| [17](../patches/17-moe-config-dir.md) | `SGLANG_MOE_CONFIG_DIR` searched before the builtin MoE tile tree (flat or tree layout, missing dirs skipped) | Upstream's knob replaces the tree and crashes on a missing dir; tuned tiles are now mounted per checkpoint instead of baked into the image |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
-| [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16` | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
+| [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
 Everything else (GDN, QSA prefill/indexer, HyperConnections, fused sigmoid-mul,
 n-gram hashing) is pure Triton upstream and runs unmodified.
@@ -39,7 +40,8 @@ n-gram hashing) is pure Triton upstream and runs unmodified.
        -v $PWD/tools/test_qwen38_rocm.py:/test.py:ro strix-halo-sglang:dev python3 /test.py
    ```
    Expect `ALL PARITY TESTS PASSED` (PLE gather bf16/fp8, QSA decode, top-k chain,
-   MoE zero points incl. a negative control, dense WNA16 dequant).
+   MoE zero points incl. a negative control, dense WNA16 dequant, MoE config
+   search path).
 3. Convert the PLE table to fp8 (halves the table to ~48 GiB and is the format
    the file backend expects to keep resident-free):
    ```bash
@@ -78,9 +80,12 @@ with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the environment.
 
 with `SGLANG_FORCE_NATIVE_LAYERNORM=1 SGLANG_USE_AITER=0
 SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1 PYTORCH_TUNABLEOP_TUNING=0` in the
-environment, and `~/.cache/strix-halo-sglang-cache` mounted at
+environment, `~/.cache/strix-halo-sglang-cache` mounted at
 `/root/.cache/sglang` (SGLang's Triton / JIT kernel cache) so restarts do not
-recompile every kernel.
+recompile every kernel, and [`configs/moe/qwen38-flash-next`](../configs/moe/)
+mounted at `/moe-configs` with `SGLANG_MOE_CONFIG_DIR=/moe-configs` (the
+tuned MoE tiles; `MOE_CONFIG_DIR` / `QWEN38_MOE_CONFIG_DIR` pick another
+profile, empty disables it).
 
 The first boot writes the 48 GiB PLE table and takes ~10 min; later boots
 reuse it (patch 13) and skip the 128 PLE shards. First-request kernel
@@ -108,6 +113,7 @@ on local NVMe: it is random-read during decode.
 
 ```
 Using CompressedTensorsWNA16TritonMoE (ROCm)
+Using MoE kernel config from /moe-configs/E=512,N=320,device_name=Radeon_8060S_Graphics,dtype=int4_w4a16.json.
 PLE table: file-backed mmap /ple/ple_table_<rows>x160_float8_e4m3fn_..._rows0-<rows>.bin (47.x GiB, torch.float8_e4m3fn)
 PLE table: WILLNEED prefetch on for gathers of >= 2048 rows (row = 160 B)
 PLE table: resident set capped at 8.0 GiB, checked every 30 s
@@ -274,16 +280,23 @@ noise (dominated by GDN/QSA and the PLE gather). Greedy answers, needle
 recall in a 7,790-token prompt and generated code were re-checked after the
 change; the tuner itself does not verify numerics.
 
-The config is baked into the image (Dockerfile copies `configs/moe/*.json`
-into the installed Triton version's config directory). Re-tune after a
-Triton or kernel change:
+The config lives in `configs/moe/qwen38-flash-next/` and is mounted at
+`/moe-configs` by the launcher (patch 17 makes `SGLANG_MOE_CONFIG_DIR` a
+search path in front of upstream's tree); nothing is baked into the image.
+Re-tune after a Triton or kernel change:
 
 ```bash
 docker cp tools/tune_moe_gfx1151.py sglang-qwen38:/tmp/
 docker exec -w /tmp sglang-qwen38 python3 /tmp/tune_moe_gfx1151.py \
     --model /models/qwen38 --dtype int4_w4a16 --disable-shared-experts-fusion --tune
-docker cp "sglang-qwen38:/tmp/E=512,N=320,device_name=Radeon_8060S_Graphics,dtype=int4_w4a16.json" configs/moe/
+docker cp "sglang-qwen38:/tmp/E=512,N=320,device_name=Radeon_8060S_Graphics,dtype=int4_w4a16.json" \
+    configs/moe/qwen38-flash-next/
 ```
+
+Keep the tuner's `--tp-size` at its default 2 (that is what yields the
+`N=320` key the runtime looks up). Another checkpoint gets its own profile
+directory (`QWEN38_MOE_CONFIG_DIR=…`) so the two sets of tuning data never
+overwrite each other; see [`configs/moe/README.md`](../configs/moe/README.md).
 
 ### Speculative decoding (MTP)
 
@@ -324,6 +337,71 @@ Verified end to end: chat with thinking (`reasoning_content` split out),
 structured tool calls (`finish_reason: tool_calls`), vision (exact OCR of
 rendered text plus shape/color identification, 128 image tokens), 8
 concurrent streams, 6302-token prompt with radix-cache reuse.
+
+## Running the abliterated variant (DERISKED)
+
+`davetha/Qwen3.8-Flash-Next-DERISKED-W4A16-AWQ` is a refusal-ablated requant
+of the same architecture: compressed-tensors W4A16, **symmetric, group 128**,
+experts *and* the 12 full-attention layers' `q/k/v/o` quantized; indexer,
+GDN, PLE, MTP, gates, norms, `lm_head` and the vision tower bf16 (the 333
+vision tensors are byte-identical in name and shape to cyankiwi's). Kept
+separate from the stock checkpoint end to end: own model directory, own PLE
+directory (the table file name is the same for every checkpoint), own
+container and served name, and its own benchmark and tuning data.
+
+What had to change to run it, and where:
+
+| Difference | Handling |
+|---|---|
+| Quantized dense attention projections | [Patch 16](../patches/16-wna16-rocm-dense.md): dequantized to bf16 at load, served with `F.linear` (the dense WNA16 scheme is Marlin-only; the MoE path already had a ROCm Triton kernel). Costs no extra bandwidth over the stock checkpoint's bf16 attention. |
+| `model-mtp-merged.safetensors` is 100 GiB (all 128 PLE shards + MTP in one file) | `tools/convert_ple_fp8.py --part-bytes 2GiB` splits any oversized file into PLE-only `-pleNNN` and `-restNNN` parts and rewrites the index, so patch 13's PLE-shard skip still applies. The converter also stopped using `safe_open`: safetensors maps the file `PROT_WRITE|MAP_PRIVATE`, which overcommit mode 0 refuses for 100 GiB on a 30 GB host; it now reads headers and tensors with plain seek/`readinto`. |
+| Chat template prepends a "Qwentium" obedience persona to every system block | Renamed to `chat_template.derisked.jinja`; the stock template is used. It is a template, not weights: the model's behaviour was probed without it. |
+| No `preprocessor_config.json` / `video_preprocessor_config.json` | Copied from the stock checkpoint (identical processor). |
+| Symmetric g128 experts | Same Triton kernel; the tuned `E=512,N=320` tiles measured the same on g128 as on g32 in the tuner's benchmark mode (bs 1/8/16/20/32: 103/734/1418/1569/2242 µs vs 105/750/1347/1611/2305), so the stock profile is mounted until a g128-tuned profile exists. |
+
+Conversion (the 100 GiB file needs a memory cap only to keep the page cache
+honest; RSS stays under 2 GiB):
+
+```bash
+docker run --rm --memory 14g \
+    -v /scratch/hf-staging/Qwen3.8-Flash-Next-DERISKED-W4A16-AWQ:/src:ro \
+    -v /opt/llm/models/Qwen3.8-Flash-Next-DERISKED-W4A16-ple-fp8:/dst \
+    -v $PWD/tools/convert_ple_fp8.py:/convert.py:ro \
+    strix-halo-sglang:dev python3 -u /convert.py /src /dst --part-bytes 2GiB
+cd /opt/llm/models/Qwen3.8-Flash-Next-DERISKED-W4A16-ple-fp8
+mv chat_template.jinja chat_template.derisked.jinja
+cp /path/to/stock/{chat_template.jinja,preprocessor_config.json,video_preprocessor_config.json} .
+```
+
+Launch beside (not with: the GPU holds one of these) the stock server:
+
+```bash
+SGLANG_CONTAINER=sglang-qwen38-derisked QWEN38_SERVED_NAME=qwen38-flash-next-derisked \
+MODEL_DIR=/opt/llm/models/Qwen3.8-Flash-Next-DERISKED-W4A16-ple-fp8 \
+PLE_DIR=/opt/llm/ple-cache-derisked ./start-qwen38.sh
+```
+
+Loads in ~6 min (first boot writes its own 47.7 GiB table), ~1.5 GB more
+free VRAM after load than stock, same graph list and request cap. Verified: 12 greedy probes answered (the stock model
+refused none of them either; the difference is in tone, not in refusals, for
+that set), identity unchanged, vision exact on the synthetic test image
+(160 image tokens).
+
+| | Stock (cyankiwi g32) | DERISKED (g128) |
+|---|---:|---:|
+| Prefill 1.6k / 6.7k / 27k tokens | 535 / 554 / 475 tok/s | 535 / 538 / 504 tok/s |
+| Decode bs=1 | 14.5 tok/s | 14.3–15.0 tok/s |
+| 8 streams | 57.9 (sanity re-run 49.6) | 47.1 / 51.8 |
+| 16 streams | 99.4 (sanity re-run 89.5) | 70.6 / 73.9 / 72.7 |
+| 20 streams | 88–97 | 72.9 |
+
+Single-stream and prefill match; at 16–20 streams the abliterated build is
+~20% behind. The MoE tiles are ruled out (same kernel time on both group
+sizes, see above); the runs were not back to back with stock, and the
+stock 16-stream figure itself moved 99 → 90 between sessions, so treat the
+gap as partly run variance and partly open. Its logs show every decode step
+in a captured graph. The int4 attention projections are served as bf16
+(patch 16), so they cannot be slower than stock's bf16 ones.
 
 ## Known limitations
 

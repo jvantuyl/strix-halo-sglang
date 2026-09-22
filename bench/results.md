@@ -201,7 +201,7 @@ workgroups launch. Upstream's defaults launch roughly 64 across a 40-CU part.
 
 `num_warps=1` can't cover memory latency; 8 oversubscribes. Two is the optimum, reproduced three
 times. `BLOCK_SIZE_K` 64 and 256 were both worse than 128; `GROUP_SIZE_M` made no difference.
-Shipped in [`configs/moe/`](../configs/moe/).
+Shipped in [`configs/moe/qwen3.5-35b-a3b/`](../configs/moe/qwen3.5-35b-a3b/) (mounted by the launcher, patch 17).
 
 **This is what took SGLang past Ollama on single-stream decode** — 34.5 → 39.6 tps, +15%.
 

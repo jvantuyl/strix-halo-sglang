@@ -2,14 +2,25 @@
 
 Upstream ships no fused-MoE tile configs for `Radeon_8060S_Graphics`, so the
 kernel falls back to a generic shape (`BLOCK_SIZE_N=128, num_warps=4` for
-large M; `16/32/64` for small M). The files here are baked into the image by
-the Dockerfile, under the config directory of whatever Triton version the
-image installs, so they apply without a mount. To try a config without
-rebuilding, mount this directory over that path instead:
+large M; `16/32/64` for small M). The configs live here, one directory per
+checkpoint they were tuned on, and are **mounted at run time**, not baked
+into the image: the launchers and `compose.yaml` bind the chosen profile at
+`/moe-configs` and set `SGLANG_MOE_CONFIG_DIR=/moe-configs`, which
+[patch 17](../../patches/17-moe-config-dir.md) turns into a search path
+checked before upstream's builtin tree (flat files or the
+`configs/triton_x_y_z/` layout; several directories may be joined with `:`).
 
-```
--v $(pwd)/configs/moe:/sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_0
-```
+| Profile | Tuned on | Launcher default for |
+|---|---|---|
+| [`qwen3.5-35b-a3b/`](qwen3.5-35b-a3b/) | `cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit` (`E=256,N=256`, int4 g32) | `start-sglang.sh`, compose `sglang` (`MOE_CONFIG_DIR`) |
+| [`qwen38-flash-next/`](qwen38-flash-next/) | `cyankiwi/Qwen3.8-Flash-Next-AWQ-INT4` (`E=512,N=320`, int4 g32) | `start-qwen38.sh`, compose `qwen38` (`QWEN38_MOE_CONFIG_DIR`) |
+
+The file name is keyed on expert count, `N` and dtype only (`block_shape`
+`[0, group]` is dropped because of the leading zero), so a config tuned for
+another group size or checkpoint of the same shape gets the **same name**;
+keeping one directory per checkpoint is what stops them overwriting each
+other and keeps each model's tuning data separate. `MOE_CONFIG_DIR=` (empty)
+runs on upstream's generic tiles, e.g. for a before/after measurement.
 
 Keys must be integers (batch sizes); the loader does `int(key)` on every
 key, so no comment fields.
@@ -59,8 +70,18 @@ Reproduce inside the image (GPU attached, server may stay up):
 docker cp tools/tune_moe_gfx1151.py sglang-qwen38:/tmp/
 docker exec -w /tmp sglang-qwen38 python3 /tmp/tune_moe_gfx1151.py \
     --model /models/qwen38 --dtype int4_w4a16 --disable-shared-experts-fusion --tune
-docker cp "sglang-qwen38:/tmp/E=512,N=320,device_name=Radeon_8060S_Graphics,dtype=int4_w4a16.json" configs/moe/
+docker cp "sglang-qwen38:/tmp/E=512,N=320,device_name=Radeon_8060S_Graphics,dtype=int4_w4a16.json" \
+    configs/moe/qwen38-flash-next/
 ```
+
+Leave the tuner's `--tp-size` at its default of 2: that is what makes its
+`N` come out as 320, the key the runtime looks up (`--tp-size 1` writes an
+`N=640` file nothing reads). For another checkpoint of the same shape (e.g.
+a g128 requant) write into a new profile directory and point
+`MOE_CONFIG_DIR` / `QWEN38_MOE_CONFIG_DIR` at it. The tuner's benchmark
+mode (without `--tune`) times whichever config the runtime would pick, so
+`SGLANG_MOE_CONFIG_DIR=/moe-configs` vs unset gives a direct tuned vs
+generic comparison.
 
 Results are in [`docs/RUNNING_QWEN38.md`](../../docs/RUNNING_QWEN38.md)
 (MoE tile tuning section).

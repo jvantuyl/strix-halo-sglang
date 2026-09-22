@@ -7,6 +7,10 @@
 #
 # Override defaults via .env or shell env, e.g.:
 #   SGLANG_MODEL=Qwen/Qwen3.5-4B HF_TOKEN=hf_xxx docker compose up -d
+#
+# Tuned fused-MoE tiles are mounted per checkpoint from configs/moe/<profile>
+# (patch 17), not baked into the image; MOE_CONFIG_DIR / QWEN38_MOE_CONFIG_DIR
+# pick the profile. See configs/moe/README.md.
 
 services:
   sglang:
@@ -23,9 +27,11 @@ services:
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
       SGLANG_FORCE_NATIVE_LAYERNORM: "1"
+      SGLANG_MOE_CONFIG_DIR: /moe-configs
     volumes:
       - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
       - ${TUNABLE_DIR:-~/.cache/strix-halo-sglang-tunableop}:/root/.tunableop
+      - ${MOE_CONFIG_DIR:-./configs/moe/qwen3.5-35b-a3b}:/moe-configs:ro
     command:
       - python3
       - -m
@@ -68,6 +74,7 @@ services:
       SGLANG_FORCE_NATIVE_LAYERNORM: "1"
       SGLANG_USE_AITER: "0"
       SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK: "1"
+      SGLANG_MOE_CONFIG_DIR: /moe-configs
       # Tuning benchmarks every GEMM solution per new prompt length (14-20 s
       # of TTFT each); recorded tunings are still used with it off.
       PYTORCH_TUNABLEOP_TUNING: "${SGLANG_TUNABLEOP_TUNING:-0}"
@@ -80,6 +87,8 @@ services:
       - ${TUNABLE_DIR:-~/.cache/strix-halo-sglang-tunableop}:/root/.tunableop
       # Triton / JIT kernel cache, so restarts do not recompile everything.
       - ${SGL_CACHE_DIR:-~/.cache/strix-halo-sglang-cache}:/root/.cache/sglang
+      # Tuned MoE tiles for this checkpoint (g32); another checkpoint gets its own profile.
+      - ${QWEN38_MOE_CONFIG_DIR:-./configs/moe/qwen38-flash-next}:/moe-configs:ro
     command:
       - python3
       - -m

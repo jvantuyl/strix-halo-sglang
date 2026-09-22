@@ -21,6 +21,8 @@ Covers:
      fixed-width reference.
   5. patch 16 -- dense wNa16 load-time dequant (symmetric / asymmetric, with
      and without actorder g_idx) vs a plain reference, plus F.linear output.
+  6. patch 17 -- SGLANG_MOE_CONFIG_DIR search path (flat and
+     configs/triton_<ver>/ layouts, missing directories, precedence).
 """
 from __future__ import annotations
 
@@ -331,12 +333,74 @@ def test_wna16_dense_dequant():
 # ---------------------------------------------------------------------------
 # 6. SGLANG_MOE_CONFIG_DIR search path (patch 17)
 # ---------------------------------------------------------------------------
+def test_moe_config_dir():
+    """Mounted tile configs win over the builtin tree; missing dirs are skipped.
+
+    Uses a fabricated (E, N) so the builtin tree never has a match, and the
+    layout the tuner writes (flat json in a directory) plus upstream's
+    configs/triton_<ver>/ layout.
+    """
+    import json
+    import os
+    import tempfile
+
+    import triton
+    from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe_triton_config as cfg
+    from sglang.srt.runtime_context import publish, reset_context
+    from sglang.srt.server_args import ServerArgs
+
+    # get_moe_configs reads the published server args (deterministic flag).
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+
+    E, N, dtype, group = 7, 11, "int4_w4a16", 32
+    name = cfg.get_config_file_name(E, N, dtype, [0, group])
+    version_dir = f"triton_{triton.__version__.replace('.', '_')}"
+
+    def lookup(env):
+        cfg.get_moe_configs.cache_clear()
+        old = os.environ.pop("SGLANG_MOE_CONFIG_DIR", None)
+        if env is not None:
+            os.environ["SGLANG_MOE_CONFIG_DIR"] = env
+        try:
+            return cfg.get_moe_configs(E, N, dtype, 0, group)
+        finally:
+            os.environ.pop("SGLANG_MOE_CONFIG_DIR", None)
+            if old is not None:
+                os.environ["SGLANG_MOE_CONFIG_DIR"] = old
+
+    with tempfile.TemporaryDirectory() as flat, tempfile.TemporaryDirectory() as tree:
+        with open(os.path.join(flat, name), "w") as f:
+            json.dump({"1": {"BLOCK_SIZE_M": 16, "tag": "flat"}}, f)
+        os.makedirs(os.path.join(tree, "configs", version_dir))
+        with open(os.path.join(tree, "configs", version_dir, name), "w") as f:
+            json.dump({"1": {"BLOCK_SIZE_M": 16, "tag": "tree"}}, f)
+
+        try:
+            unset = lookup(None)
+            check("moe_config_dir unset -> builtin fallback", unset is None, repr(unset))
+            missing = lookup("/nonexistent-moe-configs")
+            check("moe_config_dir missing dir skipped", missing is None, repr(missing))
+            got = lookup(flat)
+            check("moe_config_dir flat layout", got == {1: {"BLOCK_SIZE_M": 16, "tag": "flat"}}, repr(got))
+            got = lookup(tree)
+            check("moe_config_dir configs/triton_ver layout", got == {1: {"BLOCK_SIZE_M": 16, "tag": "tree"}}, repr(got))
+            got = lookup(os.pathsep.join(["/nonexistent-moe-configs", tree, flat]))
+            check("moe_config_dir first match wins", got == {1: {"BLOCK_SIZE_M": 16, "tag": "tree"}}, repr(got))
+        except Exception as e:  # noqa: BLE001
+            check("moe_config_dir", False, f"{type(e).__name__}: {e}")
+        finally:
+            cfg.get_moe_configs.cache_clear()
+            reset_context()
+
+
 if __name__ == "__main__":
     test_ple_cpu_gather()
     test_qsa_decode()
     test_fast_topk()
     test_moe_zp()
     test_wna16_dense_dequant()
+    test_moe_config_dir()
     print()
     if FAILURES:
         print("FAILED:", ", ".join(FAILURES))
