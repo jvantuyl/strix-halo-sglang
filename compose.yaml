@@ -100,7 +100,7 @@ services:
       - --mem-fraction-static
       - "${QWEN38_MEM_FRAC:-0.85}"
       - --context-length
-      - "${QWEN38_CONTEXT:-32768}"
+      - "${QWEN38_CONTEXT:-131072}"
       # fp8 KV halves the pool; the cap turns that into ~3 GB of headroom.
       - --kv-cache-dtype
       - "${QWEN38_KV_DTYPE:-fp8_e4m3}"

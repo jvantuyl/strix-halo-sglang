@@ -65,7 +65,7 @@ python3 -m sglang.launch_server \
     --model-path /models/qwen38 \
     --ple-offload-embedding \
     --ple-offload-backend file --ple-offload-dir /ple \
-    --mem-fraction-static 0.85 --context-length 32768 \
+    --mem-fraction-static 0.85 --context-length 131072 \
     --kv-cache-dtype fp8_e4m3 --max-total-tokens 262144 \
     --attention-backend triton \
     --cuda-graph-max-bs-decode 20 --max-running-requests 20 \
@@ -94,6 +94,7 @@ on local NVMe: it is random-read during decode.
 | `--ple-offload-backend file --ple-offload-dir /ple` | The table becomes a sparse file-backed `mmap`; rows are read through the page cache on demand and the resident set is trimmed (8 GiB cap by default). The first boot writes the table (~48 GiB) and arms a completion marker (`<table>.complete.json`, fingerprinted by the checkpoint index and PLE shard sizes); later boots skip the PLE shards while the marker matches. Delete the marker to force a rewrite. |
 | `SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1` | Upstream gates the file backend on `cudaDevAttrPageableMemoryAccessUsesHostPageTables` (GB10). Irrelevant here: patch 11 gathers on the CPU, the GPU never dereferences the mapping. |
 | `--attention-backend triton` | Same as every other model on this box; aiter's CK paths are CDNA-only. |
+| `--context-length 131072` | The model is trained to 262,144 positions (no RoPE scaling needed). 131k costs nothing here: the pools are preallocated and the 8192-token prefill chunks bound activation size, so peak VRAM at a 120k prefill equals idle (88.9 GiB). Measured below: prefill flat at 450–480 tok/s to 125k tokens, decode 14.0 tok/s at 125k vs 14.5 short, exact needle recall at 120k. `QWEN38_CONTEXT` / `SGLANG_CONTEXT` override. |
 | `--kv-cache-dtype fp8_e4m3 --max-total-tokens 262144` | fp8 KV halves the pool; the token cap keeps the saving as headroom instead of a larger pool (see Memory). `QWEN38_KV_DTYPE` / `QWEN38_MAX_TOTAL_TOKENS` override. |
 | `--cuda-graph-max-bs-decode 20 --max-running-requests 20` | Decode graphs for bs 1, 2, 4, 8, 12, 16, 20; patch 14 fills the PLE prefetch buffer from the host before each replay. The two numbers are independent (`QWEN38_CUDA_GRAPH_MAX_BS`, `QWEN38_MAX_RUNNING_REQUESTS`); the default keeps them equal because graphs above bs 8 cost 0.3 GB and nothing else. They used to be tied because eager decode above the graph range faulted the next replay; patch 15 fixed that. Note this upstream split the flag: a bare `--cuda-graph-max-bs` is rejected as ambiguous. |
 | `--max-mamba-cache-size 100` | The GDN layers keep a fixed-size recurrent state (conv window + SSM matrix) per request instead of per-token KV, in a pool counted in slots. With the radix cache on SGLang reserves 5 slots per request (3 for the live state, prefix-cache branch points and the prefill→decode handoff, plus 2 for the overlap scheduler's ping-pong buffer), so `max_running_requests = slots // 5`. The ratio-sized pool came out at 99 slots and silently capped the server at 19 requests (and the graph list at `[..., 16, 19]`); 100 makes the advertised 20 real. ~54 MB per slot in bf16, so ~270 MB per extra request. `QWEN38_MAMBA_CACHE_SIZE` overrides; keep it at 5 × `QWEN38_MAX_RUNNING_REQUESTS`. |
@@ -159,7 +160,7 @@ pools. What does:
 | Change | Saves | Cost | Default |
 |---|---:|---|---|
 | `--kv-cache-dtype fp8_e4m3` | half the KV pool | none measured: identical greedy answers, exact needle recall in a 3,858-token prompt, decode 12.9 tok/s | on |
-| `--max-total-tokens 262144` | ~3.2 GiB vs the fraction-sized pool | one full-context request or 8 × 32k still fit | on |
+| `--max-total-tokens 262144` | ~3.2 GiB vs the fraction-sized pool | two full 131k-context requests or 20 × 13k fit at once; beyond that SGLang queues or retracts | on |
 | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | fragmentation | none | on |
 | vision tower off (`QWEN38_VISION=0` / `QWEN38_MODEL_OVERRIDE='{"language_model_only": true}'`) | ~0.9 GiB (333 tensors skipped) | no image input | off |
 | `--max-mamba-cache-size N` | ~54 MB per slot (bf16) | 5 slots per request with the radix cache on, 1 with `--disable-radix-cache`; under MTP an extra `(requests+1) × draft_tokens` intermediate states | 100 (= 20 requests) |
@@ -187,6 +188,18 @@ flushed before every prefill measurement (streaming client, `max_tokens`
 | 1,650 | 3.1 s | 535 tok/s | 14.5 tok/s |
 | 6,693 | 12.1 s | 554 tok/s | 14.5 tok/s |
 | 26,983 | 56.8 s | 475 tok/s | 14.7 tok/s |
+| 32,935 | 71.7 s | 459 tok/s | 13.9 tok/s |
+| 66,043 | 138.5 s | 477 tok/s | 14.0 tok/s |
+| 99,151 | 215.2 s | 461 tok/s | 14.0 tok/s |
+| 125,576 | 280.9 s | 447 tok/s | 14.0 tok/s |
+
+Prefill is flat to the context limit (sparse attention and GDN, not dense
+attention) and decode loses ~3% between short and 125k contexts. A needle at
+60% depth of a 119,911-token prompt was recalled exactly. Two concurrent
+59.5k-token requests with distinct prefixes: 119k KV tokens in use (46% of
+the pool), 19.3 tok/s aggregate decode; the second request's prefill queued
+behind the first (TTFT 151 s / 248 s) while the first decoded at 1.2 tok/s
+between prefill chunks, which is chunked prefill working as designed.
 
 | Concurrency (short prompts, 200 tokens each) | Aggregate | Per stream | TTFT (max) |
 |---:|---:|---:|---:|
