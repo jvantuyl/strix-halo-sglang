@@ -188,6 +188,16 @@ RUN python3 /tmp/patch_sleep_on_idle.py && rm /tmp/patch_sleep_on_idle.py
 COPY patches/fix_aiter_gfx1151_mxfp4.py /tmp/fix_aiter_gfx1151_mxfp4.py
 RUN python3 /tmp/fix_aiter_gfx1151_mxfp4.py && rm /tmp/fix_aiter_gfx1151_mxfp4.py
 
+# --- tuned fused-MoE Triton tile configs for gfx1151 ---
+# Upstream ships no Radeon_8060S_Graphics configs, so the kernel falls back to a
+# generic tile shape. Install configs/moe/*.json under the directory for the
+# Triton version actually in the image; the runtime looks there first and only
+# falls back to other versions' directories with a warning. See configs/moe/README.md.
+COPY configs/moe/*.json /tmp/moe-configs/
+RUN d="python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_$(python3 -c 'import triton; print(triton.__version__.replace(".", "_"))')" \
+    && mkdir -p "$d" && cp /tmp/moe-configs/*.json "$d/" && rm -rf /tmp/moe-configs \
+    && python3 -c "import glob, json, sys; [({int(k) for k in json.load(open(p))}, print('moe config', p)) for p in glob.glob(sys.argv[1] + '/*Radeon_8060S*.json')]" "$d"
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"
