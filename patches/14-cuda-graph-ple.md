@@ -53,18 +53,14 @@ Verified on the dummy-weight mini config: decode graphs bs 1–8, a padded
 batch (5 requests → bs 8), and MTP (`--speculative-algorithm NEXTN`) with
 target-verify and draft graphs.
 
-## Open issue: eager decode above the graph range
+## Resolved: eager decode above the graph range
 
-A decode step that runs eager because the batch is larger than any captured
-graph (e.g. 12–16 streams with graphs for bs ≤ 8) is followed, once the batch
-drains back into the graph range, by a GPU page fault inside the next replay
-(`Memory access fault by GPU node-1 ... Page not present`). Reproduced within
-two rounds of an 8/12/16-stream loop; independent of the MoE tile config and
-of `expandable_segments`; pure eager and pure graph runs are clean; under
-`AMD_SERIALIZE_KERNEL=3` the fault is reported at the first kernel launched
-after the replay. Not yet root-caused (this patch's host fill or the upstream
-decode graph runner on the eager→graph transition are the suspects). The
-launchers tie `--max-running-requests` to `--cuda-graph-max-bs-decode` (both
-20, with `--max-mamba-cache-size 100` so the GDN state pool does not cap the
-request count below the graph list) so the scheduler never forms a decode
-batch without a graph.
+A decode step that ran eager because the batch was larger than any captured
+graph (e.g. 12–16 streams with graphs for bs ≤ 8) was followed, after a
+`/flush_cache`, by a GPU page fault inside the next replay. This patch was a
+suspect but is not involved: the PLE prefetch buffers are per batch size,
+allocated under capture and never replaced. The buffer the graphs lost was
+upstream's QSA packed-KV scratch, re-grown by the eager step; see
+[patch 15](15-qsa-graph-scratch.md) for the two contributing factors and the
+fix. `--max-running-requests` no longer has to match
+`--cuda-graph-max-bs-decode`.

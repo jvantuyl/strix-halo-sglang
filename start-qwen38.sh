@@ -14,15 +14,13 @@
 #
 # Notes:
 #   - Decode CUDA graphs are on for bs 1-20 (patch 14 fills the PLE prefetch
-#     buffer from the host before each replay) and --max-running-requests is
-#     tied to the same number: a decode step that runs eager because the
-#     batch is larger than any captured graph is followed by a GPU page fault
-#     in the next replay (reproducible, cause not yet found; pure eager and
-#     pure graph runs are both clean). QWEN38_CUDA_GRAPH_MAX_BS moves both,
-#     and the GDN state pool is sized to match (--max-mamba-cache-size =
-#     5 slots per request; the ratio-sized pool came out at 99 and capped the
-#     server at 19). QWEN38_CUDA_GRAPH_MAX_BS=0 is not a switch; pass
-#     --disable-cuda-graph as an extra argument instead.
+#     buffer from the host before each replay). QWEN38_CUDA_GRAPH_MAX_BS sets
+#     the largest graph; QWEN38_MAX_RUNNING_REQUESTS (default: the same
+#     number) sets the request cap, and the GDN state pool is sized from it
+#     (--max-mamba-cache-size = 5 slots per request; the ratio-sized pool
+#     came out at 99 and capped the server at 19). Eager decode above the
+#     graph range is safe since patch 15. QWEN38_CUDA_GRAPH_MAX_BS=0 is not a
+#     switch; pass --disable-cuda-graph as an extra argument instead.
 #   - The PLE table file (~48 GiB fp8, sparse) is written on the first boot,
 #     reused on later ones (patch 13) and random-read during decode; keep
 #     $PLE_DIR on local NVMe.
@@ -47,8 +45,9 @@ IMAGE="${SGLANG_IMAGE:-strix-halo-sglang:dev}"
 PORT="${SGLANG_PORT:-30001}"
 NAME="${SGLANG_CONTAINER:-sglang-qwen38}"
 CUDA_GRAPH_MAX_BS="${QWEN38_CUDA_GRAPH_MAX_BS:-20}"
+MAX_RUNNING_REQUESTS="${QWEN38_MAX_RUNNING_REQUESTS:-$CUDA_GRAPH_MAX_BS}"
 # With the radix cache on, SGLang reserves 5 GDN state slots per request.
-MAMBA_CACHE_SIZE="${QWEN38_MAMBA_CACHE_SIZE:-$((5 * CUDA_GRAPH_MAX_BS))}"
+MAMBA_CACHE_SIZE="${QWEN38_MAMBA_CACHE_SIZE:-$((5 * MAX_RUNNING_REQUESTS))}"
 MODEL_DIR="${MODEL_DIR:-$HOME/models/Qwen3.8-Flash-Next-AWQ-INT4-ple-fp8}"
 PLE_DIR="${PLE_DIR:-/opt/llm/ple-cache}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
@@ -106,7 +105,7 @@ exec docker run --name "$NAME" \
         --json-model-override-args "$MODEL_OVERRIDE" \
         --attention-backend triton \
         --cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS" \
-        --max-running-requests "$CUDA_GRAPH_MAX_BS" \
+        --max-running-requests "$MAX_RUNNING_REQUESTS" \
         --max-mamba-cache-size "$MAMBA_CACHE_SIZE" \
         --mamba-ssm-dtype bfloat16 \
         --reasoning-parser qwen3-thinking \

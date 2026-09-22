@@ -19,6 +19,7 @@ group 32, asymmetric; vision tower unquantized). MTP is not used.
 | [12](../patches/12-wna16-triton-zp.md) | Pass zero points to the Triton WNA16 MoE kernel; load-time zp transpose; GC between MoE layers in post-load | Asymmetric AWQ; without it every expert weight is off by `(8 - zp) * scale`. Without the GC the old expert weights of every converted layer stay allocated (~1.4 GiB each) and the 48-layer load OOMs |
 | [13](../patches/13-ple-table-reuse.md) | Reuse the file-backed PLE table across boots | Upstream rewrites the 48 GiB table from the checkpoint on every start; a fingerprinted marker lets later boots skip the PLE shards |
 | [14](../patches/14-cuda-graph-ple.md) | Decode CUDA graphs with the CPU-side PLE gather | The host gather cannot be captured; fill the static PLE prefetch buffer from the host before each replay |
+| [15](../patches/15-qsa-graph-scratch.md) | Dedicated QSA packed-KV scratch for captured graphs | Upstream shares one growable scratch between graphs and eager decode; an eager step above the graph range re-allocates it and the graphs write into freed memory (GPU page fault after the next `empty_cache`). Not gfx1151-specific |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16` | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
@@ -94,8 +95,8 @@ on local NVMe: it is random-read during decode.
 | `SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1` | Upstream gates the file backend on `cudaDevAttrPageableMemoryAccessUsesHostPageTables` (GB10). Irrelevant here: patch 11 gathers on the CPU, the GPU never dereferences the mapping. |
 | `--attention-backend triton` | Same as every other model on this box; aiter's CK paths are CDNA-only. |
 | `--kv-cache-dtype fp8_e4m3 --max-total-tokens 262144` | fp8 KV halves the pool; the token cap keeps the saving as headroom instead of a larger pool (see Memory). `QWEN38_KV_DTYPE` / `QWEN38_MAX_TOTAL_TOKENS` override. |
-| `--cuda-graph-max-bs-decode 20 --max-running-requests 20` | Decode graphs for bs 1, 2, 4, 8, 12, 16, 20. Patch 14 fills the PLE prefetch buffer from the host before each replay. The two numbers must match: a decode step that runs eager because the batch exceeds the largest captured graph is followed by a GPU page fault in the next replay (see Known limitations), so every batch size the scheduler can form has a graph. `QWEN38_CUDA_GRAPH_MAX_BS` moves both. Note this upstream split the flag: a bare `--cuda-graph-max-bs` is rejected as ambiguous. |
-| `--max-mamba-cache-size 100` | The GDN layers keep a fixed-size recurrent state (conv window + SSM matrix) per request instead of per-token KV, in a pool counted in slots. With the radix cache on SGLang reserves 5 slots per request (3 for the live state, prefix-cache branch points and the prefill→decode handoff, plus 2 for the overlap scheduler's ping-pong buffer), so `max_running_requests = slots // 5`. The ratio-sized pool came out at 99 slots and silently capped the server at 19 requests (and the graph list at `[..., 16, 19]`); 100 makes the advertised 20 real. ~54 MB per slot in bf16, so ~270 MB per extra request. `QWEN38_MAMBA_CACHE_SIZE` overrides; keep it at 5 × `QWEN38_CUDA_GRAPH_MAX_BS`. |
+| `--cuda-graph-max-bs-decode 20 --max-running-requests 20` | Decode graphs for bs 1, 2, 4, 8, 12, 16, 20; patch 14 fills the PLE prefetch buffer from the host before each replay. The two numbers are independent (`QWEN38_CUDA_GRAPH_MAX_BS`, `QWEN38_MAX_RUNNING_REQUESTS`); the default keeps them equal because graphs above bs 8 cost 0.3 GB and nothing else. They used to be tied because eager decode above the graph range faulted the next replay; patch 15 fixed that. Note this upstream split the flag: a bare `--cuda-graph-max-bs` is rejected as ambiguous. |
+| `--max-mamba-cache-size 100` | The GDN layers keep a fixed-size recurrent state (conv window + SSM matrix) per request instead of per-token KV, in a pool counted in slots. With the radix cache on SGLang reserves 5 slots per request (3 for the live state, prefix-cache branch points and the prefill→decode handoff, plus 2 for the overlap scheduler's ping-pong buffer), so `max_running_requests = slots // 5`. The ratio-sized pool came out at 99 slots and silently capped the server at 19 requests (and the graph list at `[..., 16, 19]`); 100 makes the advertised 20 real. ~54 MB per slot in bf16, so ~270 MB per extra request. `QWEN38_MAMBA_CACHE_SIZE` overrides; keep it at 5 × `QWEN38_MAX_RUNNING_REQUESTS`. |
 | `--mamba-ssm-dtype bfloat16` | The GDN recurrent state is fp32 by default (~108 MB per slot); bf16 halves it, so 100 slots cost 5.4 GB instead of 10.8. Upstream's own suggestion in the startup log. |
 | `--reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder` | The chat template opens `<think>` in the generation prompt and asks for `<tool_call><function=...><parameter=...>` tool calls. Without these the thinking and the XML come back as plain `content`. |
 | `PYTORCH_TUNABLEOP_TUNING=0` | The image enables PyTorch TunableOp, which benchmarks every GEMM solution for each *new* M (= tokens in the prefill chunk). That is 14–20 s of TTFT for every novel prompt length (measured; the recorded results persist in `~/.cache/strix-halo-sglang-tunableop` so a repeated length is fast). With tuning off the recorded solutions are still used and untuned shapes take hipBLASLt's heuristic pick. `SGLANG_TUNABLEOP_TUNING=1 ./start-qwen38.sh` to deliberately record more. |
@@ -200,8 +201,9 @@ How it got here, single stream / 8 streams: eager 11.2 / 42.9 tok/s; decode
 graphs (patch 14) 12.7 / 43.0; tuned MoE tiles (below) 14.5 / 57.9. Graphs
 for bs 12–20 do not change throughput measurably against eager at those
 sizes (server-side peak +4% at bs 16, within run-to-run noise end to end);
-they are captured because of the fault described under Known limitations,
-not for speed. Run-to-run spread at 8 streams is about ±7%. Throughput
+they were originally captured to keep eager decode out of the picture (see
+patch 15) and stay on because they are cheap. Run-to-run spread at 8 streams
+is about ±7%. Throughput
 plateaus at 16 streams; the 20-request cap is queueing capacity, not speed
 (each extra request costs ~270 MB of GDN state and one more graph).
 
@@ -316,15 +318,12 @@ concurrent streams, 6302-token prompt with radix-cache reuse.
 - Prefill runs eager (upstream disables prefill graphs for this model).
 - First boot writes the 48 GiB PLE table; the `pinned` backend is not an
   option here (host RAM is the same pool).
-- Eager decode above the largest captured graph faults. With graphs for
-  bs ≤ 8 and 12–16 concurrent streams (eager decode), the first graph replay
-  after the batch drained below 8 died with `Memory access fault by GPU
-  node-1 ... Page not present`, reproducibly within two rounds, with and
-  without the tuned MoE tiles and with and without expandable segments. Pure
-  eager (`--disable-cuda-graph`) and pure graph (graphs up to
-  `max_running_requests`) runs are clean over many rounds; under
-  `AMD_SERIALIZE_KERNEL=3` the fault surfaces at the first kernel after the
-  replay (the sampler's `argmax`), placing it inside the replay. Cause not yet
-  found (patch 14 or the upstream decode graph runner on this path). The
-  launchers tie `--max-running-requests` to `--cuda-graph-max-bs-decode`
-  so the eager decode path never runs; keep them equal if you change one.
+- Fixed, kept for the record: eager decode above the largest captured graph
+  used to fault the next replay (`Memory access fault by GPU node-1 ... Page
+  not present`) after a `/flush_cache`. Two factors: upstream's QSA backend
+  shares one growable packed-KV scratch between captured graphs and eager
+  decode, so an eager step larger than any graph re-allocated it and the
+  graphs kept writing into the freed block; and `empty_cache()` then unmapped
+  that block. Patch 15 gives the graphs their own scratch. Verified with
+  graphs for bs ≤ 8 and 20 streams, flush between rounds, 3 rounds clean,
+  greedy probe identical. Without the flush the stale write was silent.

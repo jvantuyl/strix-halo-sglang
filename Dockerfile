@@ -169,6 +169,14 @@ RUN python3 /tmp/patch_ple_table_reuse.py && rm /tmp/patch_ple_table_reuse.py
 COPY patches/patch_cuda_graph_ple.py /tmp/patch_cuda_graph_ple.py
 RUN python3 /tmp/patch_cuda_graph_ple.py && rm /tmp/patch_cuda_graph_ple.py
 
+# --- dedicated QSA packed-KV scratch for captured graphs (patch 15) ---
+# Upstream shares one growable scratch between captured decode graphs and
+# eager decode; an eager step larger than any graph re-allocates it and the
+# graphs keep writing into freed memory (page fault after the next
+# empty_cache). Key the scratch on is_cuda_graph. See patches/15-qsa-graph-scratch.md.
+COPY patches/patch_qsa_graph_scratch.py /tmp/patch_qsa_graph_scratch.py
+RUN python3 /tmp/patch_qsa_graph_scratch.py && rm /tmp/patch_qsa_graph_scratch.py
+
 # --- idle scheduler sleeps instead of spinning a core (patch 10) ---
 # Upstream busy-polls its ZMQ sockets while idle, pinning one CPU core at 100%
 # forever (Tctl 38 -> 71 C on an idle Strix Halo). Default --sleep-on-idle to on;
