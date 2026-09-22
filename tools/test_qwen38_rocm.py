@@ -19,6 +19,8 @@ Covers:
      attention over packed selected KV.
   4. patch 11 -- qsa_fast_topk (JIT -> sgl_kernel -> reference chain) vs the
      fixed-width reference.
+  5. patch 16 -- dense wNa16 load-time dequant (symmetric / asymmetric, with
+     and without actorder g_idx) vs a plain reference, plus F.linear output.
 """
 from __future__ import annotations
 
@@ -264,11 +266,77 @@ def test_fast_topk():
     check("fast_topk_chain", not mism, f"mismatched rows {mism[:8]}")
 
 
+# ---------------------------------------------------------------------------
+# 5. dense wNa16 load-time dequant (patch 16)
+# ---------------------------------------------------------------------------
+def test_wna16_dense_dequant():
+    """Unpack of compressed-tensors pack-quantized int4 vs a plain reference.
+
+    Covers symmetric / asymmetric (packed zero points along N) with and
+    without an actorder g_idx; the layout of every W4A16 dense Linear
+    (attention q/k/v/o, shared experts) in public Qwen3.x checkpoints.
+    """
+    from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
+    from compressed_tensors.quantization import ActivationOrdering
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        compressed_tensors_wNa16 as wna16,
+    )
+
+    if not getattr(wna16, "_WNA16_DENSE_FALLBACK", False):
+        check("wna16_dense_dequant", False, "patch 16 fallback flag not present")
+        return
+
+    n, k, group = 256, 1024, 128
+    ngroups = k // group
+    for symmetric in (True, False):
+        for actorder in (False, True):
+            torch.manual_seed(5)
+            q = torch.randint(-8, 8, (n, k), dtype=torch.int8)
+            scale = (torch.rand(n, ngroups) * 0.05 + 0.01).to(torch.bfloat16)
+            zp = None if symmetric else torch.randint(-8, 8, (n, ngroups), dtype=torch.int8)
+            g_idx = (torch.randperm(k, dtype=torch.int32) % ngroups) if actorder else None
+            gi = g_idx.long() if actorder else torch.arange(k) // group
+            zref = (torch.zeros(n, ngroups) if zp is None else zp.float())[:, gi]
+            ref = (q.float() - zref) * scale.float()[:, gi]
+
+            layer = torch.nn.Module()
+            p = lambda t: torch.nn.Parameter(t.cuda(), requires_grad=False)  # noqa: E731
+            layer.register_parameter("weight_packed", p(pack_to_int32(q, 4)))
+            layer.register_parameter("weight_scale", p(scale))
+            layer.register_parameter("weight_shape", p(torch.tensor([n, k])))
+            if zp is not None:
+                layer.register_parameter("weight_zero_point", p(pack_to_int32(zp, 4, packed_dim=0)))
+            if actorder:
+                layer.register_parameter("weight_g_idx", p(g_idx))
+            scheme = wna16.CompressedTensorsWNA16(
+                strategy="group", num_bits=4, group_size=group, symmetric=symmetric,
+                actorder=ActivationOrdering.GROUP if actorder else None,
+            )
+            scheme.process_weights_after_loading(layer)
+            w = layer.weight.float().cpu()
+            # bf16 rounding of (q - zp) * scale is the only allowed difference
+            tol = ref.abs().max().item() * 2 ** -7
+            err = (w - ref).abs().max().item()
+            x = torch.randn(4, k, dtype=torch.bfloat16, device="cuda")
+            y = scheme.apply_weights(layer, x, bias=None).float().cpu()
+            yref = torch.nn.functional.linear(x.float().cpu(), ref)
+            rel = ((y - yref).norm() / yref.norm()).item()
+            check(
+                f"wna16_dense_dequant sym={symmetric} actorder={actorder}",
+                set(layer._parameters) == {"weight"} and err <= tol and rel < 2e-2,
+                f"max|dw|={err:.2e} (tol {tol:.2e}) rel(y)={rel:.2e}",
+            )
+
+
+# ---------------------------------------------------------------------------
+# 6. SGLANG_MOE_CONFIG_DIR search path (patch 17)
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     test_ple_cpu_gather()
     test_qsa_decode()
     test_fast_topk()
     test_moe_zp()
+    test_wna16_dense_dequant()
     print()
     if FAILURES:
         print("FAILED:", ", ".join(FAILURES))

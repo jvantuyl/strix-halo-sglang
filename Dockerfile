@@ -177,6 +177,14 @@ RUN python3 /tmp/patch_cuda_graph_ple.py && rm /tmp/patch_cuda_graph_ple.py
 COPY patches/patch_qsa_graph_scratch.py /tmp/patch_qsa_graph_scratch.py
 RUN python3 /tmp/patch_qsa_graph_scratch.py && rm /tmp/patch_qsa_graph_scratch.py
 
+# --- compressed-tensors int4 dense Linear on ROCm (patch 16) ---
+# The wNa16 dense scheme is Marlin-only and Marlin is CUDA-only, so any
+# checkpoint that quantizes attention / shared-expert / lm_head layers dies
+# in process_weights_after_loading. Dequantize the packed weight to bf16 once
+# at load and serve it with F.linear. See patches/16-wna16-rocm-dense.md.
+COPY patches/patch_wna16_rocm_dense.py /tmp/patch_wna16_rocm_dense.py
+RUN python3 /tmp/patch_wna16_rocm_dense.py && rm /tmp/patch_wna16_rocm_dense.py
+
 # --- idle scheduler sleeps instead of spinning a core (patch 10) ---
 # Upstream busy-polls its ZMQ sockets while idle, pinning one CPU core at 100%
 # forever (Tctl 38 -> 71 C on an idle Strix Halo). Default --sleep-on-idle to on;

@@ -20,6 +20,7 @@ group 32, asymmetric; vision tower unquantized). MTP is not used.
 | [13](../patches/13-ple-table-reuse.md) | Reuse the file-backed PLE table across boots | Upstream rewrites the 48 GiB table from the checkpoint on every start; a fingerprinted marker lets later boots skip the PLE shards |
 | [14](../patches/14-cuda-graph-ple.md) | Decode CUDA graphs with the CPU-side PLE gather | The host gather cannot be captured; fill the static PLE prefetch buffer from the host before each replay |
 | [15](../patches/15-qsa-graph-scratch.md) | Dedicated QSA packed-KV scratch for captured graphs | Upstream shares one growable scratch between graphs and eager decode; an eager step above the graph range re-allocates it and the graphs write into freed memory (GPU page fault after the next `empty_cache`). Not gfx1151-specific |
+| [16](../patches/16-wna16-rocm-dense.md) | Dense compressed-tensors int4 Linear on ROCm: dequantize to bf16 at load, serve with `F.linear` | The dense WNA16 scheme is Marlin-only and Marlin is CUDA-only (`NameError: gptq_marlin_repack`); needed by checkpoints that also quantize attention `q/k/v/o`, e.g. the [abliterated variant](#running-the-abliterated-variant-derisked) |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16` | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
@@ -38,7 +39,7 @@ n-gram hashing) is pure Triton upstream and runs unmodified.
        -v $PWD/tools/test_qwen38_rocm.py:/test.py:ro strix-halo-sglang:dev python3 /test.py
    ```
    Expect `ALL PARITY TESTS PASSED` (PLE gather bf16/fp8, QSA decode, top-k chain,
-   MoE zero points incl. a negative control).
+   MoE zero points incl. a negative control, dense WNA16 dequant).
 3. Convert the PLE table to fp8 (halves the table to ~48 GiB and is the format
    the file backend expects to keep resident-free):
    ```bash
