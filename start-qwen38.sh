@@ -11,6 +11,7 @@
 # Usage:
 #   ./start-qwen38.sh [extra sglang args...]
 #   SGLANG_PORT=30000 ./start-qwen38.sh
+#   SGLANG_DOCKER_ARGS="-e SGLANG_ENABLE_QWEN4_PLE_FUSION=0" ./start-qwen38.sh   # extra docker run args
 #
 # Another checkpoint of the same architecture (e.g. an abliterated variant,
 # see docs/RUNNING_QWEN38.md) is a matter of pointing MODEL_DIR at its
@@ -89,6 +90,7 @@ if [ -n "$MOE_CONFIG_DIR" ]; then
     MOE_ARGS=(-v "$MOE_CONFIG_DIR:/moe-configs:ro" -e SGLANG_MOE_CONFIG_DIR=/moe-configs)
 fi
 # Extra `docker run` arguments (word-split), e.g. -e VAR=1 for engine env knobs.
+read -r -a DOCKER_ARGS <<< "${SGLANG_DOCKER_ARGS:-}"
 
 if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
     echo "Note: removing existing container '$NAME'." >&2
@@ -113,6 +115,7 @@ exec docker run --name "$NAME" \
     -e SGLANG_FORCE_NATIVE_LAYERNORM=1 \
     -e SGLANG_USE_AITER=0 \
     -e SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1 \
+    "${DOCKER_ARGS[@]}" \
     "$IMAGE" \
     python3 -m sglang.launch_server \
         --model-path /models/qwen38 \
