@@ -222,6 +222,14 @@ RUN python3 /tmp/patch_moe_config_dir.py && rm /tmp/patch_moe_config_dir.py
 COPY patches/patch_hc_mix_rocm.py /tmp/patch_hc_mix_rocm.py
 RUN python3 /tmp/patch_hc_mix_rocm.py && rm /tmp/patch_hc_mix_rocm.py
 
+# --- GPTQ/AWQ MoE kernel: mask the weight load on a partial K block (patch 19) ---
+# When K % BLOCK_SIZE_K != 0 the kernel masks a and the scales but read the
+# packed weights unmasked, past the last expert's rows: a layout-dependent GPU
+# page fault (killed the tuner on the g128 checkpoint). Same code for even K.
+# See patches/19-moe-wna16-kmask.md.
+COPY patches/patch_moe_wna16_kmask.py /tmp/patch_moe_wna16_kmask.py
+RUN python3 /tmp/patch_moe_wna16_kmask.py && rm /tmp/patch_moe_wna16_kmask.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"

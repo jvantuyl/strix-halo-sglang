@@ -25,6 +25,8 @@ Covers:
      configs/triton_<ver>/ layouts, missing directories, precedence).
   7. patch 18 -- split (atomics-free) HyperConnection mix selected on HIP,
      vs the fp32 reference, and bit-identical across repeated launches.
+  8. patch 19 -- GPTQ/AWQ MoE kernel with K not a multiple of BLOCK_SIZE_K
+     (partial last block) vs the dequantized reference.
 """
 from __future__ import annotations
 
@@ -429,6 +431,64 @@ def test_hc_mix_deterministic():
         check(f"hc_mix rows={rows} bit-identical across launches", same == repeats, f"{same}/{repeats}")
 
 
+def test_moe_partial_k():
+    """GPTQ/AWQ MoE kernel with K not a multiple of BLOCK_SIZE_K (patch 19).
+
+    K=320 with BLOCK_SIZE_K=128 leaves a 64-row last block, the shape the
+    tuner's tp-2 shard produces for the down projection. Symmetric int4,
+    group 64. Checks parity against the dequantized reference; the unmasked
+    B load it replaces read past the tensor (a GPU page fault when the
+    mapping ends there), which only the tuner run itself can exercise.
+    """
+    from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+        invoke_fused_moe_kernel,
+    )
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+        moe_align_block_size,
+    )
+
+    torch.manual_seed(1)
+    E, K, N, G = 8, 320, 128, 64
+    M, topk = 13, 2
+    kg = K // G
+    dev = "cuda"
+    q = torch.randint(0, 16, (E, N, K), dtype=torch.int32, device=dev)
+    scale = torch.rand(E, kg, N, device=dev) * 0.01 + 0.005
+    dequant = ((q.view(E, N, kg, G).float() - 8.0)
+               * scale.float().permute(0, 2, 1).unsqueeze(-1)).reshape(E, N, K)
+    w_uint8 = q.to(torch.uint8).view(E, N, K // 2, 2)
+    w_packed = (w_uint8[..., 0] | (w_uint8[..., 1] << 4)).contiguous()
+    scale_conv = scale.to(torch.bfloat16).transpose(1, 2).contiguous()
+
+    a = torch.randn(M, K, device=dev, dtype=torch.bfloat16)
+    topk_ids = torch.randint(0, E, (M, topk), device=dev, dtype=torch.int32)
+    topk_weights = torch.ones(M, topk, device=dev, dtype=torch.bfloat16)
+    sorted_ids, expert_ids, num_post = moe_align_block_size(topk_ids, 16, E)
+    em = sorted_ids.shape[0]
+    for block_k in (128, 256):
+        config = {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": block_k,
+                  "GROUP_SIZE_M": 1, "num_warps": 2, "num_stages": 2}
+        out = torch.zeros(em, N, device=dev, dtype=torch.bfloat16)
+        invoke_fused_moe_kernel(
+            a, w_packed, None, out, None, scale_conv, None,
+            topk_weights, topk_ids, sorted_ids, expert_ids, num_post,
+            False, topk, config,
+            compute_type=tl.bfloat16,
+            use_fp8_w8a8=False, use_int8_w8a8=False, use_int8_w8a16=False,
+            use_int4_w4a16=True, per_channel_quant=False,
+            block_shape=[0, G],
+        )
+        torch.cuda.synchronize()
+        got = out[: M * topk].float()
+        ref = torch.zeros(M * topk, N, device=dev, dtype=torch.float32)
+        for t in range(M):
+            for j in range(topk):
+                ref[t * topk + j] = dequant[topk_ids[t, j]] @ a[t].float()
+        err = (got - ref).abs().max().item()
+        check(f"moe_partial_k K={K} BLOCK_K={block_k}",
+              torch.allclose(got, ref, atol=2e-2, rtol=2e-2), f"max abs err {err:.4g}")
+
+
 if __name__ == "__main__":
     test_ple_cpu_gather()
     test_qsa_decode()
@@ -437,6 +497,7 @@ if __name__ == "__main__":
     test_wna16_dense_dequant()
     test_moe_config_dir()
     test_hc_mix_deterministic()
+    test_moe_partial_k()
     print()
     if FAILURES:
         print("FAILED:", ", ".join(FAILURES))

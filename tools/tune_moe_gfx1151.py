@@ -32,7 +32,10 @@ copy:
    memory monitor is disabled too: it counts page cache and killed the worker
    at "95%" with 10 GB genuinely free. Sizes already present in the partial
    directory are skipped, so a run can be resumed by pointing
-   ``MOE_TUNE_PARTIAL_DIR`` at the previous one.
+   ``MOE_TUNE_PARTIAL_DIR`` at the previous one. The worker also appends every
+   config to ``<partial dir>/trace-M=<m>.log`` (epoch time, index, best so
+   far) before running it, so a config that kills the worker (GPU page fault)
+   is identified by the last line and can be matched against ``dmesg``.
 
 Environment: ``MOE_TUNE_BAIL_FACTOR`` (default 3.0), ``MOE_TUNE_PARTIAL_DIR``,
 ``SGLANG_MOE_TUNER_DIR``. Compiled kernels land in the normal Triton cache, so
@@ -138,11 +141,27 @@ replace(
     "    for _ in range(3):\n        graph.replay()\n    torch.cuda.synchronize()\n",
 )
 
-# tune(): pass the budget, count how many configs bailed.
+# tune(): pass the budget, count how many configs bailed. Trace every config
+# to <partial dir>/trace-M=<m>.log from the worker before it runs, so a
+# config that kills the worker (GPU page fault) can be identified by index
+# and matched against the kernel log by epoch time.
 replace(
     "        best_config = None\n        best_time = float(\"inf\")\n",
-    "        best_config = None\n        best_time = float(\"inf\")\n        bailed = 0\n",
+    "        best_config = None\n        best_time = float(\"inf\")\n        bailed = 0\n"
+    "        _trace = None\n"
+    "        if os.environ.get('MOE_TUNE_PARTIAL_DIR'):\n"
+    "            os.makedirs(os.environ['MOE_TUNE_PARTIAL_DIR'], exist_ok=True)\n"
+    "            _trace = open(os.path.join(os.environ['MOE_TUNE_PARTIAL_DIR'], f'trace-M={num_tokens}.log'), 'a')\n",
 )
+replace(
+    "            for config in tqdm(search_space):\n                try:\n",
+    "            for _idx, config in enumerate(tqdm(search_space)):\n"
+    "                if _trace is not None:\n"
+    "                    _trace.write(f'{time.time():.3f} idx={_idx} best={best_time:.1f} {config}\\n')\n"
+    "                    _trace.flush()\n"
+    "                try:\n",
+)
+replace("import json\n", "import json\nimport time\n")
 replace(
     "                        block_shape,\n                        num_iters=10,\n                    )\n",
     "                        block_shape,\n                        num_iters=10,\n"
