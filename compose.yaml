@@ -115,6 +115,9 @@ services:
       - "${QWEN38_CUDA_GRAPH_MAX_BS:-20}"
       - --max-running-requests
       - "${QWEN38_CUDA_GRAPH_MAX_BS:-20}"
+      # 5 GDN state slots per request (radix cache on); keep at 5 × the above.
+      - --max-mamba-cache-size
+      - "${QWEN38_MAMBA_CACHE_SIZE:-100}"
       - --mamba-ssm-dtype
       - bfloat16
       - --reasoning-parser

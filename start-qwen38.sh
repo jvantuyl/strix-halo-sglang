@@ -18,14 +18,16 @@
 #     tied to the same number: a decode step that runs eager because the
 #     batch is larger than any captured graph is followed by a GPU page fault
 #     in the next replay (reproducible, cause not yet found; pure eager and
-#     pure graph runs are both clean). QWEN38_CUDA_GRAPH_MAX_BS moves both;
-#     20 is the mamba-cache cap anyway. QWEN38_CUDA_GRAPH_MAX_BS=0 is not a
-#     switch; pass --disable-cuda-graph as an extra argument instead.
+#     pure graph runs are both clean). QWEN38_CUDA_GRAPH_MAX_BS moves both,
+#     and the GDN state pool is sized to match (--max-mamba-cache-size =
+#     5 slots per request; the ratio-sized pool came out at 99 and capped the
+#     server at 19). QWEN38_CUDA_GRAPH_MAX_BS=0 is not a switch; pass
+#     --disable-cuda-graph as an extra argument instead.
 #   - The PLE table file (~48 GiB fp8, sparse) is written on the first boot,
 #     reused on later ones (patch 13) and random-read during decode; keep
 #     $PLE_DIR on local NVMe.
-#   - --mamba-ssm-dtype bfloat16 halves the GDN recurrent state (5.4 -> 2.7 GB
-#     for 50 slots), so 20 requests can run instead of 10.
+#   - --mamba-ssm-dtype bfloat16 halves the GDN recurrent state (~54 MB per
+#     slot instead of ~108), so 100 slots cost 5.4 GB instead of 10.8.
 #   - TunableOp *tuning* is off by default (SGLANG_TUNABLEOP_TUNING=0): the
 #     image enables TunableOp, and tuning benchmarks every GEMM solution for
 #     each new prompt length, which cost 14-20 s of TTFT per novel length.
@@ -45,6 +47,8 @@ IMAGE="${SGLANG_IMAGE:-strix-halo-sglang:dev}"
 PORT="${SGLANG_PORT:-30001}"
 NAME="${SGLANG_CONTAINER:-sglang-qwen38}"
 CUDA_GRAPH_MAX_BS="${QWEN38_CUDA_GRAPH_MAX_BS:-20}"
+# With the radix cache on, SGLang reserves 5 GDN state slots per request.
+MAMBA_CACHE_SIZE="${QWEN38_MAMBA_CACHE_SIZE:-$((5 * CUDA_GRAPH_MAX_BS))}"
 MODEL_DIR="${MODEL_DIR:-$HOME/models/Qwen3.8-Flash-Next-AWQ-INT4-ple-fp8}"
 PLE_DIR="${PLE_DIR:-/opt/llm/ple-cache}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
@@ -103,6 +107,7 @@ exec docker run --name "$NAME" \
         --attention-backend triton \
         --cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS" \
         --max-running-requests "$CUDA_GRAPH_MAX_BS" \
+        --max-mamba-cache-size "$MAMBA_CACHE_SIZE" \
         --mamba-ssm-dtype bfloat16 \
         --reasoning-parser qwen3-thinking \
         --tool-call-parser qwen3_coder \

@@ -68,7 +68,7 @@ python3 -m sglang.launch_server \
     --kv-cache-dtype fp8_e4m3 --max-total-tokens 262144 \
     --attention-backend triton \
     --cuda-graph-max-bs-decode 20 --max-running-requests 20 \
-    --mamba-ssm-dtype bfloat16 \
+    --max-mamba-cache-size 100 --mamba-ssm-dtype bfloat16 \
     --reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder
 ```
 
@@ -94,8 +94,9 @@ on local NVMe: it is random-read during decode.
 | `SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1` | Upstream gates the file backend on `cudaDevAttrPageableMemoryAccessUsesHostPageTables` (GB10). Irrelevant here: patch 11 gathers on the CPU, the GPU never dereferences the mapping. |
 | `--attention-backend triton` | Same as every other model on this box; aiter's CK paths are CDNA-only. |
 | `--kv-cache-dtype fp8_e4m3 --max-total-tokens 262144` | fp8 KV halves the pool; the token cap keeps the saving as headroom instead of a larger pool (see Memory). `QWEN38_KV_DTYPE` / `QWEN38_MAX_TOTAL_TOKENS` override. |
-| `--cuda-graph-max-bs-decode 20 --max-running-requests 20` | Decode graphs for bs 1, 2, 4, 8, 12, 16, 20. Patch 14 fills the PLE prefetch buffer from the host before each replay. The two numbers must match: a decode step that runs eager because the batch exceeds the largest captured graph is followed by a GPU page fault in the next replay (see Known limitations), so every batch size the scheduler can form has a graph. 20 is also the mamba-cache cap. `QWEN38_CUDA_GRAPH_MAX_BS` moves both. Note this upstream split the flag: a bare `--cuda-graph-max-bs` is rejected as ambiguous. |
-| `--mamba-ssm-dtype bfloat16` | The GDN recurrent state is fp32 by default: 5.4 GB for 50 slots, which caps `max_running_requests` at 10 (5 slots per request). bf16 halves it to 20 requests in the same memory. Upstream's own suggestion in the startup log. |
+| `--cuda-graph-max-bs-decode 20 --max-running-requests 20` | Decode graphs for bs 1, 2, 4, 8, 12, 16, 20. Patch 14 fills the PLE prefetch buffer from the host before each replay. The two numbers must match: a decode step that runs eager because the batch exceeds the largest captured graph is followed by a GPU page fault in the next replay (see Known limitations), so every batch size the scheduler can form has a graph. `QWEN38_CUDA_GRAPH_MAX_BS` moves both. Note this upstream split the flag: a bare `--cuda-graph-max-bs` is rejected as ambiguous. |
+| `--max-mamba-cache-size 100` | The GDN layers keep a fixed-size recurrent state (conv window + SSM matrix) per request instead of per-token KV, in a pool counted in slots. With the radix cache on SGLang reserves 5 slots per request (3 for the live state, prefix-cache branch points and the prefill→decode handoff, plus 2 for the overlap scheduler's ping-pong buffer), so `max_running_requests = slots // 5`. The ratio-sized pool came out at 99 slots and silently capped the server at 19 requests (and the graph list at `[..., 16, 19]`); 100 makes the advertised 20 real. ~54 MB per slot in bf16, so ~270 MB per extra request. `QWEN38_MAMBA_CACHE_SIZE` overrides; keep it at 5 × `QWEN38_CUDA_GRAPH_MAX_BS`. |
+| `--mamba-ssm-dtype bfloat16` | The GDN recurrent state is fp32 by default (~108 MB per slot); bf16 halves it, so 100 slots cost 5.4 GB instead of 10.8. Upstream's own suggestion in the startup log. |
 | `--reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder` | The chat template opens `<think>` in the generation prompt and asks for `<tool_call><function=...><parameter=...>` tool calls. Without these the thinking and the XML come back as plain `content`. |
 | `PYTORCH_TUNABLEOP_TUNING=0` | The image enables PyTorch TunableOp, which benchmarks every GEMM solution for each *new* M (= tokens in the prefill chunk). That is 14–20 s of TTFT for every novel prompt length (measured; the recorded results persist in `~/.cache/strix-halo-sglang-tunableop` so a repeated length is fast). With tuning off the recorded solutions are still used and untuned shapes take hipBLASLt's heuristic pick. `SGLANG_TUNABLEOP_TUNING=1 ./start-qwen38.sh` to deliberately record more. |
 | `SGLANG_USE_AITER=0` | Set in the image. |
@@ -145,7 +146,7 @@ near the 8 GiB cap). Measure with `amdgpu_top --json --dump`
 Measured: weights 75.9 GiB after `load_weights` (the vision tower is ~0.9
 GiB of that), KV cache 3.0 GiB (262,144 tokens fp8; only the 12
 full-attention layers hold KV, ~12 KB/token in fp8, so one full 262k-token
-request fits), GDN state 2.7 GiB in bf16 (~100 slots → 19–20 requests).
+request fits), GDN state 5.5 GB in bf16 (100 slots → 20 requests).
 Scheduler RSS ≈ 2.9 GB; host `buff/cache` holds the PLE pages.
 
 The `avail mem` figure in the log is not headroom on this ROCm build:
@@ -160,7 +161,7 @@ pools. What does:
 | `--max-total-tokens 262144` | ~3.2 GiB vs the fraction-sized pool | one full-context request or 8 × 32k still fit | on |
 | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | fragmentation | none | on |
 | vision tower off (`QWEN38_VISION=0` / `QWEN38_MODEL_OVERRIDE='{"language_model_only": true}'`) | ~0.9 GiB (333 tensors skipped) | no image input | off |
-| `--max-mamba-cache-size N` | 27 MB per slot (bf16) | 5 slots per request under MTP, 1 otherwise | fraction-sized |
+| `--max-mamba-cache-size N` | ~54 MB per slot (bf16) | 5 slots per request with the radix cache on, 1 with `--disable-radix-cache`; under MTP an extra `(requests+1) × draft_tokens` intermediate states | 100 (= 20 requests) |
 
 `--language-model-only` itself is whitelisted to three unrelated
 architectures in this upstream; the model code supports it, so the override
@@ -190,17 +191,19 @@ flushed before every prefill measurement (streaming client, `max_tokens`
 |---:|---:|---:|---:|
 | 4 | 33.3 tok/s | 8.8 tok/s | 1.3 s |
 | 8 | 57.9 tok/s | 7.5 tok/s | 1.2 s |
-
 | 12 | 77.5 tok/s | 6.9 tok/s | 2.3 s |
 | 16 | 99.4 tok/s | 6.7 tok/s | 2.6 s |
-| 20 | 97.3 tok/s | 5.1 tok/s | 2.2 s |
+| 20 | 88–97 tok/s | 4.6–5.1 tok/s | 2.3 s |
+| 24 | 74–76 tok/s | 5.8 tok/s | 42.6 s (4 queued) |
 
 How it got here, single stream / 8 streams: eager 11.2 / 42.9 tok/s; decode
 graphs (patch 14) 12.7 / 43.0; tuned MoE tiles (below) 14.5 / 57.9. Graphs
 for bs 12–20 do not change throughput measurably against eager at those
 sizes (server-side peak +4% at bs 16, within run-to-run noise end to end);
 they are captured because of the fault described under Known limitations,
-not for speed. Run-to-run spread at 8 streams is about ±7%.
+not for speed. Run-to-run spread at 8 streams is about ±7%. Throughput
+plateaus at 16 streams; the 20-request cap is queueing capacity, not speed
+(each extra request costs ~270 MB of GDN state and one more graph).
 
 The PLE gather costs about 1 s per 2048 cold tokens (32k rows faulted from
 NVMe, ~35 µs each); rows already in the page cache shave that off (440–520
@@ -275,25 +278,28 @@ graphs. It needs real headroom: the mamba pool grows a 2.3 GB
 token cap became the defaults the eager GDN prefill OOMed on prompts over
 ~1k tokens (lowering `--mem-fraction-static` does not help, the budget just
 moves into the pools; `--max-total-tokens 131072 --max-mamba-cache-size 30`
-was the workaround). With the current defaults it fits as is:
+was the workaround). It still needs the request cap halved: at the default
+20 requests the mamba pool is 5.5 GB plus a 4.4 GB intermediate cache
+(`(requests+1) × 4 draft tokens`), and a 26k-token prefill OOMs. At 10
+requests (50 slots + 2.3 GB intermediate) everything fits:
 
 ```bash
-./start-qwen38.sh --speculative-algorithm NEXTN --speculative-num-steps 3 \
-    --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+QWEN38_CUDA_GRAPH_MAX_BS=10 ./start-qwen38.sh --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
 ```
 
 | Prompt tokens | TTFT | Prefill | Decode (bs=1) |
 |---:|---:|---:|---:|
-| 183 | 0.8 s | 223 tok/s | 20.1 tok/s |
-| 1,650 | 2.9 s | 578 tok/s | 22.8 tok/s |
+| 183 | 0.8 s | 222 tok/s | 21.0 tok/s |
+| 1,650 | 2.9 s | 574 tok/s | 21.2 tok/s |
 | 6,693 | 12.8 s | 522 tok/s | 21.8 tok/s |
-| 26,983 | 55.4 s | 487 tok/s | 22.9 tok/s |
+| 26,363 | 54.6 s | 483 tok/s | 22.4 tok/s |
 
 Mean accept length 2.6 of 4 draft tokens (accept rate 0.53); +45–55%
 single-stream decode over plain graphs with the tuned MoE tiles. 4
-concurrent: 40.4 tok/s aggregate (vs 33.3); 8 concurrent: 58.9 (vs 57.9).
-The mamba pool caps `max_running_requests` at 10 (5 slots per request), so
-more than 10 streams queue. `--speculative-num-steps 2
+concurrent: 39.5–40.4 tok/s aggregate (vs 33.3); 8 concurrent: 57.9–58.9
+(vs 57.9). More than 10 streams queue (12 streams: 51.6 aggregate, 31 s
+worst TTFT). `--speculative-num-steps 2
 --speculative-num-draft-tokens 3` was tried: accept length 2.2, bs=1 18.4–19.7
 tok/s, 8 streams 60.0, 12 requests allowed; not better. Not on by default: it
 trades concurrency for single-stream speed.

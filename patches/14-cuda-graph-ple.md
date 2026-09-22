@@ -65,4 +65,6 @@ of `expandable_segments`; pure eager and pure graph runs are clean; under
 after the replay. Not yet root-caused (this patch's host fill or the upstream
 decode graph runner on the eager→graph transition are the suspects). The
 launchers tie `--max-running-requests` to `--cuda-graph-max-bs-decode` (both
-20) so the scheduler never forms a decode batch without a graph.
+20, with `--max-mamba-cache-size 100` so the GDN state pool does not cap the
+request count below the graph list) so the scheduler never forms a decode
+batch without a graph.
