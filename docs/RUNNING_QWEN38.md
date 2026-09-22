@@ -25,11 +25,13 @@ group 32, asymmetric; vision tower unquantized). MTP is not used.
 | [18](../patches/18-hc-mix-rocm.md) | Atomics-free two-launch HyperConnection mix for decode batches, used on HIP | The sm_100 JIT mix is unavailable, so every decode step ran the persistent kernel whose split-K `atomic_add` made greedy decode differ run to run (and whose software grid barrier assumes co-resident CTAs). Same speed, bit-identical |
 | [19](../patches/19-moe-wna16-kmask.md) | GPTQ/AWQ MoE kernel masks the packed-weight load on a partial last K block | Unmasked, it read past the last expert's rows: a layout-dependent GPU page fault (killed the tuner on the g128 checkpoint). Runtime shapes are even multiples, so serving is unchanged |
 | [20](../patches/20-qsa-decode-topk.md) | Decode QSA block selection uses a graph-capturable torch top-k on HIP instead of the JIT kernel | `select_decode_tokens` bypassed patch 11's guard; the JIT kernel is unsafe here and its output order varies past 512 blocks (long-context decode drift). ~1–1.5 ms per decode step |
+| [21](../patches/21-qsa-topk-ties.md) | Tie-stable QSA block selection on HIP: stable sort for prefill rows, top-k over unique score+index keys for decode, ties toward the lower block | `torch.topk` orders tied entries differently per launch on this ROCm build and the indexer's relu scores tie constantly, so prefill above ~1.4k tokens (and patch 20's decode) still drifted bit-wise. Also replaces the per-row Python loop in prefill (119 → 3.5 ms per QSA layer at 1.5k tokens) |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
-Everything else (GDN, QSA prefill/indexer, HyperConnections, fused sigmoid-mul,
-n-gram hashing) is pure Triton upstream and runs unmodified.
+Everything else (GDN, QSA prefill attention and indexer projections, the
+HyperConnection layers other than the mix, fused sigmoid-mul, n-gram hashing)
+is pure Triton upstream and runs unmodified.
 
 ## Prerequisites
 
@@ -44,7 +46,8 @@ n-gram hashing) is pure Triton upstream and runs unmodified.
    ```
    Expect `ALL PARITY TESTS PASSED` (PLE gather bf16/fp8, QSA decode, top-k chain,
    MoE zero points incl. a negative control, dense WNA16 dequant, MoE config
-   search path, deterministic HC mix, partial-K MoE tile, dense decode top-k).
+   search path, deterministic HC mix, partial-K MoE tile, dense decode top-k,
+   tie-stable block selection).
 3. Convert the PLE table to fp8 (halves the table to ~48 GiB and is the format
    the file backend expects to keep resident-free):
    ```bash
@@ -429,6 +432,20 @@ in a captured graph. The int4 attention projections are served as bf16
   bit-identical across cold runs. Sending the mix to the torch path instead
   would have cost ~35% decode speed (the GEMM shapes are untuned under
   TunableOp).
+- Fixed, kept for the record: after patch 18, prompts above ~1.4k tokens
+  still drifted: same first token, different logprob, and an 8.6k-token
+  prompt diverged on a near-tie token around step 37. Two causes, one per
+  path. Decode: `select_decode_tokens` called the JIT `fast_topk` kernel
+  directly (bypassing patch 11's guard), and its output order varies past
+  512 compressed blocks; patch 20 gives decode a vectorised torch top-k.
+  Prefill (and, once exposed, that torch top-k): `torch.topk` on this ROCm
+  build orders *tied* scores differently per launch, and the indexer's
+  `relu` block scores tie constantly; every other prefill stage (conv, GDN
+  chunk kernel, indexer logits, index expansion, sparse attention, GEMMs,
+  MoE, HC mix) was bit-stable in repeat-and-compare tests at 1,475 and
+  8,192 tokens. Patch 21 breaks ties toward the lower block with a stable
+  sort (prefill) or a top-k over unique score+index keys (decode). See the
+  end-to-end numbers below the DERISKED table.
 - Fixed, kept for the record: eager decode above the largest captured graph
   used to fault the next replay (`Memory access fault by GPU node-1 ... Page
   not present`) after a `/flush_cache`. Two factors: upstream's QSA backend

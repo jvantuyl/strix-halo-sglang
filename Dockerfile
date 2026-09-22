@@ -239,6 +239,16 @@ RUN python3 /tmp/patch_moe_wna16_kmask.py && rm /tmp/patch_moe_wna16_kmask.py
 COPY patches/patch_qsa_decode_topk.py /tmp/patch_qsa_decode_topk.py
 RUN python3 /tmp/patch_qsa_decode_topk.py && rm /tmp/patch_qsa_decode_topk.py
 
+# --- tie-stable QSA block selection on ROCm (patch 21) ---
+# torch.topk orders tied entries differently per launch on this ROCm build,
+# and QSA block scores (relu sums) tie constantly, so prefill above ~1.4k
+# tokens and patch 20's decode selection still drifted bit-wise. Stable sort
+# (prefill) / topk over unique composite keys (decode), ties toward the lower
+# block; also removes the per-row host sync from prefill. Anchors on patch 20.
+# See patches/21-qsa-topk-ties.md.
+COPY patches/patch_qsa_topk_ties.py /tmp/patch_qsa_topk_ties.py
+RUN python3 /tmp/patch_qsa_topk_ties.py && rm /tmp/patch_qsa_topk_ties.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"

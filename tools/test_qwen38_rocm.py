@@ -29,6 +29,11 @@ Covers:
      (partial last block) vs the dequantized reference.
   9. patch 20 -- dense decode top-k (graph-capturable replacement for the JIT
      kernel on HIP) vs the reference set, padding, determinism, guard.
+ 10. patch 21 -- tie-stable block selection: torch.topk's tie order varies
+     per launch on ROCm; the sort and key forms of qsa_ordered_topk agree,
+     match the reference scores, stay bit-identical on tied relu-style
+     scores (decode and prefill shapes), and the decode form captures into
+     a CUDA graph.
 """
 from __future__ import annotations
 
@@ -537,6 +542,106 @@ def test_qsa_dense_topk():
     check("qsa_dense_topk bit-identical across launches", same == 50, f"{same}/50")
 
 
+# ---------------------------------------------------------------------------
+# 10. tie-stable QSA top-k (patch 21)
+# ---------------------------------------------------------------------------
+def _tied_scores(rows, width, lengths, dev):
+    """relu-style indexer scores: ~half exact zeros, bf16-rounded, -inf tail."""
+    x = torch.relu(torch.randn(rows, width, device=dev) - 0.3)
+    x = x.to(torch.bfloat16).float()
+    cols = torch.arange(width, device=dev).unsqueeze(0)
+    return x.masked_fill(cols >= lengths.unsqueeze(1), float("-inf"))
+
+
+def test_qsa_topk_ties():
+    """Block selection with tied scores (patch 21).
+
+    Indexer scores are relu sums, so exact ties are common; torch.topk on
+    ROCm orders tied entries differently per launch. The sort and key forms
+    of qsa_ordered_topk must agree, select the same scores as the reference,
+    break ties toward the lower index, be bit-identical over repeats, and the
+    key form must capture into a CUDA graph.
+    """
+    from sglang.srt.layers.attention.qsa.kernel import (
+        _qsa_fixed_width_topk,
+        qsa_dense_topk,
+        qsa_ordered_topk,
+        qsa_stable_rows_topk,
+    )
+
+    torch.manual_seed(0)
+    dev = "cuda"
+    topk = 512
+
+    # decode shape: (bs, 4096) dense rows of various lengths
+    lengths = torch.tensor([30, 511, 600, 2152, 4096], dtype=torch.int32, device=dev)
+    logits = _tied_scores(5, 4096, lengths, dev)
+    zeros = (logits == 0).sum().item()
+    check("tied test data has exact zeros", zeros > 1000, f"{zeros} zeros")
+    a = qsa_ordered_topk(logits, topk, use_sort=True)
+    b = qsa_ordered_topk(logits, topk, use_sort=False)
+    check("qsa_ordered_topk sort == key indices", torch.equal(a, b),
+          f"{(a != b).sum().item()} differ")
+    ref_vals = torch.topk(logits, topk, dim=1).values
+    check("qsa_ordered_topk selects the reference scores",
+          torch.equal(torch.gather(logits, 1, a), ref_vals))
+    # ties toward the lower index: within each run of equal scores, indices ascend
+    va = torch.gather(logits, 1, a)
+    tie = va[:, 1:] == va[:, :-1]
+    check("qsa_ordered_topk ties break toward the lower index",
+          bool((a[:, 1:] > a[:, :-1])[tie].all()))
+    for use_sort in (True, False):
+        first = qsa_ordered_topk(logits, topk, use_sort=use_sort)
+        same = sum(int(torch.equal(qsa_ordered_topk(logits, topk, use_sort=use_sort), first)) for _ in range(30))
+        check(f"qsa_ordered_topk use_sort={use_sort} bit-identical", same == 30, f"{same}/30")
+    plain = torch.topk(logits, topk, dim=1).indices
+    varies = sum(int(not torch.equal(torch.topk(logits, topk, dim=1).indices, plain)) for _ in range(30))
+    print(f"       (plain torch.topk on the same tied rows: {varies}/30 launches differ)")
+
+    got = qsa_dense_topk(logits, lengths, topk)
+    ref = _qsa_fixed_width_topk(logits, lengths, torch.zeros(5, dtype=torch.int32, device=dev), topk)
+    ok = True
+    for r, L in enumerate(lengths.tolist()):
+        w = min(L, topk)
+        ok &= torch.equal(torch.gather(logits[r], 0, got[r, :w].long()),
+                          torch.gather(logits[r], 0, ref[r, :w].long()))
+        ok &= bool((got[r, w:] == -1).all()) and bool((got[r, :w] >= 0).all())
+    check("qsa_dense_topk tied rows: reference scores + padding", ok)
+    same = sum(int(torch.equal(qsa_dense_topk(logits, lengths, topk), got)) for _ in range(30))
+    check("qsa_dense_topk tied rows bit-identical", same == 30, f"{same}/30")
+    graph = torch.cuda.CUDAGraph()
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        qsa_dense_topk(logits, lengths, topk)
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        g_out = qsa_dense_topk(logits, lengths, topk)
+    graph.replay()
+    torch.cuda.synchronize()
+    check("qsa_dense_topk graph replay matches eager", torch.equal(g_out, got))
+
+    # prefill shape: packed rows with non-zero starts and growing lengths
+    rows, width = 300, 700
+    starts = torch.cat([torch.zeros(150, dtype=torch.int32, device=dev),
+                        torch.full((150,), 300, dtype=torch.int32, device=dev)])
+    lengths = torch.cat([torch.arange(150, device=dev, dtype=torch.int32) * 2,
+                         torch.arange(150, device=dev, dtype=torch.int32) * 2 + 100])
+    full = torch.relu(torch.randn(rows, width, device=dev) - 0.3).to(torch.bfloat16).float()
+    for k in (512, 64):
+        got = qsa_stable_rows_topk(full, lengths, starts, k)
+        ref = _qsa_fixed_width_topk(full, lengths, starts, k)
+        ok = tuple(got.shape) == (rows, k) and got.dtype == torch.int32
+        for r in range(rows):
+            w = min(int(lengths[r]), k)
+            s0 = int(starts[r])
+            ok &= bool((got[r, w:] == -1).all()) and bool((got[r, :w] >= 0).all())
+            ok &= bool((got[r, :w] < int(lengths[r])).all())
+            ok &= torch.equal(full[r, s0 + got[r, :w].long()], full[r, s0 + ref[r, :w].long()])
+        check(f"qsa_stable_rows_topk k={k}: reference scores, relative indices, padding", ok)
+        same = sum(int(torch.equal(qsa_stable_rows_topk(full, lengths, starts, k), got)) for _ in range(30))
+        check(f"qsa_stable_rows_topk k={k} bit-identical", same == 30, f"{same}/30")
+
+
 if __name__ == "__main__":
     test_ple_cpu_gather()
     test_qsa_decode()
@@ -547,6 +652,7 @@ if __name__ == "__main__":
     test_hc_mix_deterministic()
     test_moe_partial_k()
     test_qsa_dense_topk()
+    test_qsa_topk_ties()
     print()
     if FAILURES:
         print("FAILED:", ", ".join(FAILURES))
