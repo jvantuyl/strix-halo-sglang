@@ -230,6 +230,15 @@ RUN python3 /tmp/patch_hc_mix_rocm.py && rm /tmp/patch_hc_mix_rocm.py
 COPY patches/patch_moe_wna16_kmask.py /tmp/patch_moe_wna16_kmask.py
 RUN python3 /tmp/patch_moe_wna16_kmask.py && rm /tmp/patch_moe_wna16_kmask.py
 
+# --- decode QSA block selection honours the HIP top-k guard (patch 20) ---
+# select_decode_tokens called the JIT fast_topk directly, bypassing patch 11's
+# guard: unsafe on RDNA 3.5 and its output order varies past 512 blocks, so
+# long-context greedy decode drifted. Use a vectorised, graph-capturable torch
+# top-k on HIP (the reference loop syncs per row). Anchors on patch 11.
+# See patches/20-qsa-decode-topk.md.
+COPY patches/patch_qsa_decode_topk.py /tmp/patch_qsa_decode_topk.py
+RUN python3 /tmp/patch_qsa_decode_topk.py && rm /tmp/patch_qsa_decode_topk.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"

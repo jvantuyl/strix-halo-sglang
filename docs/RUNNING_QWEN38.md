@@ -24,6 +24,7 @@ group 32, asymmetric; vision tower unquantized). MTP is not used.
 | [17](../patches/17-moe-config-dir.md) | `SGLANG_MOE_CONFIG_DIR` searched before the builtin MoE tile tree (flat or tree layout, missing dirs skipped) | Upstream's knob replaces the tree and crashes on a missing dir; tuned tiles are now mounted per checkpoint instead of baked into the image |
 | [18](../patches/18-hc-mix-rocm.md) | Atomics-free two-launch HyperConnection mix for decode batches, used on HIP | The sm_100 JIT mix is unavailable, so every decode step ran the persistent kernel whose split-K `atomic_add` made greedy decode differ run to run (and whose software grid barrier assumes co-resident CTAs). Same speed, bit-identical |
 | [19](../patches/19-moe-wna16-kmask.md) | GPTQ/AWQ MoE kernel masks the packed-weight load on a partial last K block | Unmasked, it read past the last expert's rows: a layout-dependent GPU page fault (killed the tuner on the g128 checkpoint). Runtime shapes are even multiples, so serving is unchanged |
+| [20](../patches/20-qsa-decode-topk.md) | Decode QSA block selection uses a graph-capturable torch top-k on HIP instead of the JIT kernel | `select_decode_tokens` bypassed patch 11's guard; the JIT kernel is unsafe here and its output order varies past 512 blocks (long-context decode drift). ~1–1.5 ms per decode step |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
@@ -43,7 +44,7 @@ n-gram hashing) is pure Triton upstream and runs unmodified.
    ```
    Expect `ALL PARITY TESTS PASSED` (PLE gather bf16/fp8, QSA decode, top-k chain,
    MoE zero points incl. a negative control, dense WNA16 dequant, MoE config
-   search path, deterministic HC mix, partial-K MoE tile).
+   search path, deterministic HC mix, partial-K MoE tile, dense decode top-k).
 3. Convert the PLE table to fp8 (halves the table to ~48 GiB and is the format
    the file backend expects to keep resident-free):
    ```bash

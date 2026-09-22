@@ -27,6 +27,8 @@ Covers:
      vs the fp32 reference, and bit-identical across repeated launches.
   8. patch 19 -- GPTQ/AWQ MoE kernel with K not a multiple of BLOCK_SIZE_K
      (partial last block) vs the dequantized reference.
+  9. patch 20 -- dense decode top-k (graph-capturable replacement for the JIT
+     kernel on HIP) vs the reference set, padding, determinism, guard.
 """
 from __future__ import annotations
 
@@ -489,6 +491,52 @@ def test_moe_partial_k():
               torch.allclose(got, ref, atol=2e-2, rtol=2e-2), f"max abs err {err:.4g}")
 
 
+def test_qsa_dense_topk():
+    """Decode block selection on HIP (patch 20): dense top-k vs the reference.
+
+    Rows of 30, 511, 600 and 2152 compressed blocks in a 4096-wide -inf
+    padded logits tensor (what qsa_mqa_decode returns), budget 512: same set
+    as the reference, -1 padding for short rows, bit-identical over repeats,
+    and the JIT kernel stays off HIP unless SGLANG_QSA_TOPK_JIT=1.
+    """
+    import os
+
+    from sglang.srt.layers.attention.qsa.kernel import (
+        _qsa_fixed_width_topk,
+        qsa_dense_topk,
+        qsa_jit_topk_allowed,
+    )
+
+    old = os.environ.pop("SGLANG_QSA_TOPK_JIT", None)
+    try:
+        check("qsa_jit_topk_allowed false on HIP", not qsa_jit_topk_allowed())
+        os.environ["SGLANG_QSA_TOPK_JIT"] = "1"
+        check("qsa_jit_topk_allowed override", qsa_jit_topk_allowed())
+    finally:
+        os.environ.pop("SGLANG_QSA_TOPK_JIT", None)
+        if old is not None:
+            os.environ["SGLANG_QSA_TOPK_JIT"] = old
+
+    torch.manual_seed(0)
+    dev = "cuda"
+    W, topk = 4096, 512
+    lengths = torch.tensor([30, 511, 600, 2152], dtype=torch.int32, device=dev)
+    logits = torch.full((4, W), float("-inf"), device=dev)
+    for r, L in enumerate(lengths.tolist()):
+        logits[r, :L] = torch.randn(L, device=dev)
+    ref = _qsa_fixed_width_topk(logits, lengths, torch.zeros(4, dtype=torch.int32, device=dev), topk)
+    got = qsa_dense_topk(logits, lengths, topk)
+    check("qsa_dense_topk shape", tuple(got.shape) == (4, topk) and got.dtype == torch.int32, str(got.shape))
+    for r, L in enumerate(lengths.tolist()):
+        want = set(ref[r].tolist())
+        have = set(got[r].tolist())
+        pad_ok = (got[r] == -1).sum().item() == max(0, topk - L)
+        check(f"qsa_dense_topk L={L} set matches reference", have == want and pad_ok,
+              f"{len(have ^ want)} differing, pad {(got[r] == -1).sum().item()}")
+    same = sum(int(torch.equal(qsa_dense_topk(logits, lengths, topk), got)) for _ in range(50))
+    check("qsa_dense_topk bit-identical across launches", same == 50, f"{same}/50")
+
+
 if __name__ == "__main__":
     test_ple_cpu_gather()
     test_qsa_decode()
@@ -498,6 +546,7 @@ if __name__ == "__main__":
     test_moe_config_dir()
     test_hc_mix_deterministic()
     test_moe_partial_k()
+    test_qsa_dense_topk()
     print()
     if FAILURES:
         print("FAILED:", ", ".join(FAILURES))
