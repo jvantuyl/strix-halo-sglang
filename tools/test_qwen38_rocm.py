@@ -66,6 +66,14 @@ Covers:
      at the pinned address, embedding / linear forwards and a CUDA graph
      replay equal the VRAM originals, unmatched parameters untouched, torch's
      allocated VRAM drops by the moved bytes, empty pattern list is a no-op.
+ 17. patch 28 -- PLE short conv over the packed prefill batch (upstream pads
+     every request to the longest one, three copies of
+     [requests, row_width, channels]): bit-identical conv output,
+     next-state and track-slot gathers vs the padded layout on mixed
+     lengths (fp32 and bf16), padding rows routed to a scratch column
+     without disturbing valid outputs, and peak allocation at the real
+     shape (17 x 71 tokens + a 6,024-token chunk, 10,240 channels) under
+     0.5 GiB where the padded layout needs 6.2.
 """
 from __future__ import annotations
 
@@ -1126,6 +1134,86 @@ def test_host_parked_params():
     check("graph replay reads the parked weight", torch.equal(out, ref_e))
 
 
+def test_ple_short_conv_packed():
+    """PLE short conv over the packed prefill batch (patch 28)."""
+    try:
+        from sglang.srt.models.qwen4_exp import _packed_short_conv
+    except ImportError:
+        check("patch 28 present (_packed_short_conv)", False)
+        return
+    check("patch 28 present (_packed_short_conv)", True)
+    import torch.nn.functional as F
+    torch.manual_seed(0)
+    K, d = 4, 3
+    S = (K - 1) * d
+
+    def padded_reference(x, state, weight, lengths, req_indices, token_offsets, row_width):
+        R, C = lengths.shape[0], x.shape[1]
+        padded_seq = x.new_zeros((R, row_width, C))
+        padded_seq[req_indices, token_offsets] = x
+        conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
+        conv_output = F.conv1d(conv_input, weight, bias=None, dilation=d, groups=C).transpose(1, 2)
+        state_cols = torch.arange(S, device=x.device, dtype=torch.long)
+
+        def gather_at(offsets):
+            return conv_input.gather(
+                2, (offsets.unsqueeze(1) + state_cols.unsqueeze(0)).unsqueeze(1).expand(-1, C, -1))
+
+        return conv_output[req_indices, token_offsets], gather_at
+
+    def batch_meta(lengths):
+        pos = torch.arange(int(lengths.sum()), device=lengths.device)
+        qsl = torch.cat([lengths.new_zeros(1), torch.cumsum(lengths, 0)])
+        req = (torch.searchsorted(qsl, pos, right=True) - 1).clamp(0, lengths.shape[0] - 1)
+        off = pos - qsl.index_select(0, req)
+        return req, off, off < lengths.index_select(0, req)
+
+    C = 64
+    for dtype in (torch.float32, torch.bfloat16):
+        for lens in ([1, 7, 300, 2, 64], [71] * 17 + [6024], [5], [1, 1, 1], [777]):
+            lengths = torch.tensor(lens, device="cuda")
+            req, off, valid = batch_meta(lengths)
+            x = torch.randn(int(lengths.sum()), C, device="cuda").to(dtype)
+            state = torch.randn(len(lens), C, S, device="cuda").to(dtype)
+            w = (torch.randn(C, 1, K, device="cuda") * 0.3).to(dtype)
+            ref_y, ref_g = padded_reference(x, state, w, lengths, req, off, max(lens))
+            y, g = _packed_short_conv(x, state, w, d, S, lengths, req, off, valid)
+            track = lengths // 2
+            check(f"packed short conv == padded layout ({str(dtype).split('.')[-1]}, {len(lens)} reqs, longest {max(lens)})",
+                  torch.equal(y, ref_y) and torch.equal(g(lengths), ref_g(lengths)) and torch.equal(g(track), ref_g(track)),
+                  f"max abs err {(y.float() - ref_y.float()).abs().max().item():.2e}")
+
+    lengths = torch.tensor([3, 5], device="cuda")
+    req, off, valid = batch_meta(lengths)
+    x = torch.randn(12, 16, device="cuda")
+    req = torch.cat([req, torch.full((4,), 1, device="cuda")])
+    off = torch.cat([off, torch.arange(5, 9, device="cuda")])
+    valid = torch.cat([valid, torch.zeros(4, dtype=torch.bool, device="cuda")])
+    state = torch.randn(2, 16, S, device="cuda")
+    w = torch.randn(16, 1, K, device="cuda")
+    y, g = _packed_short_conv(x, state, w, d, S, lengths, req, off, valid)
+    ref_y, ref_g = padded_reference(x[:8], state, w, lengths, req[:8], off[:8], 5)
+    check("padding rows leave valid outputs and next state untouched",
+          torch.equal(y[:8], ref_y) and torch.isfinite(y[8:]).all().item() and torch.equal(g(lengths), ref_g(lengths)))
+
+    C = 10240
+    lengths = torch.tensor([71] * 17 + [6024], device="cuda")
+    req, off, valid = batch_meta(lengths)
+    x = torch.randn(int(lengths.sum()), C, device="cuda").to(torch.bfloat16)
+    state = torch.randn(18, C, S, device="cuda").to(torch.bfloat16)
+    w = (torch.randn(C, 1, K, device="cuda") * 0.3).to(torch.bfloat16)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    y, g = _packed_short_conv(x, state, w, d, S, lengths, req, off, valid)
+    g(lengths)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+    padded = 3 * 18 * 6024 * C * 2
+    check("peak allocation at the real mixed shape under 0.5 GiB", peak < 0.5 * 2**30,
+          f"{peak / 2**20:.0f} MiB (padded layout: {padded / 2**30:.1f} GiB)")
+
+
 if __name__ == "__main__":
     test_ple_cpu_gather()
     test_qsa_decode()
@@ -1143,6 +1231,7 @@ if __name__ == "__main__":
     test_qsa_topk_slices()
     test_qsa_mqa_prefill_triton()
     test_host_parked_params()
+    test_ple_short_conv_packed()
     print()
     if FAILURES:
         print("FAILED:", ", ".join(FAILURES))

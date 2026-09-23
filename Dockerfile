@@ -307,6 +307,16 @@ RUN python3 /tmp/patch_qsa_mqa_prefill_triton.py && rm /tmp/patch_qsa_mqa_prefil
 COPY patches/patch_host_parked_params.py /tmp/patch_host_parked_params.py
 RUN python3 /tmp/patch_host_parked_params.py && rm /tmp/patch_host_parked_params.py
 
+# --- PLE short conv over the packed prefill batch (patch 28) ---
+# Upstream pads the prefill batch to [requests, longest request, 10240
+# channels] for the PLE conv1d and makes three copies of it: a chunked
+# prefill of 17 short prompts plus a 6k-token chunk of a long one is 6.3 GiB
+# for 7,231 tokens (9.6 GiB at the cap), and 60x slower than the conv over
+# the packed tokens with each request's 9 state columns spliced in. Verify
+# keeps the padded layout (row width 4). See patches/28-ple-short-conv-packed.md.
+COPY patches/patch_ple_short_conv_packed.py /tmp/patch_ple_short_conv_packed.py
+RUN python3 /tmp/patch_ple_short_conv_packed.py && rm /tmp/patch_ple_short_conv_packed.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"

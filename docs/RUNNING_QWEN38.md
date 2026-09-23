@@ -34,6 +34,7 @@ off.
 | [25](../patches/25-qsa-topk-slices.md) | Prefill block selection sorts row slices into a preallocated output | Patch 21's whole-chunk stable sort was ~1 GiB of transient buffers per QSA layer, 40% of the prefill VRAM peak on a box idling at 90 of 96 GiB (MTP, 20 requests). Identical indices |
 | [26](../patches/26-qsa-mqa-prefill-triton.md) | `tl.dot` prefill MQA for the indexer, logits the only allocation | Prefill twin of patch 24: the reference `einsum` materialises per-head scores (4× the logits) plus three copies, ~1.15 GiB per layer per chunk. 2.9e-6 from the reference, 5× faster, prefill transient flat in prompt length |
 | [27](../patches/27-host-parked-params.md) | Token embedding and vision tower parked in pinned host memory (`SGLANG_HOST_PARKED_PARAMS`) | Both are read a few KB per step or not at all, yet held 2.0 GiB of a carve-out idling at 90 of 96 GiB. Exactly sized `hipHostMalloc` aliased as CUDA tensors; worst-case headroom 1.6 → 3.3 GiB, output and throughput unchanged |
+| [28](../patches/28-ple-short-conv-packed.md) | PLE short conv over the packed prefill batch instead of a `[requests, longest, 10240]` padded layout | Chunked prefill mixing many short prompts with a slice of a long one made three copies of that layout: 6.3 GiB for 7,231 tokens, 9.6 GiB possible at the cap, 714 ms per layer; the benchmark suite's mixed scenario reached 117 MiB free. Packed: bit-identical, 431 MiB, 60× faster |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
@@ -57,7 +58,7 @@ is pure Triton upstream and runs unmodified.
    search path, deterministic HC mix, partial-K MoE tile, dense decode top-k,
    tie-stable block selection, greedy draft proposal, MTP tail placement,
    Triton decode MQA, row-sliced prefill top-k, Triton prefill MQA,
-   host-parked parameters). Run
+   host-parked parameters, packed PLE short conv). Run
    GPU experiments beside a live server under `--memory 12g` and `timeout`:
    a bad Triton kernel's compile has OOMed the 30 GB host once.
 3. Convert the PLE table to fp8 (halves the table to ~48 GiB and is the format
@@ -408,6 +409,8 @@ wrong. Measured with `sudo amdgpu_top` (driver view; the server log's
 | 20 requests, patches ≤ 24 | 90.1 GiB | 18 streams + two 43k prefills together: 94.8 GiB | 1.2 GiB |
 | 20 requests, patches ≤ 26 | 90.1 GiB | same: 94.5 GiB | 1.5 GiB |
 | 20 requests, patches ≤ 27 (embedding + vision tower parked in host memory) | 88.1 GiB | same: 92.7 GiB (two 71k prefills: also 92.7) | 3.3 GiB |
+| 20 requests, patches ≤ 27, 71-token short prompts instead of 300-token ones | 88.1 GiB | 18 streams + two 26k prefills: 95.9 GiB | **0.1 GiB** |
+| 20 requests, patches ≤ 28 | 87.9 GiB | either mix: 90.4 GiB | 5.8 GiB |
 
 Idle at cap 20 is fully accounted for by the load log: weights 75.9, MTP
 layer 0.2, KV 3.05, GDN pools 9.4 (5.33 ssm + 4.43 intermediate + 0.3
@@ -423,6 +426,13 @@ caching allocator's per-stream pools under the overlap scheduler (reserved
 streams, two 43k prefills at once with 18 streams. GTT stayed at ~110 MiB
 throughout, nothing spills to system memory.
 
+The 0.1 GiB row is why the benchmark suite exists: the hand-run mixes all
+used 300-token synthetic short prompts, and the suite's 71-token story
+prompts left the long prompt a longer row in the chunked-prefill batch,
+which the PLE conv padded every request to, three copies of
+`[requests, longest, 10240]` (patch 28). With the packed conv the mix
+bottoms at 5.8 GiB whichever prompts are used.
+
 So the default cap works with MTP:
 
 ```bash
@@ -432,8 +442,8 @@ So the default cap works with MTP:
 
 and gives 25.4–25.9 tok/s single-stream *and* 101–110 tok/s at 20 streams
 (the same as plain graphs), which removes the trade-off MTP used to carry.
-With patch 27 the worst case measured leaves 3.3 GiB; before it 1.5 GiB
-was thin. `QWEN38_CUDA_GRAPH_MAX_BS=10` remains the conservative choice
+With patches 27 and 28 the worst case measured leaves 5.8 GiB; before
+them 1.5 GiB was thin and one prompt mix reached 0.1. `QWEN38_CUDA_GRAPH_MAX_BS=10` remains the conservative choice
 (8.6 GiB free at its worst case) if the workload mixes many long prefills
 with a full decode batch, and `QWEN38_HOST_PARKED_PARAMS=` (empty) keeps
 every weight in VRAM if the 2 GiB of host RAM matters more.
