@@ -48,6 +48,13 @@ Usage (inside the image, GPU attached):
 
 Writes E=...,N=...,device_name=...,dtype=int4_w4a16.json into the current
 directory; copy it to python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/<triton_ver>/.
+
+Note on ``--tp-size``: the runtime keys the file on the int4-packed width
+(intermediate 640 stored as 320 int32 columns -> ``N=320``), while upstream's
+tuner uses ``intermediate / tp_size``. The default ``--tp-size 2`` therefore
+produces the file name the runtime reads but benchmarks a half-width shard;
+``--tp-size 1`` measures the true shape and writes an ``N=640`` file that
+must be renamed to ``N=320``.
 """
 import json
 import os

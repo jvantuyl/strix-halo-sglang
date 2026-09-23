@@ -299,10 +299,19 @@ docker cp "sglang-qwen38:/tmp/E=512,N=320,device_name=Radeon_8060S_Graphics,dtyp
     configs/moe/qwen38-flash-next/
 ```
 
-Keep the tuner's `--tp-size` at its default 2 (that is what yields the
-`N=320` key the runtime looks up). Another checkpoint gets its own profile
-directory (`QWEN38_MOE_CONFIG_DIR=…`) so the two sets of tuning data never
-overwrite each other; see [`configs/moe/README.md`](../configs/moe/README.md).
+The tuner's default `--tp-size 2` yields the `N=320` file name the runtime
+looks up, but that is a coincidence of two different conventions: the
+runtime's `N=320` is the int4-packed width of the real 640-wide
+intermediate, while the tuner's is `640 / tp`, so at the default it
+benchmarks a half-width shard. The kernel times in the table above are
+therefore for half the real GEMM; `--tp-size 1` measures the true shape
+(bs 1 / 8 / 16 / 20 / 32: generic 438 / 3066 / 5685 / 6829 / 9794 µs,
+tuned 179 / 1390 / 2544 / 3037 / 4340) and writes an `N=640` file that has
+to be renamed to `N=320` to be picked up. Whether a true-shape sweep picks
+different tiles has not been tested. Another checkpoint gets its own
+profile directory (`QWEN38_MOE_CONFIG_DIR=…`) so the two sets of tuning
+data never overwrite each other; see
+[`configs/moe/README.md`](../configs/moe/README.md).
 
 ### Speculative decoding (MTP)
 
@@ -363,7 +372,7 @@ What had to change to run it, and where:
 | `model-mtp-merged.safetensors` is 100 GiB (all 128 PLE shards + MTP in one file) | `tools/convert_ple_fp8.py --part-bytes 2GiB` splits any oversized file into PLE-only `-pleNNN` and `-restNNN` parts and rewrites the index, so patch 13's PLE-shard skip still applies. The converter also stopped using `safe_open`: safetensors maps the file `PROT_WRITE|MAP_PRIVATE`, which overcommit mode 0 refuses for 100 GiB on a 30 GB host; it now reads headers and tensors with plain seek/`readinto`. |
 | Chat template prepends a "Qwentium" obedience persona to every system block | Renamed to `chat_template.derisked.jinja`; the stock template is used. It is a template, not weights: the model's behaviour was probed without it. |
 | No `preprocessor_config.json` / `video_preprocessor_config.json` | Copied from the stock checkpoint (identical processor). |
-| Symmetric g128 experts | Same Triton kernel; the tuned `E=512,N=320` tiles measured the same on g128 as on g32 in the tuner's benchmark mode (bs 1/8/16/20/32: 103/734/1418/1569/2242 µs vs 105/750/1347/1611/2305), so the stock profile is mounted until a g128-tuned profile exists. |
+| Symmetric g128 experts | Same Triton kernel; the stock (g32-tuned) `E=512,N=320` tiles measure the same on g128 as on g32 in the tuner's benchmark mode (bs 1/8/16/20/32: 103/734/1418/1569/2242 µs vs 105/750/1347/1611/2305). A full sweep on the g128 checkpoint (`configs/moe/qwen38-flash-next-derisked/`) wins that microbenchmark by 6–9% but loses 7–9% end to end, so the launcher keeps the stock profile mounted; details below. |
 
 Conversion (the 100 GiB file needs a memory cap only to keep the page cache
 honest; RSS stays under 2 GiB):
@@ -403,17 +412,41 @@ the first decode token on, see below.
 | 16 streams | 99.4 (sanity re-run 89.5) | 70.6 / 73.9 / 72.7 | 71.3 |
 | 20 streams | 88–97 | 72.9 | 71.5 |
 
-Single-stream matches stock, and prefill is now ~20–30% ahead of it: patch
-21 removed a per-query-row Python loop (one host sync per row) from the QSA
-indexer's block selection, which is worth ~1.4 s per 1.5k-token prefill
-across the 12 QSA layers. Stock would gain the same once re-measured on the
-current image. At 16–20 streams the abliterated build is ~20% behind. The
-MoE tiles are ruled out (same kernel time on both group sizes, see above);
-the runs were not back to back with stock, and the stock 16-stream figure
-itself moved 99 → 90 between sessions, so treat the gap as partly run
-variance and partly open. Its logs show every decode step in a captured
-graph. The int4 attention projections are served as bf16 (patch 16), so
-they cannot be slower than stock's bf16 ones.
+Single-stream matches stock, and prefill is now ~20–30% ahead of the
+stock column: patch 21 removed a per-query-row Python loop (one host sync
+per row) from the QSA indexer's block selection, which is worth ~1.4 s per
+1.5k-token prefill across the 12 QSA layers.
+
+Stock re-measured on the same patches ≤ 21 image, same day, same prompts:
+prefill 263 / 675 / 694 tok/s (183 / 2.6k / 11k-token prompts), decode
+13.8 / 13.3 / 13.4 tok/s, 8 / 16 / 20 streams **42.8 / 67.7 / 71.7**
+tok/s, greedy repeats bit-identical (96 tokens 3/3, 8.6k-token prompt 3/3).
+So stock gained the same prefill and now sits at the same concurrency as
+the abliterated build: the 16–20 stream gap in the table is not
+checkpoint-specific. What is open is why both are ~25% under the
+99.4 / 88–97 figures measured earlier in the stock column. The candidates
+are patches 18–21 (the split HC mix and the stable top-k both add a little
+per-step work at bs ≥ 8) and run-to-run or thermal variance (the stock
+16-stream figure had already moved 99 → 90 between sessions before any of
+them). It could not be bisected: the image behind the 99.4 run no longer
+exists, and the only older image left (`:qwen38`, September 21) predates
+patch 14 and crashes at graph capture. Every decode step in both builds runs
+in a captured graph. The int4 attention projections are served as bf16
+(patch 16), so they cannot be slower than stock's bf16 ones.
+
+MoE tiles tuned on the g128 checkpoint (full 18-size sweep, 8 h; tiles and
+numbers in [`configs/moe/README.md`](../configs/moe/README.md)): in the
+tuner's benchmark mode they are 6–9% faster than the stock profile at
+batch ≥ 8 (at the true `--tp-size 1` shape: 1285 / 2339 / 2780 / 3942 µs
+vs 1390 / 2544 / 3037 / 4340 at bs 8 / 16 / 20 / 32), but end to end,
+back to back on the derisked server, 8 / 16 / 20 streams came out
+41.8 / 62.4 / 65.4 and 43.3 / 62.9 / 64.3 against 46.5 / 69.0 / 70.2 with
+the stock profile, and single stream no better. The launcher therefore
+keeps `QWEN38_MOE_CONFIG_DIR` on `configs/moe/qwen38-flash-next/` for this
+checkpoint too (the launch command above is unchanged), and the g128
+profile stays in the repo as data. Working hypothesis: the tuner routes
+tokens uniformly over experts and benchmarks half the real GEMM width, so
+its M does not correspond to the per-expert row counts the server sees.
 
 End-to-end determinism on the patches ≤ 21 image, every run cold (cache
 flushed between runs, `temperature=0`, top-3 logprobs compared at every
