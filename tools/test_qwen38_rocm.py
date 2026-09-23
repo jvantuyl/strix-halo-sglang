@@ -44,6 +44,12 @@ Covers:
      padding) so the KV gather's count-based packing sees the drafted
      positions; full rows, never-captured rows, the gather's own valid
      counts, and CUDA graph capture.
+ 13. patch 24 -- Triton decode MQA for the QSA indexer (TileLang is absent, so
+     upstream ran the torch reference, whose cost scales with the model's
+     context length): vs the reference on shuffled page tables with lengths
+     from 0 to full, max_model_len past the page table, -inf mask equality,
+     bit-identical over launches, CUDA graph replay, and a timing print
+     against the reference at bs 20 / 131k context.
 """
 from __future__ import annotations
 
@@ -774,6 +780,104 @@ def test_qsa_mtp_tail():
           torch.equal(g_out, state.lookup(reqs, pos, layer_id=0)))
 
 
+# ---------------------------------------------------------------------------
+# 13. Triton decode MQA for the QSA indexer (patch 24)
+# ---------------------------------------------------------------------------
+def test_qsa_mqa_triton():
+    """Length-bounded decode MQA (patch 24) vs the torch reference.
+
+    Compressed page size 16, 4 index heads of 128 (the Qwen3.8 layout).
+    Shuffled page tables; context lengths of 0, 1, page fractions, tile
+    edges and full rows; a max_model_len wider than the page table. Finite
+    scores within 1e-3 of the reference, identical -inf masks, bit-identical
+    over 20 launches, graph replay equal to eager and following the
+    context_lens buffer, and the dispatcher picks the Triton path unless
+    SGLANG_QSA_MQA_TRITON=0.
+    """
+    import math
+    import os
+
+    from sglang.srt.layers.attention.qsa import mqa
+
+    torch.manual_seed(0)
+    dev = "cuda"
+    heads, hd, page, ratio = 4, 128, 16, 4
+
+    def make(bs, max_pages, lens, max_model_len=None):
+        npages = bs * max_pages + 3
+        kc = torch.randn(npages, page, 1, hd, device=dev, dtype=torch.bfloat16)
+        pt = torch.randperm(npages, device=dev)[: bs * max_pages].reshape(bs, max_pages).to(torch.int32)
+        q = torch.randn(bs, heads, hd, device=dev, dtype=torch.bfloat16)
+        ln = torch.tensor(lens, dtype=torch.int32, device=dev)
+        return q, kc, pt, ln, max_model_len or max_pages * page
+
+    check("qsa_mqa_decode: TileLang absent, Triton path used",
+          not mqa.HAS_TILELANG and mqa.qsa_mqa_triton_allowed())
+    for bs, max_pages, lens, mml in [
+        (7, 8, [0, 1, 17, 63, 64, 65, 128], None),
+        (3, 512, [8192, 5000, 1], None),
+        (2, 8, [100, 128], 200),
+        (20, 2048, [64] * 20, None),
+    ]:
+        q, kc, pt, ln, m = make(bs, max_pages, lens, mml)
+        ref = mqa.torch_qsa_mqa_decode(q, kc, pt, ln, m)
+        got = mqa.triton_qsa_mqa_decode(q, kc, pt, ln, m)
+        fin = torch.isfinite(ref)
+        mask_ok = torch.equal(fin, torch.isfinite(got)) and got.shape == ref.shape
+        close = bool(torch.allclose(ref[fin], got[fin], atol=1e-3, rtol=1e-4)) if fin.any() else True
+        err = (ref[fin] - got[fin]).abs().max().item() if fin.any() else 0.0
+        same = all(torch.equal(mqa.triton_qsa_mqa_decode(q, kc, pt, ln, m), got) for _ in range(20))
+        check(f"triton_qsa_mqa_decode bs={bs} width={m}: reference match, mask, bit-identical",
+              mask_ok and close and same, f"max err {err:.2e}, mask {mask_ok}, identical {same}")
+    q, kc, pt, ln, m = make(4, 64, [10, 500, 1024, 0])
+    via_dispatch = mqa.qsa_mqa_decode(q, kc, pt, ln, m)
+    check("qsa_mqa_decode dispatches to the Triton kernel",
+          torch.equal(via_dispatch, mqa.triton_qsa_mqa_decode(q, kc, pt, ln, m)))
+    old = os.environ.get("SGLANG_QSA_MQA_TRITON")
+    try:
+        os.environ["SGLANG_QSA_MQA_TRITON"] = "0"
+        check("SGLANG_QSA_MQA_TRITON=0 selects the reference", not mqa.qsa_mqa_triton_allowed())
+    finally:
+        os.environ.pop("SGLANG_QSA_MQA_TRITON", None)
+        if old is not None:
+            os.environ["SGLANG_QSA_MQA_TRITON"] = old
+
+    eager = mqa.triton_qsa_mqa_decode(q, kc, pt, ln, m)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        mqa.triton_qsa_mqa_decode(q, kc, pt, ln, m)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_out = mqa.triton_qsa_mqa_decode(q, kc, pt, ln, m)
+    graph.replay()
+    torch.cuda.synchronize()
+    check("triton_qsa_mqa_decode graph replay matches eager", torch.equal(g_out, eager))
+    ln.copy_(torch.tensor([1024, 3, 700, 64], dtype=torch.int32, device=dev))
+    graph.replay()
+    torch.cuda.synchronize()
+    check("triton_qsa_mqa_decode graph replay follows the context_lens buffer",
+          torch.equal(g_out, mqa.triton_qsa_mqa_decode(q, kc, pt, ln, m)))
+
+    def timeit(fn, n=20):
+        for _ in range(5):
+            fn()
+        torch.cuda.synchronize()
+        ts = []
+        for _ in range(n):
+            a = torch.cuda.Event(enable_timing=True); b = torch.cuda.Event(enable_timing=True)
+            a.record(); fn(); b.record(); torch.cuda.synchronize(); ts.append(a.elapsed_time(b))
+        ts.sort()
+        return ts[len(ts) // 2]
+
+    max_pages = math.ceil(131072 / ratio / page)
+    q, kc, pt, ln, m = make(20, max_pages, [64] * 20)
+    t_ref = timeit(lambda: mqa.torch_qsa_mqa_decode(q, kc, pt, ln, m))
+    t_tri = timeit(lambda: mqa.triton_qsa_mqa_decode(q, kc, pt, ln, m))
+    print(f"       (decode MQA, bs 20, 131k context, 256-token rows: reference {t_ref:.3f} ms, Triton {t_tri:.3f} ms per layer)")
+    check("triton_qsa_mqa_decode faster than the reference at bs 20 / 131k", t_tri < t_ref)
+
+
 if __name__ == "__main__":
     test_ple_cpu_gather()
     test_qsa_decode()
@@ -787,6 +891,7 @@ if __name__ == "__main__":
     test_qsa_topk_ties()
     test_spec_draft_greedy()
     test_qsa_mtp_tail()
+    test_qsa_mqa_triton()
     print()
     if FAILURES:
         print("FAILED:", ", ".join(FAILURES))

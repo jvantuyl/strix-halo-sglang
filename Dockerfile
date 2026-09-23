@@ -267,6 +267,17 @@ RUN python3 /tmp/patch_spec_draft_greedy.py && rm /tmp/patch_spec_draft_greedy.p
 COPY patches/patch_qsa_mtp_tail.py /tmp/patch_qsa_mtp_tail.py
 RUN python3 /tmp/patch_qsa_mtp_tail.py && rm /tmp/patch_qsa_mtp_tail.py
 
+# --- length-bounded Triton decode MQA for the QSA indexer (patch 24) ---
+# TileLang is not installed here, so the indexer's decode scoring ran the
+# torch reference, which gathers the whole context/4 window per row on every
+# decode step (6 ms per layer at bs 20 with a 131k context, 1.8 ms at 32k:
+# the entire 85 -> 72 tok/s drop at 16-20 streams when the default context
+# grew). One Triton launch bounded by each row's length; graph-capturable,
+# bit-identical. SGLANG_QSA_MQA_TRITON=0 forces the reference.
+# See patches/24-qsa-mqa-triton.md.
+COPY patches/patch_qsa_mqa_triton.py /tmp/patch_qsa_mqa_triton.py
+RUN python3 /tmp/patch_qsa_mqa_triton.py && rm /tmp/patch_qsa_mqa_triton.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"

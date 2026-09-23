@@ -30,6 +30,7 @@ off.
 | [21](../patches/21-qsa-topk-ties.md) | Tie-stable QSA block selection on HIP: stable sort for prefill rows, top-k over unique score+index keys for decode, ties toward the lower block | `torch.topk` orders tied entries differently per launch on this ROCm build and the indexer's relu scores tie constantly, so prefill above ~1.4k tokens (and patch 20's decode) still drifted bit-wise. Also replaces the per-row Python loop in prefill (119 → 3.5 ms per QSA layer at 1.5k tokens) |
 | [22](../patches/22-spec-draft-greedy.md) | The post-prefill draft extend proposes through `sample_draft_proposal` (argmax for greedy rows) under rejection sampling | HIP defaults EAGLE/NEXTN to rejection sampling; that one draft pass called `fast_sample` directly, so the first draft token was random at `temperature=0` and greedy MTP output differed run to run. Not gfx1151-specific |
 | [23](../patches/23-qsa-mtp-tail.md) | MTP shared block selection places the drafted positions right after the captured entries, not after the `-1` padding | The KV gather packs valid entries as a prefix (count, not mask), so the drafted tokens were dropped and the packed slot left unwritten: stale scratch here, zeros on the paged path. Draft never saw the newest token; accept length 2.3 → 2.55 on short prompts. Not gfx1151-specific |
+| [24](../patches/24-qsa-mqa-triton.md) | Length-bounded Triton kernel for the QSA indexer's decode block scoring, dispatched when TileLang is absent (`SGLANG_QSA_MQA_TRITON=0` forces the reference) | No TileLang here, so the torch reference ran: it gathers the whole `context_length / 4` window per row on every decode step of all 12 QSA layers, 6 ms per layer at bs 20 with a 131k context. That was the whole 99 → 71 tok/s drop at 16–20 streams when the default context grew from 32k; back to 89–105 at 131k. Same on any CUDA build without TileLang |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
@@ -51,7 +52,8 @@ is pure Triton upstream and runs unmodified.
    Expect `ALL PARITY TESTS PASSED` (PLE gather bf16/fp8, QSA decode, top-k chain,
    MoE zero points incl. a negative control, dense WNA16 dequant, MoE config
    search path, deterministic HC mix, partial-K MoE tile, dense decode top-k,
-   tie-stable block selection, greedy draft proposal, MTP tail placement).
+   tie-stable block selection, greedy draft proposal, MTP tail placement,
+   Triton decode MQA).
 3. Convert the PLE table to fp8 (halves the table to ~48 GiB and is the format
    the file backend expects to keep resident-free):
    ```bash
@@ -168,6 +170,18 @@ full-attention layers hold KV, ~12 KB/token in fp8, so one full 262k-token
 request fits), GDN state 5.5 GB in bf16 (100 slots → 20 requests).
 Scheduler RSS ≈ 2.9 GB; host `buff/cache` holds the PLE pages.
 
+Host memory over a load and a full benchmark (5 s samples of `free`, the
+container cgroup and the top RSS processes, three launches): during weight
+load the scheduler's RSS climbs to 10–17 GB for a minute or two (safetensors
+mapped and streamed to the GPU, file-backed and reclaimable), page cache
+rises to 25–26 GB, and the kernel pushes 2.5–3 GB of idle anonymous pages to
+swap (`swappiness` 10). Host `used` never exceeded 7.1 GB and `available`
+never dropped below 24.6 GB, so the swap is reclaim preference during the
+76 GB stream, not exhaustion. While serving, scheduler RSS is 2.2–2.9 GB and
+container anonymous memory ≤ 3.2 GB, flat through 20-stream runs. The one
+host OOM this box has had was a tracing hook that imported torch into every
+spawned process (see Known limitations), not the server.
+
 The `avail mem` figure in the log is not headroom on this ROCm build:
 PyTorch sits at ~95 of 96 GiB once serving (a 1,650-token prefill under MTP
 OOMed with `avail mem=13 GB` printed). Lowering `--mem-fraction-static`
@@ -226,6 +240,14 @@ between prefill chunks, which is chunked prefill working as designed.
 | 16 | 99.4 tok/s | 6.7 tok/s | 2.6 s |
 | 20 | 88–97 tok/s | 4.6–5.1 tok/s | 2.3 s |
 | 24 | 74–76 tok/s | 5.8 tok/s | 42.6 s (4 queued) |
+
+That table was taken with `--context-length 32768`, the launcher default at
+the time. At today's default of 131072 the same image gives 71–78 at 16–20
+streams, because the QSA indexer's decode scoring ran a torch reference
+whose cost scales with the context limit (patch 24 and the DERISKED section
+below). With patch 24, stock at 131k, two passes: 8 / 16 / 20 streams
+50.6 / 89.2 / 95.2 then 62.4 / 104.7 / 103.5 tok/s aggregate, bs 1
+14.0–15.1.
 
 How it got here, single stream / 8 streams: eager 11.2 / 42.9 tok/s; decode
 graphs (patch 14) 12.7 / 43.0; tuned MoE tiles (below) 14.5 / 57.9. Graphs
@@ -388,6 +410,13 @@ fixes cost nothing. Mean accept length 2.3–2.6 on short prompts (2.55 over a
 (14.5–14.8 bs 1, 48.1 at 8 streams) that is +50% single stream and about
 even at 8; the request cap of 10 is the price.
 
+With patch 24 (same flags, 131k context) the batched steps get cheaper: bs 1
+25.3–25.9 tok/s on the 183-token prompt, 22–24 / 17–19 / 21–24 at 3.4k /
+13.5k / 54k, and 4 / 8 / 10 streams 48.1 / 56.8 / 65.6 then 52.7 / 64.1 /
+69.6 tok/s aggregate (per-stream 13–14 / 8–9 / 7.6–8.1). Determinism holds:
+96 tokens 3/3 and the 14k-token prompt 64 tokens 3/3, identical accept
+histograms.
+
 Determinism under MTP, every run cold (`/flush_cache`, `temperature=0`,
 top-1 logprob compared at every position, accept histogram compared):
 19-token prompt 96 tokens 4/4 identical and 512 tokens 3/3, 2.5k-token
@@ -465,16 +494,30 @@ prefill 263 / 675 / 694 tok/s (183 / 2.6k / 11k-token prompts), decode
 tok/s, greedy repeats bit-identical (96 tokens 3/3, 8.6k-token prompt 3/3).
 So stock gained the same prefill and now sits at the same concurrency as
 the abliterated build: the 16–20 stream gap in the table is not
-checkpoint-specific. What is open is why both are ~25% under the
-99.4 / 88–97 figures measured earlier in the stock column. The candidates
-are patches 18–21 (the split HC mix and the stable top-k both add a little
-per-step work at bs ≥ 8) and run-to-run or thermal variance (the stock
-16-stream figure had already moved 99 → 90 between sessions before any of
-them). It could not be bisected: the image behind the 99.4 run no longer
-exists, and the only older image left (`:qwen38`, September 21) predates
-patch 14 and crashes at graph capture. Every decode step in both builds runs
-in a captured graph. The int4 attention projections are served as bf16
-(patch 16), so they cannot be slower than stock's bf16 ones.
+checkpoint-specific. Why both were ~25% under the 99.4 / 88–97 figures in
+the stock column was found by rebuilding the image at the commit that
+recorded them (`d1953c8`; the Dockerfile's upstream pin was unchanged and
+the `sgl_kernel` binaries came out identical) and running old and new
+images at both context lengths:
+
+| Image, stock checkpoint | Context | 8 | 16 | 20 streams |
+|---|---:|---:|---:|---:|
+| patches ≤ 14 (`d1953c8`) | 32k | 47.9–53.1 | 83.6–85.5 | 87.3–92.7 |
+| patches ≤ 14 (`d1953c8`) | 131k | 42.7–48.0 | 71.4–72.5 | 71.6–77.8 |
+| patches ≤ 23 | 32k | 47.5–62.4 | 84.8–96.5 | 89.2–93.5 |
+| patches ≤ 24, reference MQA forced | 131k | 40.9–53.4 | 66.8–78.9 | 68.4–77.0 |
+| patches ≤ 24 | 131k | 50.6–62.4 | **89.2–104.7** | **95.2–103.5** |
+
+The launcher's default context moved from 32768 to 131072 between the two
+measurements, and that is the entire gap; patches 15–23 cost nothing. The
+mechanism: without TileLang the QSA indexer's decode block scoring ran
+upstream's torch reference, which gathers the whole `context_length / 4`
+window per row on every decode step (1.8 ms per layer at bs 20 with 32k,
+6.0 ms with 131k, × 12 layers; under 1 ms at bs 1, so single stream never
+showed it). Patch 24 replaces it with a Triton kernel bounded by each row's
+length. Every decode step in both builds runs in a captured graph. The int4
+attention projections are served as bf16 (patch 16), so they cannot be
+slower than stock's bf16 ones.
 
 MoE tiles tuned on the g128 checkpoint (full 18-size sweep, 8 h; tiles and
 numbers in [`configs/moe/README.md`](../configs/moe/README.md)): in the
@@ -563,6 +606,16 @@ With MTP on, the same holds since patches 22 and 23; numbers in
   imported torch into every spawned process, OOMed the 30 GB host during
   model load and forced a reboot; the working tracer hooks the scheduler's
   model only, sums on the GPU, and the container ran under `--memory 22g`.
+- Fixed, kept for the record: 16–20 stream throughput sat at 67–78 tok/s
+  on every image after September 21 against 99.4 / 88–97 measured then,
+  and was blamed on patches 18–21 or variance. Rebuilding the old image
+  from its commit and crossing image × context length showed the launcher's
+  context default (32k → 131k) was the whole effect: the QSA indexer's
+  decode scoring ran a torch reference whose cost scales with the context
+  limit rather than the request (no TileLang in the image). Patch 24
+  replaces it with a length-bounded Triton kernel; 89–105 / 95–104 tok/s
+  at 16 / 20 streams at the full 131k context, greedy outputs identical
+  between the two paths.
 - Fixed, kept for the record: eager decode above the largest captured graph
   used to fault the next replay (`Memory access fault by GPU node-1 ... Page
   not present`) after a `/flush_cache`. Two factors: upstream's QSA backend
