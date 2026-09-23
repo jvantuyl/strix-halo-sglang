@@ -50,6 +50,11 @@
 #     at 3.9k tokens, same decode speed) and capped at 262144 tokens so the
 #     halved pool becomes headroom (~3 GB) instead of a bigger pool. The
 #     allocator uses expandable segments; headroom on this box is thin.
+#   - The token embedding and the vision tower live in pinned host memory
+#     (patch 27, QWEN38_HOST_PARKED_PARAMS): ~2 GiB of VRAM back for the same
+#     2 GiB of host RAM on the scheduler's RSS. Neither is bandwidth-bound
+#     (a bs-row gather per step; idle without images). Set it empty to keep
+#     every weight in VRAM.
 
 set -euo pipefail
 
@@ -75,6 +80,11 @@ CONTEXT="${SGLANG_CONTEXT:-131072}"
 KV_DTYPE="${QWEN38_KV_DTYPE:-fp8_e4m3}"
 MAX_TOTAL_TOKENS="${QWEN38_MAX_TOTAL_TOKENS:-262144}"
 ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Weights parked in pinned system memory instead of VRAM (patch 27): the token
+# embedding (a bs-row gather per step) and the vision tower (idle without
+# images), 2.0 GiB of VRAM back for 2.0 GiB of host RAM. `-` not `:-`: an
+# explicitly empty QWEN38_HOST_PARKED_PARAMS keeps everything in VRAM.
+HOST_PARKED_PARAMS="${QWEN38_HOST_PARKED_PARAMS-embed_tokens.weight,visual.}"
 # QWEN38_VISION=0 skips the vision tower (~0.9 GB of weights, text-only API).
 MODEL_OVERRIDE='{}'
 if [ "${QWEN38_VISION:-1}" = "0" ]; then
@@ -115,6 +125,7 @@ exec docker run --name "$NAME" \
     -e SGLANG_FORCE_NATIVE_LAYERNORM=1 \
     -e SGLANG_USE_AITER=0 \
     -e SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1 \
+    -e SGLANG_HOST_PARKED_PARAMS="$HOST_PARKED_PARAMS" \
     "${DOCKER_ARGS[@]}" \
     "$IMAGE" \
     python3 -m sglang.launch_server \

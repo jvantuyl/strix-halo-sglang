@@ -278,6 +278,35 @@ RUN python3 /tmp/patch_qsa_mtp_tail.py && rm /tmp/patch_qsa_mtp_tail.py
 COPY patches/patch_qsa_mqa_triton.py /tmp/patch_qsa_mqa_triton.py
 RUN python3 /tmp/patch_qsa_mqa_triton.py && rm /tmp/patch_qsa_mqa_triton.py
 
+# --- row-sliced prefill block selection (patch 25) ---
+# Patch 21's stable sort ran over the whole 8192-row prefill chunk: ~1 GiB of
+# transient buffers per QSA layer at a few thousand blocks per row, 40% of the
+# prefill's VRAM peak on top of ~90 GiB of resident weights and pools. Sort in
+# row slices into a preallocated output: same indices, ~70 MiB.
+# See patches/25-qsa-topk-slices.md.
+COPY patches/patch_qsa_topk_slices.py /tmp/patch_qsa_topk_slices.py
+RUN python3 /tmp/patch_qsa_topk_slices.py && rm /tmp/patch_qsa_topk_slices.py
+
+# --- Triton prefill MQA for the QSA indexer (patch 26) ---
+# The prefill twin of patch 24: without TileLang the torch reference
+# materialises the per-head scores (4x the 128 MiB logits budget) plus three
+# copies, ~1.15 GiB per QSA layer per prefill chunk and the largest piece of
+# the prefill VRAM peak. tl.dot kernel writing only the logits; 5x faster.
+# See patches/26-qsa-mqa-prefill-triton.md.
+COPY patches/patch_qsa_mqa_prefill_triton.py /tmp/patch_qsa_mqa_prefill_triton.py
+RUN python3 /tmp/patch_qsa_mqa_prefill_triton.py && rm /tmp/patch_qsa_mqa_prefill_triton.py
+
+# --- weights parked in pinned system memory (patch 27) ---
+# SGLANG_HOST_PARKED_PARAMS=<name substrings>: after load, those parameters
+# are copied into exactly sized hipHostMalloc buffers aliased as CUDA tensors
+# (zero-copy via __cuda_array_interface__, owned by the tensor storage) and
+# the VRAM is released. For the token embedding (gather only) and the vision
+# tower (idle without images) the slower IOMMU path costs nothing measurable;
+# 2.0 GiB of VRAM back on this box. Unset: no-op; draft runners skipped.
+# See patches/27-host-parked-params.md.
+COPY patches/patch_host_parked_params.py /tmp/patch_host_parked_params.py
+RUN python3 /tmp/patch_host_parked_params.py && rm /tmp/patch_host_parked_params.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"

@@ -50,6 +50,22 @@ Covers:
      from 0 to full, max_model_len past the page table, -inf mask equality,
      bit-identical over launches, CUDA graph replay, and a timing print
      against the reference at bs 20 / 131k context.
+ 14. patch 25 -- qsa_stable_rows_topk processes rows in slices: identical
+     indices to the whole-chunk sort and to the fixed-width reference on an
+     8192-row prefill chunk with tied scores, slice boundaries that do not
+     divide the rows, k below and above the width; peak allocation for the
+     stage bounded (a fraction of the whole-chunk sort's).
+ 15. patch 26 -- Triton prefill MQA for the QSA indexer (the torch reference
+     materialises the per-head scores, 4x the logits, plus three copies):
+     vs the reference on packed rows with empty, partial and full ranges and
+     tile-edge shapes, -inf mask equality, bit-identical over launches,
+     dispatch and the SGLANG_QSA_MQA_TRITON=0 override, peak allocation at
+     the 128 MiB logits budget a fraction of the reference's.
+ 16. patch 27 -- parameters parked in pinned system memory: the pattern
+     list from the env var, the parked Parameter is still a CUDA Parameter
+     at the pinned address, embedding / linear forwards and a CUDA graph
+     replay equal the VRAM originals, unmatched parameters untouched, torch's
+     allocated VRAM drops by the moved bytes, empty pattern list is a no-op.
 """
 from __future__ import annotations
 
@@ -878,6 +894,238 @@ def test_qsa_mqa_triton():
     check("triton_qsa_mqa_decode faster than the reference at bs 20 / 131k", t_tri < t_ref)
 
 
+# ---------------------------------------------------------------------------
+# 14. row-sliced prefill block selection (patch 25)
+# ---------------------------------------------------------------------------
+def test_qsa_topk_slices():
+    """Row-sliced qsa_stable_rows_topk (patch 25).
+
+    The prefill block selection sorted the whole 8192-row chunk in one
+    stable sort, about 1 GiB of transient buffers per QSA layer at a few
+    thousand blocks per row. Sorting row slices must give the same indices
+    (the selection is per row) and bound the stage's peak allocation.
+    """
+    from sglang.srt.layers.attention.qsa import kernel as K
+
+    check("patch 25 present (QSA_TOPK_SLICE_ELEMENTS)", hasattr(K, "QSA_TOPK_SLICE_ELEMENTS"))
+    if not hasattr(K, "QSA_TOPK_SLICE_ELEMENTS"):
+        return
+    torch.manual_seed(0)
+    dev = "cuda"
+
+    def whole_chunk(logits, lengths, starts, topk):
+        # patch 21's single-call form, kept here as the reference
+        rows, width = logits.shape
+        k = min(topk, width)
+        s = starts.to(device=dev, dtype=torch.int64).unsqueeze(1)
+        n = lengths.to(device=dev, dtype=torch.int64).unsqueeze(1)
+        cols = torch.arange(width, device=dev).unsqueeze(0)
+        inside = (cols >= s) & (cols < s + n)
+        order = K.qsa_ordered_topk(logits.masked_fill(~inside, float("-inf")), k, use_sort=True)
+        keep = torch.arange(k, device=dev).unsqueeze(0) < n.clamp_max(k)
+        out = torch.where(keep, order - s, torch.full_like(order, -1)).to(torch.int32)
+        if k < topk:
+            out = torch.cat([out, out.new_full((rows, topk - k), -1)], dim=1)
+        return out
+
+    def peak(fn):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        out = fn()
+        torch.cuda.synchronize()
+        return out, (torch.cuda.max_memory_allocated() - base) / 2**20
+
+    # realistic prefill chunk: 8192 query rows, ~6.6k blocks, tied relu scores
+    for rows, width, topk in [(8192, 6656, 2048), (1023, 1000, 2048), (300, 700, 64), (7, 5000, 512)]:
+        starts = torch.randint(0, max(1, width // 4), (rows,), device=dev, dtype=torch.int32)
+        lengths = torch.minimum(torch.randint(0, width, (rows,), device=dev, dtype=torch.int32), width - starts)
+        logits = torch.relu(torch.randn(rows, width, device=dev) - 0.3).to(torch.bfloat16).float()
+        ref, p_ref = peak(lambda: whole_chunk(logits, lengths, starts, topk))
+        got, p_got = peak(lambda: K.qsa_stable_rows_topk(logits, lengths, starts, topk))
+        slices = -(-rows // max(1, K.QSA_TOPK_SLICE_ELEMENTS // width))
+        check(f"qsa_stable_rows_topk sliced == whole-chunk ({rows}x{width}, k={topk}, {slices} slices)",
+              torch.equal(got, ref), f"{(got != ref).sum().item()} differ")
+        fixed = K._qsa_fixed_width_topk(logits, lengths, starts, topk) if rows <= 1023 else None
+        if fixed is not None:
+            ok = True
+            for r in range(rows):
+                w = min(int(lengths[r]), topk)
+                s0 = int(starts[r])
+                ok &= bool((got[r, w:] == -1).all())
+                ok &= torch.equal(logits[r, s0 + got[r, :w].long()], logits[r, s0 + fixed[r, :w].long()])
+            check(f"qsa_stable_rows_topk sliced selects the reference scores ({rows}x{width})", ok)
+        if rows == 8192:
+            print(f"       (8192x{width} chunk: whole-chunk sort peak {p_ref:.0f} MiB, sliced {p_got:.0f} MiB)")
+            check("sliced top-k peak allocation under a third of the whole-chunk sort", p_got < p_ref / 3)
+    same = sum(int(torch.equal(K.qsa_stable_rows_topk(logits, lengths, starts, topk), got)) for _ in range(20))
+    check("qsa_stable_rows_topk sliced bit-identical", same == 20, f"{same}/20")
+
+
+# ---------------------------------------------------------------------------
+# 15. Triton prefill MQA for the QSA indexer (patch 26)
+# ---------------------------------------------------------------------------
+def test_qsa_mqa_prefill_triton():
+    """Prefill indexer scoring (patch 26) vs the torch reference.
+
+    Packed rows with per-row [start, end) key ranges, including empty, full
+    and tile-edge cases. Finite scores within 1e-3 of the reference (bf16
+    products are exact in fp32; only the summation order differs), identical
+    -inf masks, bit-identical over launches, dispatcher picks the Triton path
+    unless SGLANG_QSA_MQA_TRITON=0, and the stage's peak allocation at the
+    upstream 128 MiB logits budget is a fraction of the reference's.
+    """
+    import os
+
+    from sglang.srt.layers.attention.qsa import mqa
+
+    check("patch 26 present (triton_qsa_mqa_prefill)", hasattr(mqa, "triton_qsa_mqa_prefill"))
+    if not hasattr(mqa, "triton_qsa_mqa_prefill"):
+        return
+    torch.manual_seed(0)
+    dev = "cuda"
+
+    def peak(fn):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        out = fn()
+        torch.cuda.synchronize()
+        return out, (torch.cuda.max_memory_allocated() - base) / 2**20
+
+    def ranges(rows, keys):
+        ends = torch.randint(0, keys + 1, (rows,), device=dev, dtype=torch.int32)
+        starts = (ends - torch.randint(0, keys + 1, (rows,), device=dev, dtype=torch.int32)).clamp_min(0)
+        if rows > 3:
+            starts[0], ends[0] = 0, keys          # full row
+            starts[1], ends[1] = 0, 0             # empty row
+            starts[2], ends[2] = keys, keys       # empty row at the end
+        return starts, ends
+
+    for rows, keys in [(3072, 10715), (8192, 2048), (1000, 333), (65, 64), (64, 65), (7, 5), (1, 1)]:
+        q = torch.randn(rows, 4, 128, device=dev).to(torch.bfloat16)
+        k = torch.randn(keys, 1, 128, device=dev).to(torch.bfloat16)
+        starts, ends = ranges(rows, keys)
+        ref, p_ref = peak(lambda: mqa.torch_qsa_mqa_prefill(q, k, starts, ends))
+        got, p_got = peak(lambda: mqa.triton_qsa_mqa_prefill(q, k, starts, ends))
+        fin = torch.isfinite(ref)
+        err = (ref[fin] - got[fin]).abs().max().item() if fin.any() else 0.0
+        check(f"triton_qsa_mqa_prefill {rows}x{keys}: -inf mask equals the reference",
+              torch.equal(torch.isinf(ref), torch.isinf(got)))
+        check(f"triton_qsa_mqa_prefill {rows}x{keys}: finite scores within 1e-3", err < 1e-3, f"max abs err {err:.2e}")
+        if rows == 3072:
+            print(f"       (3072x{keys} chunk, the 128 MiB logits budget: reference peak {p_ref:.0f} MiB, Triton {p_got:.0f} MiB)")
+            check("triton_qsa_mqa_prefill peak allocation under a quarter of the reference", p_got < p_ref / 4)
+    same = sum(int(torch.equal(mqa.triton_qsa_mqa_prefill(q, k, starts, ends), got)) for _ in range(20))
+    check("triton_qsa_mqa_prefill bit-identical", same == 20, f"{same}/20")
+
+    q = torch.randn(64, 4, 128, device=dev).to(torch.bfloat16)
+    k = torch.randn(300, 1, 128, device=dev).to(torch.bfloat16)
+    s = torch.zeros(64, dtype=torch.int32, device=dev)
+    e = torch.full((64,), 300, dtype=torch.int32, device=dev)
+    check("qsa_mqa_prefill dispatches to the Triton path",
+          torch.equal(mqa.qsa_mqa_prefill(q, k, s, e), mqa.triton_qsa_mqa_prefill(q, k, s, e)))
+    prev = os.environ.get("SGLANG_QSA_MQA_TRITON")
+    os.environ["SGLANG_QSA_MQA_TRITON"] = "0"
+    try:
+        check("SGLANG_QSA_MQA_TRITON=0 sends prefill to the reference",
+              torch.equal(mqa.qsa_mqa_prefill(q, k, s, e), mqa.torch_qsa_mqa_prefill(q, k, s, e)))
+    finally:
+        if prev is None:
+            del os.environ["SGLANG_QSA_MQA_TRITON"]
+        else:
+            os.environ["SGLANG_QSA_MQA_TRITON"] = prev
+
+
+# ---------------------------------------------------------------------------
+# 16. parameters parked in pinned system memory (patch 27)
+# ---------------------------------------------------------------------------
+def test_host_parked_params():
+    """Weights in pinned system memory aliased as CUDA tensors (patch 27).
+
+    A small model with an embedding, a two-layer 'vision' stack and an
+    lm_head: park the first two, check the Parameters stay CUDA Parameters
+    at the pinned address, forwards and a CUDA graph replay equal the VRAM
+    originals, lm_head is untouched, torch's allocated VRAM drops by the
+    moved bytes, the buffers are exactly the parameter sizes, a second
+    model sharing the Parameter parks nothing again, replacing a parked
+    Parameter frees its host buffer, and an empty pattern list moves
+    nothing.
+    """
+    try:
+        from sglang.srt.model_executor import host_parked_params as hp
+    except ImportError:
+        check("patch 27 present (host_parked_params)", False)
+        return
+    check("patch 27 present (host_parked_params)", True)
+    torch.manual_seed(0)
+    # Inference only, as in the server: an autograd graph would keep the
+    # replaced Parameter's storage alive through the saved tensors.
+    torch.set_grad_enabled(False)
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(4096, 256, dtype=torch.bfloat16)
+            self.visual = torch.nn.Sequential(
+                torch.nn.Linear(128, 256, dtype=torch.bfloat16),
+                torch.nn.Linear(256, 128, dtype=torch.bfloat16),
+            )
+            self.lm_head = torch.nn.Linear(256, 4096, bias=False, dtype=torch.bfloat16)
+
+    m = M().cuda()
+    ids = torch.randint(0, 4096, (20,), device="cuda")
+    x = torch.randn(8, 128, device="cuda").to(torch.bfloat16)
+    ref_e, ref_v = m.embed_tokens(ids), m.visual(x)
+    ref_h = m.lm_head(ref_e)
+    head_ptr = m.lm_head.weight.data_ptr()
+    check("host_parked_patterns parses the env format",
+          hp.host_parked_patterns(" embed_tokens.weight, visual. ,") == ["embed_tokens.weight", "visual."]
+          and hp.host_parked_patterns("") == [])
+    check("empty pattern list moves nothing", hp.park_model_parameters(m, []) == 0)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    expect = sum(p.numel() * p.element_size() for n, p in m.named_parameters() if "embed_tokens.weight" in n or "visual." in n)
+    moved = hp.park_model_parameters(m, ["embed_tokens.weight", "visual."])
+    torch.cuda.synchronize()
+    check("moved bytes match the selected parameters", moved == expect, f"{moved} vs {expect}")
+    check("torch allocated VRAM dropped by the moved bytes",
+          before - torch.cuda.memory_allocated() >= moved * 0.95,
+          f"{(before - torch.cuda.memory_allocated()) / 2**20:.1f} MiB freed of {moved / 2**20:.1f}")
+    w = m.embed_tokens.weight
+    check("parked weight is still a CUDA Parameter",
+          isinstance(w, torch.nn.Parameter) and w.is_cuda and w.dtype == torch.bfloat16)
+    parked = [(n, p) for n, p in m.named_parameters() if "embed_tokens.weight" in n or "visual." in n]
+    check("parked weights resolve to a host buffer at their address",
+          all(hp.is_parked(p) and hp.parked_buffer(p).data_ptr() == p.data_ptr() for _, p in parked)
+          and not hp.is_parked(m.lm_head.weight))
+    check("buffers are exactly the parameter sizes (no power-of-two rounding)",
+          all(hp.parked_buffer(p).nbytes == p.numel() * p.element_size() for _, p in parked))
+    shared = torch.nn.Module()
+    shared.embed_tokens = m.embed_tokens
+    check("a second model sharing the Parameter parks nothing again",
+          hp.park_model_parameters(shared, ["embed_tokens.weight"]) == 0)
+    check("embedding from parked weight equals the VRAM original", torch.equal(m.embed_tokens(ids), ref_e))
+    check("vision stack from parked weights equals the VRAM original", torch.equal(m.visual(x), ref_v))
+    check("lm_head untouched", m.lm_head.weight.data_ptr() == head_ptr and torch.equal(m.lm_head(ref_e), ref_h))
+    import gc, weakref
+    del parked  # the list above holds the Parameter that is about to be replaced
+    gone = weakref.ref(hp.parked_buffer(m.visual[0].bias))
+    m.visual[0].bias = torch.nn.Parameter(torch.zeros(256, dtype=torch.bfloat16, device="cuda"))
+    gc.collect()
+    check("replacing a parked Parameter frees its host buffer", gone() is None)
+    g = torch.cuda.CUDAGraph()
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        m.embed_tokens(ids)
+    torch.cuda.synchronize()
+    with torch.cuda.graph(g):
+        out = m.embed_tokens(ids)
+    g.replay()
+    torch.cuda.synchronize()
+    check("graph replay reads the parked weight", torch.equal(out, ref_e))
+
+
 if __name__ == "__main__":
     test_ple_cpu_gather()
     test_qsa_decode()
@@ -892,6 +1140,9 @@ if __name__ == "__main__":
     test_spec_draft_greedy()
     test_qsa_mtp_tail()
     test_qsa_mqa_triton()
+    test_qsa_topk_slices()
+    test_qsa_mqa_prefill_triton()
+    test_host_parked_params()
     print()
     if FAILURES:
         print("FAILED:", ", ".join(FAILURES))

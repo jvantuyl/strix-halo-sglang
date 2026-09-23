@@ -31,6 +31,9 @@ off.
 | [22](../patches/22-spec-draft-greedy.md) | The post-prefill draft extend proposes through `sample_draft_proposal` (argmax for greedy rows) under rejection sampling | HIP defaults EAGLE/NEXTN to rejection sampling; that one draft pass called `fast_sample` directly, so the first draft token was random at `temperature=0` and greedy MTP output differed run to run. Not gfx1151-specific |
 | [23](../patches/23-qsa-mtp-tail.md) | MTP shared block selection places the drafted positions right after the captured entries, not after the `-1` padding | The KV gather packs valid entries as a prefix (count, not mask), so the drafted tokens were dropped and the packed slot left unwritten: stale scratch here, zeros on the paged path. Draft never saw the newest token; accept length 2.3 → 2.55 on short prompts. Not gfx1151-specific |
 | [24](../patches/24-qsa-mqa-triton.md) | Length-bounded Triton kernel for the QSA indexer's decode block scoring, dispatched when TileLang is absent (`SGLANG_QSA_MQA_TRITON=0` forces the reference) | No TileLang here, so the torch reference ran: it gathers the whole `context_length / 4` window per row on every decode step of all 12 QSA layers, 6 ms per layer at bs 20 with a 131k context. That was the whole 99 → 71 tok/s drop at 16–20 streams when the default context grew from 32k; back to 89–105 at 131k. Same on any CUDA build without TileLang |
+| [25](../patches/25-qsa-topk-slices.md) | Prefill block selection sorts row slices into a preallocated output | Patch 21's whole-chunk stable sort was ~1 GiB of transient buffers per QSA layer, 40% of the prefill VRAM peak on a box idling at 90 of 96 GiB (MTP, 20 requests). Identical indices |
+| [26](../patches/26-qsa-mqa-prefill-triton.md) | `tl.dot` prefill MQA for the indexer, logits the only allocation | Prefill twin of patch 24: the reference `einsum` materialises per-head scores (4× the logits) plus three copies, ~1.15 GiB per layer per chunk. 2.9e-6 from the reference, 5× faster, prefill transient flat in prompt length |
+| [27](../patches/27-host-parked-params.md) | Token embedding and vision tower parked in pinned host memory (`SGLANG_HOST_PARKED_PARAMS`) | Both are read a few KB per step or not at all, yet held 2.0 GiB of a carve-out idling at 90 of 96 GiB. Exactly sized `hipHostMalloc` aliased as CUDA tensors; worst-case headroom 1.6 → 3.3 GiB, output and throughput unchanged |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
@@ -53,7 +56,10 @@ is pure Triton upstream and runs unmodified.
    MoE zero points incl. a negative control, dense WNA16 dequant, MoE config
    search path, deterministic HC mix, partial-K MoE tile, dense decode top-k,
    tie-stable block selection, greedy draft proposal, MTP tail placement,
-   Triton decode MQA).
+   Triton decode MQA, row-sliced prefill top-k, Triton prefill MQA,
+   host-parked parameters). Run
+   GPU experiments beside a live server under `--memory 12g` and `timeout`:
+   a bad Triton kernel's compile has OOMed the 30 GB host once.
 3. Convert the PLE table to fp8 (halves the table to ~48 GiB and is the format
    the file backend expects to keep resident-free):
    ```bash
@@ -168,7 +174,18 @@ Measured: weights 75.9 GiB after `load_weights` (the vision tower is ~0.9
 GiB of that), KV cache 3.0 GiB (262,144 tokens fp8; only the 12
 full-attention layers hold KV, ~12 KB/token in fp8, so one full 262k-token
 request fits), GDN state 5.5 GB in bf16 (100 slots → 20 requests).
-Scheduler RSS ≈ 2.9 GB; host `buff/cache` holds the PLE pages.
+Scheduler RSS ≈ 2.9 GB; host `buff/cache` holds the PLE pages. Since patch
+27 the launcher parks the token embedding (1.18 GiB, a `bs`-row gather per
+step) and the vision tower (0.9 GiB, idle without images) in pinned host
+memory (`QWEN38_HOST_PARKED_PARAMS`, default `embed_tokens.weight,visual.`):
+driver VRAM after load drops from 92.2 to 90.3 GB with MTP at cap 20, and
+the container's shmem rises by the same 2.0 GiB (exactly sized
+`hipHostMalloc`; the first version used torch's pinned allocator, which
+rounds to powers of two and cost 5.7 GB). `amdgpu_top` does not show these
+buffers under GTT (they are userptr mappings, GTT stayed at ~110 MiB), so
+the host side is the scheduler's RSS. The gather from host memory costs
+4.2 vs 3.8 µs at bs 20; greedy output, vision and throughput measured
+unchanged.
 
 Host memory over a load and a full benchmark (5 s samples of `free`, the
 container cgroup and the top RSS processes, three launches): during weight
@@ -182,9 +199,20 @@ container anonymous memory ≤ 3.2 GB, flat through 20-stream runs. The one
 host OOM this box has had was a tracing hook that imported torch into every
 spawned process (see Known limitations), not the server.
 
-The `avail mem` figure in the log is not headroom on this ROCm build:
-PyTorch sits at ~95 of 96 GiB once serving (a 1,650-token prefill under MTP
-OOMed with `avail mem=13 GB` printed). Lowering `--mem-fraction-static`
+The `avail mem` figure in the log is not headroom on this ROCm build (it
+reads 24.8 GB before loading 76 GB of weights and 26.6 GB after; a
+1,650-token prefill under MTP once OOMed with `avail mem=13 GB` printed).
+Measure from the host instead: `sudo amdgpu_top --json -n 1` gives total
+VRAM / GTT used and capacity plus per-process VRAM and GTT from fdinfo
+(`--dump` omits fdinfo; other users' processes need root). What it reports
+is driver-allocated memory, which for the scheduler is PyTorch's reserved
+high-water mark: after a long prefill the figure stays up until a
+`/flush_cache` even though the tensors are gone. For what is live *inside*
+the process, `POST /start_profile {"activities": ["MEM"], "output_dir":
+...}`, run the workload, `POST /stop_profile`: the pickle in `output_dir`
+holds the allocator trace (100k events by default) and the segment map;
+replaying the allocs/frees gives the peak live set by call site. That is
+how patches 25 and 26 were found. Lowering `--mem-fraction-static`
 does not create headroom either, the budget just moves into the KV/mamba
 pools. What does:
 
@@ -194,6 +222,7 @@ pools. What does:
 | `--max-total-tokens 262144` | ~3.2 GiB vs the fraction-sized pool | two full 131k-context requests or 20 × 13k fit at once; beyond that SGLang queues or retracts | on |
 | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | fragmentation | none | on |
 | vision tower off (`QWEN38_VISION=0` / `QWEN38_MODEL_OVERRIDE='{"language_model_only": true}'`) | ~0.9 GiB (333 tensors skipped) | no image input | off |
+| embedding + vision tower in pinned host memory (`QWEN38_HOST_PARKED_PARAMS`, patch 27) | ~2.0 GiB | the same 2.0 GiB of host RAM (scheduler RSS/shmem); IOMMU-routed GPU reads of a gather-only table | on |
 | `--max-mamba-cache-size N` | ~54 MB per slot (bf16) | 5 slots per request with the radix cache on, 1 with `--disable-radix-cache`; under MTP an extra `(requests+1) × draft_tokens` intermediate states | 100 (= 20 requests) |
 
 `--language-model-only` itself is whitelisted to three unrelated
@@ -348,15 +377,47 @@ graphs. It needs real headroom: the mamba pool grows a 2.3 GB
 token cap became the defaults the eager GDN prefill OOMed on prompts over
 ~1k tokens (lowering `--mem-fraction-static` does not help, the budget just
 moves into the pools; `--max-total-tokens 131072 --max-mamba-cache-size 30`
-was the workaround). It still needs the request cap halved: at the default
-20 requests the mamba pool is 5.5 GB plus a 4.4 GB intermediate cache
-(`(requests+1) × 4 draft tokens`), and a 26k-token prefill OOMs. At 10
-requests (50 slots + 2.3 GB intermediate) everything fits:
+was the workaround). An earlier note here said the request cap also had to
+be halved to 10 because a 26k-token prefill OOMed at 20; that was inferred
+from pool arithmetic, not measured, and on the patches ≤ 26 image it is
+wrong. Measured with `sudo amdgpu_top` (driver view; the server log's
+"avail mem" is meaningless on this ROCm build), 96 GiB total:
+
+| MTP, cap | Idle after load | Worst case seen | Free at worst |
+|---|---:|---|---:|
+| 10 requests | 84.6 GiB | 9 streams + 99k prefill: 87.6 GiB | 8.6 GiB |
+| 20 requests, patches ≤ 24 | 90.1 GiB | 18 streams + two 43k prefills together: 94.8 GiB | 1.2 GiB |
+| 20 requests, patches ≤ 26 | 90.1 GiB | same: 94.5 GiB | 1.5 GiB |
+| 20 requests, patches ≤ 27 (embedding + vision tower parked in host memory) | 88.1 GiB | same: 92.7 GiB (two 71k prefills: also 92.7) | 3.3 GiB |
+
+Idle at cap 20 is fully accounted for by the load log: weights 75.9, MTP
+layer 0.2, KV 3.05, GDN pools 9.4 (5.33 ssm + 4.43 intermediate + 0.3
+conv), graphs 0.6; patch 27 moves 2.0 GiB of the weights (token
+embedding, vision tower) into pinned host memory, see Memory. On top: a
+prefill transient (~2 GiB of per-chunk activations since patches 25–26,
+flat in prompt length; it was 1.6–2.7 GiB growing with length before), ~0.9
+GiB with 20 streams decoding, and the
+caching allocator's per-stream pools under the overlap scheduler (reserved
+93.5 vs allocated 88.9 GiB at the end of the mixed run;
+`garbage_collection_threshold:0.8` did not change it). Every run completed:
+10 / 16 / 20 streams, 43k and 99k prefills alone and under 19 decoding
+streams, two 43k prefills at once with 18 streams. GTT stayed at ~110 MiB
+throughout, nothing spills to system memory.
+
+So the default cap works with MTP:
 
 ```bash
-QWEN38_CUDA_GRAPH_MAX_BS=10 ./start-qwen38.sh --speculative-algorithm NEXTN \
+./start-qwen38.sh --speculative-algorithm NEXTN \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
 ```
+
+and gives 25.4–25.9 tok/s single-stream *and* 101–110 tok/s at 20 streams
+(the same as plain graphs), which removes the trade-off MTP used to carry.
+With patch 27 the worst case measured leaves 3.3 GiB; before it 1.5 GiB
+was thin. `QWEN38_CUDA_GRAPH_MAX_BS=10` remains the conservative choice
+(8.6 GiB free at its worst case) if the workload mixes many long prefills
+with a full decode batch, and `QWEN38_HOST_PARKED_PARAMS=` (empty) keeps
+every weight in VRAM if the 2 GiB of host RAM matters more.
 
 | Prompt tokens | TTFT | Prefill | Decode (bs=1) |
 |---:|---:|---:|---:|
