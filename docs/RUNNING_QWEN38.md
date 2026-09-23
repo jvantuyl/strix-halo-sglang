@@ -171,11 +171,19 @@ which the PLE table must *not* fill; the file backend's RSS trimmer keeps it
 near the 8 GiB cap). Measure with `amdgpu_top --json --dump`
 (`VRAM.Total VRAM Usage`).
 
-Measured: weights 75.9 GiB after `load_weights` (the vision tower is ~0.9
-GiB of that), KV cache 3.0 GiB (262,144 tokens fp8; only the 12
-full-attention layers hold KV, ~12 KB/token in fp8, so one full 262k-token
-request fits), GDN state 5.5 GB in bf16 (100 slots → 20 requests).
-Scheduler RSS ≈ 2.9 GB; host `buff/cache` holds the PLE pages. Since patch
+Measured (driver view sampled every 2 s over a plain-graphs launch of the
+patches ≤ 28 image): VRAM peaks at 70.8 GiB while the loader streams the
+shards, drops to **67.5 GiB** once it releases its staging buffers, and
+that is the weights in VRAM (plus 2.0 GiB parked in host memory since
+patch 27, so ~69.5 GiB of weights; the vision tower is ~0.9 GiB of that).
+Earlier revisions of this page said 75.9 GiB, read before the release.
+The pools then add 8.9 GiB (KV cache 3.0 GiB: 262,144 tokens fp8; only the
+12 full-attention layers hold KV, ~12 KB/token in fp8, so one full
+262k-token request fits; GDN state 5.33 + 0.21 GB in bf16, 100 slots → 20
+requests; ~0.4 GiB of radix tree, request-to-token map and tracking) and
+the decode graphs 1.0 GiB, for 77.4 GiB idle without MTP (with MTP see the
+accounting under Speculative decoding). Scheduler RSS ≈ 2.9 GB; host
+`buff/cache` holds the PLE pages. Since patch
 27 the launcher parks the token embedding (1.18 GiB, a `bs`-row gather per
 step) and the vision tower (0.9 GiB, idle without images) in pinned host
 memory (`QWEN38_HOST_PARKED_PARAMS`, default `embed_tokens.weight,visual.`):
@@ -183,8 +191,10 @@ driver VRAM after load drops from 92.2 to 90.3 GB with MTP at cap 20, and
 the container's shmem rises by the same 2.0 GiB (exactly sized
 `hipHostMalloc`; the first version used torch's pinned allocator, which
 rounds to powers of two and cost 5.7 GB). `amdgpu_top` does not show these
-buffers under GTT (they are userptr mappings, GTT stayed at ~110 MiB), so
-the host side is the scheduler's RSS. The gather from host memory costs
+buffers under GTT (they are userptr mappings; the scheduler's own GTT from
+fdinfo is 8 MiB, and the box's total, ~100 MiB headless or ~400 MiB with a
+Wayland desktop up, is the compositor and terminals), so the host side is
+the scheduler's RSS. The gather from host memory costs
 4.2 vs 3.8 µs at bs 20; greedy output, vision and throughput measured
 unchanged.
 
@@ -391,8 +401,9 @@ data never overwrite each other; see
 ### Speculative decoding (MTP)
 
 The checkpoint ships one MTP layer; `--speculative-algorithm NEXTN` loads it
-as the draft model (+70 s load, 0.2 GB) and captures target-verify and draft
-graphs. It needs real headroom: the mamba pool grows a 2.3 GB
+as the draft model (+45–70 s load; 7.1 GiB of VRAM, not the 0.2 GB the
+load log claims, see the accounting below) and captures target-verify and
+draft graphs. It needs real headroom: the mamba pool grows a 2.3 GB
 `intermediate_ssm_state_cache`, and before the fp8 KV cache and the 262144
 token cap became the defaults the eager GDN prefill OOMed on prompts over
 ~1k tokens (lowering `--mem-fraction-static` does not help, the budget just
@@ -412,19 +423,35 @@ wrong. Measured with `sudo amdgpu_top` (driver view; the server log's
 | 20 requests, patches ≤ 27, 71-token short prompts instead of 300-token ones | 88.1 GiB | 18 streams + two 26k prefills: 95.9 GiB | **0.1 GiB** |
 | 20 requests, patches ≤ 28 | 87.9 GiB | either mix: 90.4 GiB | 5.8 GiB |
 
-Idle at cap 20 is fully accounted for by the load log: weights 75.9, MTP
-layer 0.2, KV 3.05, GDN pools 9.4 (5.33 ssm + 4.43 intermediate + 0.3
-conv), graphs 0.6; patch 27 moves 2.0 GiB of the weights (token
-embedding, vision tower) into pinned host memory, see Memory. On top: a
-prefill transient (~2 GiB of per-chunk activations since patches 25–26,
-flat in prompt length; it was 1.6–2.7 GiB growing with length before), ~0.9
-GiB with 20 streams decoding, and the
-caching allocator's per-stream pools under the overlap scheduler (reserved
-93.5 vs allocated 88.9 GiB at the end of the mixed run;
-`garbage_collection_threshold:0.8` did not change it). Every run completed:
-10 / 16 / 20 streams, 43k and 99k prefills alone and under 19 decoding
-streams, two 43k prefills at once with 18 streams. GTT stayed at ~110 MiB
-throughout, nothing spills to system memory.
+Idle at cap 20 (87.9 GiB on the patches ≤ 28 image) is accounted for by
+the driver trace of the launch, in four steps: target weights 67.5 GiB
+after the loader releases its staging buffers (2.0 GiB more are parked in
+host memory by patch 27, see Memory); **the draft module 7.1 GiB**; pools
+12.2 GiB; graphs and caches 1.1 GiB. The load log's "MTP mem usage=0.12
+GB" is wrong for the same reason its `avail mem` is (see Memory). The 7.1
+GiB is the MTP layer built in bf16, 4.7 GiB (512 experts × 3 × 640 × 2560
+× 2 B; `mtp.*` is on the checkpoint's quantization ignore list, and the
+draft's MoE kernel looks up an `E=512,N=640` bf16 config where the target
+uses `N=320 int4_w4a16`), plus two 1.18 GiB placeholders, the draft's own
+`embed_tokens` and `lm_head` (248,320 × 2560 bf16), which
+`set_embed_and_head` replaces with the target's tensors right after the
+load. The placeholders go back to the caching allocator, not to the
+driver, so they stay in the idle figure; the small pools (conv states,
+draft KV) are carved from them, which is why the pool step is 12.2 GiB
+against the log's 13.3 (5.33 ssm + 4.43 intermediate + 0.3 conv + 3.05 KV
++ 0.26 draft KV). Building the draft without the placeholders would trim
+up to 2.4 GiB of reserved memory; quantizing the MTP layer would save
+~3.5 GiB but means a different checkpoint. Neither is done. On top of
+idle: a prefill transient (~2 GiB of per-chunk activations since patches
+25–26 and 28, flat in prompt length; it was 1.6–2.7 GiB growing with
+length before 25–26 and up to 6.3 GiB with mixed batches before 28), ~0.9
+GiB with 20 streams decoding, and the caching allocator's per-stream pools
+under the overlap scheduler (reserved 93.5 vs allocated 88.9 GiB at the
+end of the mixed run; `garbage_collection_threshold:0.8` did not change
+it). Every run completed: 10 / 16 / 20 streams, 43k and 99k prefills alone
+and under 19 decoding streams, two 43k prefills at once with 18 streams.
+The scheduler's GTT stayed at 8 MiB throughout, nothing spills to system
+memory.
 
 The 0.1 GiB row is why the benchmark suite exists: the hand-run mixes all
 used 300-token synthetic short prompts, and the suite's 71-token story
@@ -440,8 +467,29 @@ So the default cap works with MTP:
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
 ```
 
-and gives 25.4–25.9 tok/s single-stream *and* 101–110 tok/s at 20 streams
-(the same as plain graphs), which removes the trade-off MTP used to carry.
+and gives 25.4–25.9 tok/s single-stream *and* 107–111 tok/s at 20 streams,
+which removes the trade-off MTP used to carry. The same suite run against
+the same image with and without MTP (DERISKED, cap 20, two passes, first
+pass / second pass; the host columns are the container cgroup):
+
+| | Plain graphs | MTP (3 steps, 4 draft tokens) |
+|---|---:|---:|
+| Idle after load (VRAM used / free) | 77.4 / 19.1 GiB | 87.9 / 8.3 GiB |
+| Decode bs 1, 183-token prompt | 15.7 tok/s | 25.4 tok/s |
+| Decode bs 1 after 2k / 8k / 32k prompts | 14.5–15.7 / 14.2–15.6 / 14.7–15.6 | 22.0–22.6 / 19.2–20.0 / 23.8–24.6 |
+| Prefill, 8k / 32k prompt | 754 / 731 tok/s | 712 / 706 tok/s |
+| 4 / 8 / 16 / 20 short streams, aggregate | 33.9–36.0 / 58.3–61.2 / 93.9–99.0 / 93.4–97.7 | 43.1–45.0 / 63.5–65.7 / 94.6–101.0 / 106.7–110.9 |
+| 18 short streams + two 26k prefills: min VRAM free | 16.9 GiB | 5.7 GiB |
+| Container anonymous / shmem while serving | 2.5 / 2.4 GB | 2.8 / 2.4 GB |
+
+MTP is ahead or even at every point; it costs 10.5 GiB of VRAM (7.1 draft
+module, 3.3 pools net of the placeholder reuse, 0.1 graphs) and ~0.3 GB of
+host memory. One thing both configurations share: in the mixed run the 18
+short streams decode at 2.1–2.3 tok/s each and the last of them waits 21 s
+for a first token while the two long prompts prefill in 8k chunks. That is
+the chunked-prefill scheduler favouring prefill over decode, not memory,
+and it has not been looked into.
+
 With patches 27 and 28 the worst case measured leaves 5.8 GiB; before
 them 1.5 GiB was thin and one prompt mix reached 0.1. `QWEN38_CUDA_GRAPH_MAX_BS=10` remains the conservative choice
 (8.6 GiB free at its worst case) if the workload mixes many long prefills
