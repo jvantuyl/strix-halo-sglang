@@ -34,6 +34,16 @@ Covers:
      match the reference scores, stay bit-identical on tied relu-style
      scores (decode and prefill shapes), and the decode form captures into
      a CUDA graph.
+ 11. patch 22 -- greedy rows (top_k <= 1) get their argmax from
+     sample_draft_proposal, bit-identical over launches, while the
+     fast_sample draw the post-prefill draft used to take varies; the
+     rejection-sampling branch of _draft_extend_for_prefill routes through
+     sample_draft_proposal.
+ 12. patch 23 -- QSAMTPSharedSparseIndices.lookup keeps each row a valid
+     prefix (tail right after the captured entries, not after the -1
+     padding) so the KV gather's count-based packing sees the drafted
+     positions; full rows, never-captured rows, the gather's own valid
+     counts, and CUDA graph capture.
 """
 from __future__ import annotations
 
@@ -642,6 +652,128 @@ def test_qsa_topk_ties():
         check(f"qsa_stable_rows_topk k={k} bit-identical", same == 30, f"{same}/30")
 
 
+# ---------------------------------------------------------------------------
+# 11. greedy first draft under rejection sampling (patch 22)
+# ---------------------------------------------------------------------------
+def test_spec_draft_greedy():
+    """Draft proposal for greedy rows (patch 22).
+
+    HIP turns speculative_use_rejection_sampling on, so every draft goes
+    through sample_draft_proposal, which hands a top_k <= 1 row its argmax.
+    The post-prefill draft (_draft_extend_for_prefill) called fast_sample
+    directly and drew a random first draft token at temperature 0. Check the
+    proposal is the argmax and bit-identical for greedy rows on a sharp but
+    not one-hot distribution where fast_sample visibly varies, and that the
+    rejection-sampling branch of _draft_extend_for_prefill now goes through
+    sample_draft_proposal.
+    """
+    import importlib.util
+
+    from sglang.srt.speculative.spec_utils import fast_sample, sample_draft_proposal
+
+    torch.manual_seed(0)
+    dev = "cuda"
+    bs, vocab = 6, 4096
+    logits = torch.randn(bs, vocab, device=dev) * 3
+    # a runner-up within ~1.5 nats of the top so a random draw misses it often
+    top = logits.argmax(dim=-1)
+    logits.scatter_(1, ((top + 1) % vocab).unsqueeze(1), logits.max(dim=1, keepdim=True).values - 1.5)
+    temps = torch.ones(bs, 1, device=dev)
+    top_ks = torch.tensor([1, 1, 1, 50, 1, 50], device=dev, dtype=torch.int32)
+    greedy = top_ks <= 1
+
+    probs, p, idx = sample_draft_proposal(logits, temps, top_ks)
+    check("sample_draft_proposal greedy rows pick the argmax",
+          torch.equal(idx.view(-1)[greedy], top[greedy]))
+    check("sample_draft_proposal returns the argmax probability",
+          torch.allclose(p.view(-1)[greedy], probs.max(dim=1).values[greedy]))
+    same = sum(int(torch.equal(sample_draft_proposal(logits, temps, top_ks)[2].view(-1)[greedy], top[greedy]))
+               for _ in range(30))
+    check("sample_draft_proposal greedy rows bit-identical", same == 30, f"{same}/30")
+    misses = sum(int((fast_sample(probs, num_samples=1)[1].view(-1)[greedy] != top[greedy]).any())
+                 for _ in range(30))
+    print(f"       (fast_sample on the same greedy rows misses the argmax in {misses}/30 draws)")
+
+    spec = importlib.util.find_spec("sglang.srt.speculative.eagle_worker_v2")
+    src = open(spec.origin).read()
+    start = src.index("def _draft_extend_for_prefill(")
+    end = src.find("\n    def ", start + 1)
+    body = src[start:end if end > 0 else None]
+    rs = body[body.index("use_rejection_sampling = get_spec()"):]
+    branch = rs[: rs.index("else:")]
+    check("_draft_extend_for_prefill rejection-sampling branch uses sample_draft_proposal",
+          "sample_draft_proposal(" in branch and "fast_sample(" not in branch)
+
+
+# ---------------------------------------------------------------------------
+# 12. MTP shared sparse indices: tail placement (patch 23)
+# ---------------------------------------------------------------------------
+def test_qsa_mtp_tail():
+    """QSAMTPSharedSparseIndices.lookup rows stay a valid prefix (patch 23).
+
+    The KV gather (_compact_kv) packs column c only if c < valid_count, so
+    the drafted positions appended by lookup have to follow the captured
+    row's valid entries. Rows: a short capture with -1 padding, a full row,
+    and a never-captured row (zeros, captured_len 1). At each draft step the
+    row must be captured entries, then the tail positions <= current, then
+    -1; the FA2 valid-count kernel's count must equal the prefix length; and
+    the lookup must capture into a CUDA graph.
+    """
+    from sglang.srt.layers.attention.qsa.sparse_attn import qwen_sparse_fa2_cu_seqlens_triton
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import QSAMTPSharedSparseIndices
+
+    dev = "cuda"
+    topk, tail_width = 51, 4
+    state = QSAMTPSharedSparseIndices(layer_ids=[0], num_requests=3, token_topk=topk,
+                                      tail_width=tail_width, device=dev)
+    short = torch.full((topk,), -1, dtype=torch.int32, device=dev)
+    short[:19] = torch.arange(19, device=dev, dtype=torch.int32)
+    full = torch.arange(100, 100 + topk, device=dev, dtype=torch.int32)
+    state.capture(torch.stack([short, full]), torch.tensor([1, 2], device=dev),
+                  torch.tensor([19, 2000], device=dev), layer_id=0)
+    reqs = torch.tensor([1, 2, 0], device=dev, dtype=torch.int32)
+    captured = [short, full, torch.zeros(topk, dtype=torch.int32, device=dev)]
+    bases = [19, 2000, 1]
+    width = topk + tail_width
+    for step in range(tail_width + 1):
+        pos = torch.tensor([b + step for b in bases], device=dev, dtype=torch.int64)
+        out = state.lookup(reqs, pos, layer_id=0)
+        ok = tuple(out.shape) == (3, width)
+        counts = torch.empty(3, dtype=torch.int32, device=dev)
+        cu_k = torch.empty(4, dtype=torch.int32, device=dev)
+        qwen_sparse_fa2_cu_seqlens_triton(pos.to(torch.int32) + 1, out, counts, cu_k, 3, width)
+        for r in range(3):
+            n = int((captured[r] >= 0).sum())
+            t = min(step + 1, tail_width)
+            want = torch.cat([captured[r][:n],
+                              torch.arange(bases[r], bases[r] + t, device=dev, dtype=torch.int32),
+                              torch.full((width - n - t,), -1, dtype=torch.int32, device=dev)])
+            ok &= torch.equal(out[r], want)
+            ok &= int(counts[r]) == n + t
+        check(f"mtp lookup step {step}: captured, tail, -1 prefix layout; gather count matches", ok,
+              "" if ok else f"got {out[:, :24].tolist()} ... counts {counts.tolist()}")
+    check("mtp lookup leaves the stored selection untouched",
+          torch.equal(state.indices[0, 1, :topk], short) and torch.equal(state.indices[0, 2, :topk], full))
+
+    pos = torch.tensor([21, 2002, 3], device=dev, dtype=torch.int64)
+    eager = state.lookup(reqs, pos, layer_id=0)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        state.lookup(reqs, pos, layer_id=0)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_out = state.lookup(reqs, pos, layer_id=0)
+    graph.replay()
+    torch.cuda.synchronize()
+    check("mtp lookup graph replay matches eager", torch.equal(g_out, eager))
+    pos.fill_(0); pos += torch.tensor([19, 2000, 1], device=dev)
+    graph.replay()
+    torch.cuda.synchronize()
+    check("mtp lookup graph replay follows the position buffer",
+          torch.equal(g_out, state.lookup(reqs, pos, layer_id=0)))
+
+
 if __name__ == "__main__":
     test_ple_cpu_gather()
     test_qsa_decode()
@@ -653,6 +785,8 @@ if __name__ == "__main__":
     test_moe_partial_k()
     test_qsa_dense_topk()
     test_qsa_topk_ties()
+    test_spec_draft_greedy()
+    test_qsa_mtp_tail()
     print()
     if FAILURES:
         print("FAILED:", ", ".join(FAILURES))

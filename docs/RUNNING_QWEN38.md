@@ -9,7 +9,9 @@ reading rows on demand from a file. This page is the runbook for that setup
 on the fork image (`strix-halo-sglang:dev`).
 
 Tested checkpoint: `cyankiwi/Qwen3.8-Flash-Next-AWQ-INT4` (compressed-tensors,
-group 32, asymmetric; vision tower unquantized). MTP is not used.
+group 32, asymmetric; vision tower unquantized). MTP is optional (see
+[Speculative decoding](#speculative-decoding-mtp)); the launcher leaves it
+off.
 
 ## What the image adds
 
@@ -26,6 +28,8 @@ group 32, asymmetric; vision tower unquantized). MTP is not used.
 | [19](../patches/19-moe-wna16-kmask.md) | GPTQ/AWQ MoE kernel masks the packed-weight load on a partial last K block | Unmasked, it read past the last expert's rows: a layout-dependent GPU page fault (killed the tuner on the g128 checkpoint). Runtime shapes are even multiples, so serving is unchanged |
 | [20](../patches/20-qsa-decode-topk.md) | Decode QSA block selection uses a graph-capturable torch top-k on HIP instead of the JIT kernel | `select_decode_tokens` bypassed patch 11's guard; the JIT kernel is unsafe here and its output order varies past 512 blocks (long-context decode drift). ~1–1.5 ms per decode step |
 | [21](../patches/21-qsa-topk-ties.md) | Tie-stable QSA block selection on HIP: stable sort for prefill rows, top-k over unique score+index keys for decode, ties toward the lower block | `torch.topk` orders tied entries differently per launch on this ROCm build and the indexer's relu scores tie constantly, so prefill above ~1.4k tokens (and patch 20's decode) still drifted bit-wise. Also replaces the per-row Python loop in prefill (119 → 3.5 ms per QSA layer at 1.5k tokens) |
+| [22](../patches/22-spec-draft-greedy.md) | The post-prefill draft extend proposes through `sample_draft_proposal` (argmax for greedy rows) under rejection sampling | HIP defaults EAGLE/NEXTN to rejection sampling; that one draft pass called `fast_sample` directly, so the first draft token was random at `temperature=0` and greedy MTP output differed run to run. Not gfx1151-specific |
+| [23](../patches/23-qsa-mtp-tail.md) | MTP shared block selection places the drafted positions right after the captured entries, not after the `-1` padding | The KV gather packs valid entries as a prefix (count, not mask), so the drafted tokens were dropped and the packed slot left unwritten: stale scratch here, zeros on the paged path. Draft never saw the newest token; accept length 2.3 → 2.55 on short prompts. Not gfx1151-specific |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
@@ -47,7 +51,7 @@ is pure Triton upstream and runs unmodified.
    Expect `ALL PARITY TESTS PASSED` (PLE gather bf16/fp8, QSA decode, top-k chain,
    MoE zero points incl. a negative control, dense WNA16 dequant, MoE config
    search path, deterministic HC mix, partial-K MoE tile, dense decode top-k,
-   tie-stable block selection).
+   tie-stable block selection, greedy draft proposal, MTP tail placement).
 3. Convert the PLE table to fp8 (halves the table to ~48 GiB and is the format
    the file backend expects to keep resident-free):
    ```bash
@@ -353,6 +357,44 @@ structured tool calls (`finish_reason: tool_calls`), vision (exact OCR of
 rendered text plus shape/color identification, 128 image tokens), 8
 concurrent streams, 6302-token prompt with radix-cache reuse.
 
+On HIP upstream switches EAGLE/NEXTN to rejection sampling
+(`speculative_use_rejection_sampling`, log line "ROCm needs rejection
+sampling for EAGLE spec-decode to sample at all"); the greedy verify kernel
+is CUDA-only. Greedy requests still commit the target's argmax at every
+step, but until patches 22 and 23 the MTP path was not repeatable: the
+first draft token was a random draw (patch 22) and the draft's sparse
+attention never saw the tokens drafted since the capture, reading a stale
+scratch slot instead (patch 23). Details and the trace that found them are
+in the two patch notes.
+
+DERISKED with the same MTP flags (`QWEN38_CUDA_GRAPH_MAX_BS=10`, 3 steps, 4
+draft tokens), patches ≤ 23, one 128-token generation per row:
+
+| Prompt tokens | TTFT | Prefill | Decode (bs=1) |
+|---:|---:|---:|---:|
+| 183 | 0.6–0.7 s | 275–292 tok/s | 21.9–23.0 tok/s |
+| 3,372 | 4.6 s | 727 tok/s | 19.5 tok/s |
+| 13,467 | 19.2 s | 701 tok/s | 16.7 tok/s |
+| 54,015 | 82.5 s | 655 tok/s | 18.3 tok/s |
+
+4 / 8 / 10 streams (200-token stories, warm kernels): 42.0 / 47.3 / 53.3
+and 42.0 / 46.9 / 49.6 tok/s aggregate, per-stream 11.3 / 6.5 / 5.6–6.1;
+the first pass after a start is lower (35.3 / 40.8 / 45.6) while Triton
+compiles the new shapes. Before patches 22 and 23 the same box gave 25.3 /
+16.9 / 17.8 / 19.8 tok/s at bs 1 and 37.5 / 46.4 / 50.3 aggregate, so the
+fixes cost nothing. Mean accept length 2.3–2.6 on short prompts (2.55 over a
+512-token completion, was 2.3–2.8 and varying), 3.3–3.4 on the 2.5k- and
+14k-token prompts (was 3.1). Against plain graphs on the same checkpoint
+(14.5–14.8 bs 1, 48.1 at 8 streams) that is +50% single stream and about
+even at 8; the request cap of 10 is the price.
+
+Determinism under MTP, every run cold (`/flush_cache`, `temperature=0`,
+top-1 logprob compared at every position, accept histogram compared):
+19-token prompt 96 tokens 4/4 identical and 512 tokens 3/3, 2.5k-token
+prompt 128 tokens 3/3, 14k-token prompt 64 tokens 3/3. Before the two
+patches the 96-token probe differed 3/3 (same tokens, logprobs from
+position 6–7, a token flip at 79 in one run, `spec_verify_ct` 40–42).
+
 ## Running the abliterated variant (DERISKED)
 
 `davetha/Qwen3.8-Flash-Next-DERISKED-W4A16-AWQ` is a refusal-ablated requant
@@ -460,6 +502,8 @@ patches ≤ 18 image on 9 of 12 probes, as expected: a different (now fixed)
 tie order in the block selection changes the rounding, and long greedy
 generations part at the next near-tie. Long-context concurrency stress
 (4 × 13k, 8 × 5k and 2 × 50k-token prompts) completed with no GPU faults.
+With MTP on, the same holds since patches 22 and 23; numbers in
+[Speculative decoding](#speculative-decoding-mtp).
 
 ## Known limitations
 
@@ -497,6 +541,28 @@ generations part at the next near-tie. Long-context concurrency stress
   sort (prefill) or a top-k over unique score+index keys (decode). End-to-end
   numbers are below the DERISKED table: 8.6k-token prompt, 200 greedy
   tokens, 4/4 cold runs identical to the logprob.
+- Fixed, kept for the record: with MTP on, greedy decode was still not
+  repeatable after patch 21 (same tokens for ~80 positions, logprobs
+  differing from position 6–7, a token flip after ~80, the verify count and
+  accept histogram changing run to run); without MTP the same image was
+  bit-identical. Overlap scheduling and CUDA graphs were ruled out. A
+  per-module GPU checksum trace of the target and draft forwards found two
+  causes. First (patch 22): HIP defaults EAGLE/NEXTN to rejection sampling,
+  and the draft pass after prefill drew its first draft token with
+  `fast_sample` instead of the greedy-aware `sample_draft_proposal`, so the
+  first draft was random at `temperature=0`; the target still committed its
+  argmax, but the accept/reject changed the verify batch shape and with it
+  every later rounding. Second (patch 23): the draft's sparse attention
+  reuses the block selection captured at draft-extend plus a tail of the
+  positions drafted since, and that tail was written after the row's `-1`
+  padding while the KV gather packs valid entries as a prefix, so the
+  drafted positions were dropped and the packed slot read stale scratch from
+  the previous request. Both are upstream bugs, not gfx1151 ones; on CUDA
+  the second is silent (zero-filled slot, deterministic, draft blind to the
+  newest tokens). A first attempt at the trace, a `sitecustomize` hook that
+  imported torch into every spawned process, OOMed the 30 GB host during
+  model load and forced a reboot; the working tracer hooks the scheduler's
+  model only, sums on the GPU, and the container ran under `--memory 22g`.
 - Fixed, kept for the record: eager decode above the largest captured graph
   used to fault the next replay (`Memory access fault by GPU node-1 ... Page
   not present`) after a `/flush_cache`. Two factors: upstream's QSA backend

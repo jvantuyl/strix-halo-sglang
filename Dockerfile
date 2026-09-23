@@ -249,6 +249,24 @@ RUN python3 /tmp/patch_qsa_decode_topk.py && rm /tmp/patch_qsa_decode_topk.py
 COPY patches/patch_qsa_topk_ties.py /tmp/patch_qsa_topk_ties.py
 RUN python3 /tmp/patch_qsa_topk_ties.py && rm /tmp/patch_qsa_topk_ties.py
 
+# --- greedy first draft under rejection sampling (patch 22) ---
+# HIP defaults EAGLE/NEXTN to rejection sampling, whose per-step proposal
+# hands greedy rows their argmax; the post-prefill draft extend called
+# fast_sample directly, so the first draft token was random at temperature 0
+# and greedy MTP output differed run to run. Route it through the same
+# proposal. Not gfx1151-specific. See patches/22-spec-draft-greedy.md.
+COPY patches/patch_spec_draft_greedy.py /tmp/patch_spec_draft_greedy.py
+RUN python3 /tmp/patch_spec_draft_greedy.py && rm /tmp/patch_spec_draft_greedy.py
+
+# --- MTP draft decode sees the drafted tokens (patch 23) ---
+# The shared MTP selection wrote the drafted positions after the captured
+# row's -1 padding, but the KV gather packs a row's valid entries as a
+# prefix (count, not mask): the drafted positions were dropped and the packed
+# slot left unwritten (stale scratch here, zeros on the paged path). Place
+# the tail right after the captured entries. See patches/23-qsa-mtp-tail.md.
+COPY patches/patch_qsa_mtp_tail.py /tmp/patch_qsa_mtp_tail.py
+RUN python3 /tmp/patch_qsa_mtp_tail.py && rm /tmp/patch_qsa_mtp_tail.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"
