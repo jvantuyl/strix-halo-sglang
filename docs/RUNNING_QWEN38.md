@@ -240,7 +240,26 @@ hash (or the 51B table is wrong for every renumbered token).
 
 Single box, no other GPU tenant, PLE table on local NVMe, radix cache
 flushed before every prefill measurement (streaming client, `max_tokens`
-128, temperature 0):
+128, temperature 0). The same measurements, with memory sampled per
+scenario, come from [`tools/bench_qwen38.py`](../tools/bench_qwen38.py)
+against a running server:
+
+```bash
+tools/bench_qwen38.py --container sglang-qwen38-derisked --label "MTP cap 20" \
+    --single 128,2048,8192,32000 --concurrent 4,8,16,20 --concurrent-lengths 128 \
+    --mixed 18:26000:2 --passes 2 --out bench.jsonl
+```
+
+Single requests × prompt length (TTFT, prefill, decode), N streams × prompt
+length (aggregate, per stream, worst TTFT), and N short streams decoding
+while M long prompts prefill together (the VRAM worst case). Every row
+carries the driver's VRAM peak / minimum free and GTT (from sysfs, no
+root), the host's minimum available memory and, with `--container`, the
+cgroup's peak current / anonymous / shmem, all over that row's own window,
+plus the server's speculative settings, request cap and context from
+`/get_server_info`. MTP on or off is a launch option, so run the suite once
+per launch and compare the JSONL rows. The first pass after a start is
+lower while Triton compiles new shapes; `--passes 2` shows both.
 
 | Prompt tokens | TTFT | Prefill | Decode (bs=1) |
 |---:|---:|---:|---:|
