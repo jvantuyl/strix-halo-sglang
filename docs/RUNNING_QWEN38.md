@@ -78,9 +78,10 @@ is pure Triton upstream and runs unmodified.
 ```bash
 ./start-qwen38.sh                                # port 30001, container sglang-qwen38
 docker compose --profile qwen38 up -d qwen38     # same thing, detached
+systemctl --user start qwen38-sglang             # as a user service, see systemd/README.md
 ```
 
-Both run:
+All run:
 
 ```
 python3 -m sglang.launch_server \

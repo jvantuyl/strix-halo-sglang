@@ -1,0 +1,24 @@
+[Unit]
+Description=Qwen3.8-Flash-Next on SGLang (strix-halo-sglang)
+After=default.target
+
+[Service]
+Type=exec
+# Deployment-specific values (checkpoint, PLE cache dir, container name,
+# request cap, MTP flags) live here; see qwen38-sglang.env.example.
+EnvironmentFile=%h/.config/qwen38-sglang.env
+# docker.service is a system unit a user unit cannot order after, so wait
+# for the daemon instead (matters at boot under linger).
+ExecStartPre=/bin/sh -c 'until docker info >/dev/null 2>&1; do sleep 2; done'
+ExecStart=%h/strix-halo-sglang/start-qwen38.sh $QWEN38_EXTRA_ARGS
+# start-qwen38.sh execs `docker run` in the foreground and the client proxies
+# SIGTERM to the server. If the client is killed before the container exits,
+# make sure the container goes too (the launcher also removes a stale one).
+ExecStopPost=-/usr/bin/docker rm -f ${SGLANG_CONTAINER}
+TimeoutStartSec=600
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=20
+
+[Install]
+WantedBy=default.target
