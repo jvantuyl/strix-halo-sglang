@@ -64,6 +64,11 @@
 #     QWEN38_SYSTEM_PROMPT (one line asking the model to say when it is
 #     unsure; it is rendered before the client's system message). Empty
 #     disables either. Needs python3 on the host to build the JSON.
+#   - QWEN38_STRICT_THINKING (on by default): --enable-strict-thinking masks
+#     the EOS and <tool_call> tokens while the model is inside <think>, so a
+#     stray end-of-turn mid-reasoning (the model's own habit on list-heavy
+#     prompts) cannot end the request with reasoning_content and no answer.
+#     0 disables.
 #   - QWEN38_PRESHARDED_DIR (off by default): upstream's `--load-format
 #     presharded`. The first boot loads normally and dumps the post-processed
 #     weights there (~75 GiB, target and draft in their own subtrees); later
@@ -147,6 +152,16 @@ fi
 if [ -n "$SYSTEM_PROMPT" ] && [ -z "$CHAT_TEMPLATE" ]; then
     echo "QWEN38_SYSTEM_PROMPT needs the repo template (default_system_prompt kwarg); the checkpoint's template ignores it" >&2
 fi
+# The model sometimes makes <|im_end|> its top token while still inside
+# <think> (Qwen3.8 issue 216: list-heavy reasoning, worst at xhigh, roughly
+# one call in five), which ends the turn with reasoning_content only and no
+# answer or tool call. Strict thinking masks the EOS and <tool_call> tokens in
+# the logits until </think> has been emitted, so the model takes its next-best
+# token and finishes the block. Clients can cap a loop with max_thinking_tokens.
+STRICT_THINKING_FLAGS=()
+if [ "${QWEN38_STRICT_THINKING:-1}" != "0" ]; then
+    STRICT_THINKING_FLAGS=(--enable-strict-thinking)
+fi
 PRESHARDED_ARGS=()
 PRESHARDED_FLAGS=()
 if [ -n "$PRESHARDED_DIR" ]; then
@@ -211,6 +226,7 @@ exec docker run --name "$NAME" \
         --mamba-ssm-dtype bfloat16 \
         --reasoning-parser qwen3 \
         --tool-call-parser qwen3_coder \
+        "${STRICT_THINKING_FLAGS[@]}" \
         "${TEMPLATE_KWARGS[@]}" \
         "${PRESHARDED_FLAGS[@]}" \
         "$@"

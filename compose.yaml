@@ -144,6 +144,9 @@ services:
       - qwen3
       - --tool-call-parser
       - qwen3_coder
+      # Masks EOS and <tool_call> inside <think>: the model otherwise ends the
+      # turn mid-reasoning on ~1 in 5 list-heavy prompts (no answer, no tool call).
+      - --enable-strict-thinking
       #- --load-format
       #- presharded
       #- --model-loader-extra-config
