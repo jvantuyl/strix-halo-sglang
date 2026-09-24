@@ -1,0 +1,16 @@
+[Unit]
+Description=FastFlowLM NPU server
+After=default.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/flm serve qwen3.5:2b --host 0.0.0.0 --port 8001 --pmode turbo --ctx-len 65536
+# NPU buffers are pinned; flm refuses to start at the 8 MiB default
+# ("Memlock limit is too low"). A user unit cannot exceed the user manager's
+# own hard limit, so user@.service.d-memlock.conf has to be installed first.
+LimitMEMLOCK=infinity
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
