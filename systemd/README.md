@@ -36,7 +36,10 @@ systemctl --user enable --now qwen38-sglang.service flm.service
 ```
 
 `qwen38-sglang.service` expects the repository at `~/strix-halo-sglang`;
-edit `ExecStart` if it lives elsewhere. From a shell without a session
+edit `ExecStart` if it lives elsewhere. `flm.service` names its model on the
+`ExecStart` line (`qwen3.5:4b`; `flm pull <model>` first, `flm list` shows
+what is installed), so a model change is an edit there plus
+`systemctl --user daemon-reload && systemctl --user restart flm`. From a shell without a session
 (`sudo -u`, cron) point `systemctl --user` at the manager with
 `XDG_RUNTIME_DIR=/run/user/$(id -u)`.
 
