@@ -1,11 +1,18 @@
 {#- Qwen3.8-Flash-Next chat template (the stock chat_template.jinja shipped with
-    the checkpoint, Apache-2.0) with one addition: an optional `default_system_prompt`
-    template kwarg. When set and non-empty it becomes a paragraph of the system block,
-    after the model's own reasoning-effort instruction and before the client's system
-    message (and before the tool list). When unset or empty the rendered prompt is
-    byte-identical to the stock template. The launcher passes it, together with the
-    default reasoning_effort, through --default-chat-template-kwargs; a request may
-    override either through its own chat_template_kwargs. -#}
+    the checkpoint, Apache-2.0) with two additions:
+    1. An optional `default_system_prompt` template kwarg. When set and non-empty it
+       becomes a paragraph of the system block, after the model's own reasoning-effort
+       instruction and before the client's system message (and before the tool list).
+       When unset or empty the rendered prompt is byte-identical to the stock template.
+       The launcher passes it, together with the default reasoning_effort, through
+       --default-chat-template-kwargs; a request may override either through its own
+       chat_template_kwargs.
+    2. The OpenAI reasoning_effort values the model does not define are mapped onto
+       the three it does instead of failing the request (clients such as Hermes pass
+       them straight through): minimal -> low, high -> xhigh, none -> low (SGLang
+       turns a top-level none into enable_thinking=false before the template runs;
+       this covers none inside chat_template_kwargs); empty -> the template default.
+       Anything else still raises, as in the stock template. -#}
 {%- set image_count = namespace(value=0) %}
 {%- set video_count = namespace(value=0) %}
 {%- macro render_content(content, do_vision_count, is_system_content=false) %}
@@ -52,9 +59,13 @@
 {%- endif %}
 {%- set reasoning_instructions = '' %}
 {%- if enable_thinking is undefined or enable_thinking is true %}
-    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+    {%- set resolved_reasoning_effort = (reasoning_effort|default('xhigh', true))|string|lower %}
+    {%- set effort_aliases = {'none': 'low', 'minimal': 'low', 'high': 'xhigh'} %}
+    {%- if resolved_reasoning_effort in effort_aliases %}
+        {%- set resolved_reasoning_effort = effort_aliases[resolved_reasoning_effort] %}
+    {%- endif %}
     {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
-        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}
+        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low; none, minimal and high are mapped onto them.') }}
     {%- endif %}
     {%- if resolved_reasoning_effort == 'xhigh' %}
         {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
