@@ -47,7 +47,12 @@ what is installed), so a model change is an edit there plus
 
 - A user unit cannot order itself after `docker.service` (a system unit),
   so `ExecStartPre` polls `docker info` until the daemon answers. Loading
-  takes 3–4 minutes; `Restart=on-failure` covers a failed load.
+  takes 3–4 minutes, or 2–3 with `QWEN38_PRESHARDED_DIR` set (one 7-minute
+  boot per image to write the dump; see the runbook's Load time section);
+  `Restart=on-failure` covers a failed load.
+- Stopping the unit with requests in flight takes the full 120 s
+  `TimeoutStopSec`: the server drains them until it is killed. An idle
+  server stops in about 15 s.
 - Stopping the unit sends SIGTERM to the `docker run` client, which proxies
   it to the server. `ExecStopPost` removes the container regardless, and
   the launcher removes a stale one of the same name on the next start.

@@ -80,6 +80,9 @@ services:
       PYTORCH_TUNABLEOP_TUNING: "${SGLANG_TUNABLEOP_TUNING:-0}"
       # Headroom is thin (~95 of 96 GiB in use); avoid allocator fragmentation.
       PYTORCH_CUDA_ALLOC_CONF: "${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+      # With the presharded dump enabled, set this to the image ID (docker
+      # image inspect -f '{{.Id}}') so a rebuilt image gets its own dump.
+      SGLANG_PRESHARDED_STAMP: "${SGLANG_PRESHARDED_STAMP:-}"
     volumes:
       - ${QWEN38_MODEL_DIR:-~/models/Qwen3.8-Flash-Next-AWQ-INT4-ple-fp8}:/models/qwen38:ro
       - ${QWEN38_PLE_DIR:-/opt/llm/ple-cache}:/ple
@@ -91,6 +94,10 @@ services:
       - ${QWEN38_MOE_CONFIG_DIR:-./configs/moe/qwen38-flash-next}:/moe-configs:ro
       # Stock chat template plus the default_system_prompt kwarg.
       - ${QWEN38_CHAT_TEMPLATE:-./configs/chat/qwen38.jinja}:/chat-template.jinja:ro
+      # Post-processed weight dump for fast restarts (--load-format presharded,
+      # ~75 GiB on the first boot); point QWEN38_PRESHARDED_DIR at local NVMe
+      # and add the two flags below to the command to use it.
+      #- ${QWEN38_PRESHARDED_DIR:-/opt/llm/presharded}:/presharded
     command:
       - python3
       - -m
@@ -137,6 +144,10 @@ services:
       - qwen3
       - --tool-call-parser
       - qwen3_coder
+      #- --load-format
+      #- presharded
+      #- --model-loader-extra-config
+      #- '{"presharded_path": "/presharded/target", "draft_presharded_path": "/presharded/draft", "max_file_bytes": 1073741824, "hash_num_threads": 4}'
       - --chat-template
       - /chat-template.jinja
       # Server-wide template defaults; a request's chat_template_kwargs win.

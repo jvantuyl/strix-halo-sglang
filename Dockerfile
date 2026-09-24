@@ -326,6 +326,27 @@ RUN python3 /tmp/patch_ple_short_conv_packed.py && rm /tmp/patch_ple_short_conv_
 COPY patches/patch_default_effort_override.py /tmp/patch_default_effort_override.py
 RUN python3 /tmp/patch_default_effort_override.py && rm /tmp/patch_default_effort_override.py
 
+# --- MTP draft loads only the shards with mtp tensors (patch 30) ---
+# The draft's load_weights drops every name without "mtp", yet its loader
+# walked all 34 shards (222k expert tensors + 26 PLE shards) to keep 31
+# tensors from three files: 49 s of the boot. weight_files_to_skip on the
+# MTP class, decided from the safetensors index. See patches/30-draft-mtp-shards.md.
+COPY patches/patch_draft_mtp_shards.py /tmp/patch_draft_mtp_shards.py
+RUN python3 /tmp/patch_draft_mtp_shards.py && rm /tmp/patch_draft_mtp_shards.py
+
+# --- presharded dump/reload with a host-resident PLE table (patch 31) ---
+# --load-format presharded copies the post-processed state back on later
+# boots instead of walking 222k small tensors. On this model the 47.7 GB
+# file-backed PLE table is a Parameter (dump would hash and rewrite it), its
+# completion marker is only checked from load_weights (which the reload never
+# calls), and load_weights ends with the GDN in_proj fusion. Skip host tensors,
+# check the marker before trusting a dump, run the fusion after the copy.
+# SGLANG_PRESHARDED_STAMP (the image ID) joins the cache key; an interrupted
+# dump is removed and redone, other subfolders are reported, never removed.
+# See patches/31-presharded-host-tables.md.
+COPY patches/patch_presharded_host_tables.py /tmp/patch_presharded_host_tables.py
+RUN python3 /tmp/patch_presharded_host_tables.py && rm /tmp/patch_presharded_host_tables.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"
