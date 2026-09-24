@@ -35,6 +35,7 @@ off.
 | [26](../patches/26-qsa-mqa-prefill-triton.md) | `tl.dot` prefill MQA for the indexer, logits the only allocation | Prefill twin of patch 24: the reference `einsum` materialises per-head scores (4× the logits) plus three copies, ~1.15 GiB per layer per chunk. 2.9e-6 from the reference, 5× faster, prefill transient flat in prompt length |
 | [27](../patches/27-host-parked-params.md) | Token embedding and vision tower parked in pinned host memory (`SGLANG_HOST_PARKED_PARAMS`) | Both are read a few KB per step or not at all, yet held 2.0 GiB of a carve-out idling at 90 of 96 GiB. Exactly sized `hipHostMalloc` aliased as CUDA tensors; worst-case headroom 1.6 → 3.3 GiB, output and throughput unchanged |
 | [28](../patches/28-ple-short-conv-packed.md) | PLE short conv over the packed prefill batch instead of a `[requests, longest, 10240]` padded layout | Chunked prefill mixing many short prompts with a slice of a long one made three copies of that layout: 6.3 GiB for 7,231 tokens, 9.6 GiB possible at the cap, 714 ms per layer; the benchmark suite's mixed scenario reached 117 MiB free. Packed: bit-identical, 431 MiB, 60× faster |
+| [29](../patches/29-default-effort-override.md) | A request's `reasoning_effort` beats `--default-chat-template-kwargs` | Upstream pops the request's effort out of its `chat_template_kwargs`, refills the slot with the server default, then merges the kwargs over the request field: with the launcher's `medium` default every request rendered at `medium` (`prompt_tokens` identical for low / medium / xhigh). Not gfx1151-specific |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
@@ -93,10 +94,14 @@ python3 -m sglang.launch_server \
     --attention-backend triton \
     --cuda-graph-max-bs-decode 20 --max-running-requests 20 \
     --max-mamba-cache-size 100 --mamba-ssm-dtype bfloat16 \
-    --reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder
+    --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
+    --chat-template /chat-template.jinja \
+    --default-chat-template-kwargs '{"reasoning_effort": "medium", "default_system_prompt": "If you are unsure or do not know something, say so plainly instead of guessing."}'
 ```
 
-with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the environment.
+with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the environment
+and [`configs/chat/qwen38.jinja`](../configs/chat/qwen38.jinja) mounted at
+`/chat-template.jinja`.
 
 with `SGLANG_FORCE_NATIVE_LAYERNORM=1 SGLANG_USE_AITER=0
 SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1 PYTORCH_TUNABLEOP_TUNING=0` in the
@@ -125,7 +130,9 @@ on local NVMe: it is random-read during decode.
 | `--cuda-graph-max-bs-decode 20 --max-running-requests 20` | Decode graphs for bs 1, 2, 4, 8, 12, 16, 20; patch 14 fills the PLE prefetch buffer from the host before each replay. The two numbers are independent (`QWEN38_CUDA_GRAPH_MAX_BS`, `QWEN38_MAX_RUNNING_REQUESTS`); the default keeps them equal because graphs above bs 8 cost 0.3 GB and nothing else. They used to be tied because eager decode above the graph range faulted the next replay; patch 15 fixed that. Note this upstream split the flag: a bare `--cuda-graph-max-bs` is rejected as ambiguous. |
 | `--max-mamba-cache-size 100` | The GDN layers keep a fixed-size recurrent state (conv window + SSM matrix) per request instead of per-token KV, in a pool counted in slots. With the radix cache on SGLang reserves 5 slots per request (3 for the live state, prefix-cache branch points and the prefill→decode handoff, plus 2 for the overlap scheduler's ping-pong buffer), so `max_running_requests = slots // 5`. The ratio-sized pool came out at 99 slots and silently capped the server at 19 requests (and the graph list at `[..., 16, 19]`); 100 makes the advertised 20 real. ~54 MB per slot in bf16, so ~270 MB per extra request. `QWEN38_MAMBA_CACHE_SIZE` overrides; keep it at 5 × `QWEN38_MAX_RUNNING_REQUESTS`. |
 | `--mamba-ssm-dtype bfloat16` | The GDN recurrent state is fp32 by default (~108 MB per slot); bf16 halves it, so 100 slots cost 5.4 GB instead of 10.8. Upstream's own suggestion in the startup log. |
-| `--reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder` | The chat template opens `<think>` in the generation prompt and asks for `<tool_call><function=...><parameter=...>` tool calls. Without these the thinking and the XML come back as plain `content`. |
+| `--reasoning-parser qwen3 --tool-call-parser qwen3_coder` | The chat template opens `<think>` in the generation prompt and asks for `<tool_call><function=...><parameter=...>` tool calls. Without these the thinking and the XML come back as plain `content`. `qwen3`, not `qwen3-thinking`: the latter forces "everything before `</think>` is reasoning" for every request, and with `"chat_template_kwargs": {"enable_thinking": false}` the template closes the block in the prompt, the model emits no `</think>`, and the whole answer landed in `reasoning_content` with `content` empty (measured). `qwen3` decides per request from the template's `enable_thinking` toggle: thinking on by default, off when asked, answer in `content` either way. |
+| `--chat-template /chat-template.jinja` | [`configs/chat/qwen38.jinja`](../configs/chat/qwen38.jinja): the checkpoint's stock template plus a `default_system_prompt` kwarg, byte-identical to stock when the kwarg is empty ([`tests/check_chat_template.py`](../tests/check_chat_template.py), 50 renderings). Also makes the served template independent of what sits in the model directory (the DERISKED checkpoint shipped a persona template, see below). `QWEN38_CHAT_TEMPLATE=` (empty) uses the checkpoint's file. |
+| `--default-chat-template-kwargs '{"reasoning_effort": "medium", "default_system_prompt": "..."}'` | Server-wide template kwargs; a request's own `chat_template_kwargs` (or top-level `reasoning_effort`) win key by key, which for `reasoning_effort` needs [patch 29](../patches/29-default-effort-override.md): upstream refills the request's popped effort with the server default and every request rendered at `medium`. **`reasoning_effort`**: the template's default is `xhigh`, which prepends "Please think carefully through the task, validate key assumptions, consider plausible alternatives..." to every request and is what every Qwen 3.8 overthinking report traces back to (Simon Willison's 21-minute SVG at 22k reasoning tokens; the model repo's "This model cannot stop thinking" thread, where `medium` measured a third less thinking with no quality drop and a proxy forcing `medium` for everything was ~3× faster and "no longer does stuff I didn't ask for"). `medium` emits no instruction text; `low` emits a "keep your thinking brief" one. Qwen's card cautions that in multi-turn agentic work lower effort can cost more through retries, so clients doing that may pass `xhigh`. **`default_system_prompt`**: one line asking the model to say when it is unsure, rendered after the effort instruction and before the client's own system message (so it is part of the shared radix-cache prefix). `QWEN38_REASONING_EFFORT` / `QWEN38_SYSTEM_PROMPT` set them; empty disables. Note the kwargs live at the top of the prompt: changing them per request invalidates the prefix cache for that conversation. |
 | `PYTORCH_TUNABLEOP_TUNING=0` | The image enables PyTorch TunableOp, which benchmarks every GEMM solution for each *new* M (= tokens in the prefill chunk). That is 14–20 s of TTFT for every novel prompt length (measured; the recorded results persist in `~/.cache/strix-halo-sglang-tunableop` so a repeated length is fast). With tuning off the recorded solutions are still used and untuned shapes take hipBLASLt's heuristic pick. `SGLANG_TUNABLEOP_TUNING=1 ./start-qwen38.sh` to deliberately record more. |
 | `SGLANG_USE_AITER=0` | Set in the image. |
 
@@ -597,6 +604,11 @@ cd /opt/llm/models/Qwen3.8-Flash-Next-DERISKED-W4A16-ple-fp8
 mv chat_template.jinja chat_template.derisked.jinja
 cp /path/to/stock/{chat_template.jinja,preprocessor_config.json,video_preprocessor_config.json} .
 ```
+
+The template rename is belt and braces now: the launcher serves
+[`configs/chat/qwen38.jinja`](../configs/chat/qwen38.jinja) via
+`--chat-template`, so the file in the model directory is not read unless
+`QWEN38_CHAT_TEMPLATE=` is set empty.
 
 Launch beside (not with: the GPU holds one of these) the stock server:
 

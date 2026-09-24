@@ -89,6 +89,8 @@ services:
       - ${SGL_CACHE_DIR:-~/.cache/strix-halo-sglang-cache}:/root/.cache/sglang
       # Tuned MoE tiles for this checkpoint (g32); another checkpoint gets its own profile.
       - ${QWEN38_MOE_CONFIG_DIR:-./configs/moe/qwen38-flash-next}:/moe-configs:ro
+      # Stock chat template plus the default_system_prompt kwarg.
+      - ${QWEN38_CHAT_TEMPLATE:-./configs/chat/qwen38.jinja}:/chat-template.jinja:ro
     command:
       - python3
       - -m
@@ -129,7 +131,15 @@ services:
       - "${QWEN38_MAMBA_CACHE_SIZE:-100}"
       - --mamba-ssm-dtype
       - bfloat16
+      # qwen3, not qwen3-thinking: the latter files the whole answer under
+      # reasoning_content when a request disables thinking.
       - --reasoning-parser
-      - qwen3-thinking
+      - qwen3
       - --tool-call-parser
       - qwen3_coder
+      - --chat-template
+      - /chat-template.jinja
+      # Server-wide template defaults; a request's chat_template_kwargs win.
+      # The template's own reasoning_effort default is xhigh (see the runbook).
+      - --default-chat-template-kwargs
+      - '${QWEN38_DEFAULT_CHAT_TEMPLATE_KWARGS:-{"reasoning_effort": "medium", "default_system_prompt": "If you are unsure or do not know something, say so plainly instead of guessing."}}'
