@@ -36,6 +36,8 @@ off.
 | [27](../patches/27-host-parked-params.md) | Token embedding and vision tower parked in pinned host memory (`SGLANG_HOST_PARKED_PARAMS`) | Both are read a few KB per step or not at all, yet held 2.0 GiB of a carve-out idling at 90 of 96 GiB. Exactly sized `hipHostMalloc` aliased as CUDA tensors; worst-case headroom 1.6 → 3.3 GiB, output and throughput unchanged |
 | [28](../patches/28-ple-short-conv-packed.md) | PLE short conv over the packed prefill batch instead of a `[requests, longest, 10240]` padded layout | Chunked prefill mixing many short prompts with a slice of a long one made three copies of that layout: 6.3 GiB for 7,231 tokens, 9.6 GiB possible at the cap, 714 ms per layer; the benchmark suite's mixed scenario reached 117 MiB free. Packed: bit-identical, 431 MiB, 60× faster |
 | [29](../patches/29-default-effort-override.md) | A request's `reasoning_effort` beats `--default-chat-template-kwargs` | Upstream pops the request's effort out of its `chat_template_kwargs`, refills the slot with the server default, then merges the kwargs over the request field: with the launcher's `medium` default every request rendered at `medium` (`prompt_tokens` identical for low / medium / xhigh). Not gfx1151-specific |
+| [30](../patches/30-draft-mtp-shards.md) | MTP draft loads only the shards that hold `mtp` tensors | The draft's `load_weights` drops every other name, yet its loader walked all 34 shards (222k expert tensors, 26 PLE shards) for 31 tensors in three files: 49 s of the boot. `weight_files_to_skip` on the MTP class, from the safetensors index |
+| [31](../patches/31-presharded-host-tables.md) | `--load-format presharded` (post-processed weight dump, copied back on later boots) with the host PLE table | The 47.7 GB file-backed table is a `Parameter` the dump would hash and rewrite; its completion marker is only checked from `load_weights`, which the reload never calls; `load_weights` ends with the GDN in_proj fusion. Skip host tensors, check the marker first (normal load otherwise), fuse after the copy. The image ID joins the cache key (`SGLANG_PRESHARDED_STAMP`); an interrupted dump is removed and redone, other subfolders only reported. See Load time below |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
@@ -132,7 +134,7 @@ on local NVMe: it is random-read during decode.
 | `--mamba-ssm-dtype bfloat16` | The GDN recurrent state is fp32 by default (~108 MB per slot); bf16 halves it, so 100 slots cost 5.4 GB instead of 10.8. Upstream's own suggestion in the startup log. |
 | `--reasoning-parser qwen3 --tool-call-parser qwen3_coder` | The chat template opens `<think>` in the generation prompt and asks for `<tool_call><function=...><parameter=...>` tool calls. Without these the thinking and the XML come back as plain `content`. `qwen3`, not `qwen3-thinking`: the latter forces "everything before `</think>` is reasoning" for every request, and with `"chat_template_kwargs": {"enable_thinking": false}` the template closes the block in the prompt, the model emits no `</think>`, and the whole answer landed in `reasoning_content` with `content` empty (measured). `qwen3` decides per request from the template's `enable_thinking` toggle: thinking on by default, off when asked, answer in `content` either way. |
 | `--chat-template /chat-template.jinja` | [`configs/chat/qwen38.jinja`](../configs/chat/qwen38.jinja): the checkpoint's stock template plus a `default_system_prompt` kwarg, byte-identical to stock when the kwarg is empty ([`tests/check_chat_template.py`](../tests/check_chat_template.py), 50 renderings). Also makes the served template independent of what sits in the model directory (the DERISKED checkpoint shipped a persona template, see below). `QWEN38_CHAT_TEMPLATE=` (empty) uses the checkpoint's file. |
-| `--default-chat-template-kwargs '{"reasoning_effort": "medium", "default_system_prompt": "..."}'` | Server-wide template kwargs; a request's own `chat_template_kwargs` (or top-level `reasoning_effort`) win key by key, which for `reasoning_effort` needs [patch 29](../patches/29-default-effort-override.md): upstream refills the request's popped effort with the server default and every request rendered at `medium`. **`reasoning_effort`**: the template's default is `xhigh`, which prepends "Please think carefully through the task, validate key assumptions, consider plausible alternatives..." to every request and is what every Qwen 3.8 overthinking report traces back to (Simon Willison's 21-minute SVG at 22k reasoning tokens; the model repo's "This model cannot stop thinking" thread, where `medium` measured a third less thinking with no quality drop and a proxy forcing `medium` for everything was ~3× faster and "no longer does stuff I didn't ask for"). `medium` emits no instruction text; `low` emits a "keep your thinking brief" one. Qwen's card cautions that in multi-turn agentic work lower effort can cost more through retries, so clients doing that may pass `xhigh`. **`default_system_prompt`**: one line asking the model to say when it is unsure, rendered after the effort instruction and before the client's own system message (so it is part of the shared radix-cache prefix). `QWEN38_REASONING_EFFORT` / `QWEN38_SYSTEM_PROMPT` set them; empty disables. Note the kwargs live at the top of the prompt: changing them per request invalidates the prefix cache for that conversation. |
+| `--default-chat-template-kwargs '{"reasoning_effort": "medium", "default_system_prompt": "..."}'` | Server-wide template kwargs; a request's own `chat_template_kwargs` (or top-level `reasoning_effort`) win key by key, which for `reasoning_effort` needs [patch 29](../patches/29-default-effort-override.md): upstream refills the request's popped effort with the server default and every request rendered at `medium`. **`reasoning_effort`**: the template's default is `xhigh`, which prepends "Please think carefully through the task, validate key assumptions, consider plausible alternatives..." to every request and is what every Qwen 3.8 overthinking report traces back to (Simon Willison's 21-minute SVG at 22k reasoning tokens; the model repo's "This model cannot stop thinking" thread, where `medium` measured a third less thinking with no quality drop and a proxy forcing `medium` for everything was ~3× faster and "no longer does stuff I didn't ask for"). `medium` emits no instruction text; `low` emits a "keep your thinking brief" one. The stock template rejects every other value with a 400; clients that pass the OpenAI scale straight through (Hermes sent `minimal`) would fail, so the repo template maps `minimal` to `low` and `high` to `xhigh` (case-insensitively; an empty value means the default; anything else still errors). A top-level `reasoning_effort: "none"` never reaches the template: SGLang turns it into `enable_thinking: false`, the OpenAI meaning; inside `chat_template_kwargs` the template maps it to `low`. Verified: `prompt_tokens` 59 / 71 / 35 for `minimal` / `high` / `none`, matching `low` / `xhigh` / thinking off. Qwen's card cautions that in multi-turn agentic work lower effort can cost more through retries, so clients doing that may pass `xhigh`. **`default_system_prompt`**: one line asking the model to say when it is unsure, rendered after the effort instruction and before the client's own system message (so it is part of the shared radix-cache prefix). `QWEN38_REASONING_EFFORT` / `QWEN38_SYSTEM_PROMPT` set them; empty disables. Note the kwargs live at the top of the prompt: changing them per request invalidates the prefix cache for that conversation. |
 | `PYTORCH_TUNABLEOP_TUNING=0` | The image enables PyTorch TunableOp, which benchmarks every GEMM solution for each *new* M (= tokens in the prefill chunk). That is 14–20 s of TTFT for every novel prompt length (measured; the recorded results persist in `~/.cache/strix-halo-sglang-tunableop` so a repeated length is fast). With tuning off the recorded solutions are still used and untuned shapes take hipBLASLt's heuristic pick. `SGLANG_TUNABLEOP_TUNING=1 ./start-qwen38.sh` to deliberately record more. |
 | `SGLANG_USE_AITER=0` | Set in the image. |
 
@@ -150,6 +152,104 @@ QSA decode on HIP: using Triton qwen38_qsa kernel (heads=(12,1) head_dim=256)
 
 If you see `QSA decode on HIP: using flash_attn varlen fallback`, the QSA
 kernel's shape contract was not met; the fallback is correct but slow.
+
+## Load time
+
+A warm restart (PLE table already on disk, kernel cache warm) of the
+DERISKED deployment with MTP and a cap of 16 measured, from `docker run` to
+Uvicorn, with the phases from the journal:
+
+| Phase | Normal load | With patch 30 | Presharded reload |
+|---|---|---|---|
+| Container start, imports, tokenizer | 37 s | 37 s | 37 s |
+| Target weights | 152 s | 152 s | 72 to 98 s |
+| MTP draft weights | 49 s | 30 s | 4 to 9 s |
+| CUDA graphs (target verify + draft decode) | 14 s | 14 s | 11 s |
+| Memory pools | 1.4 s | 1.4 s | 1.6 s |
+| **Uvicorn up** | **259 s** | **~240 s** | **133 to 169 s** |
+
+The patch 30 column is the normal-load column with the measured draft time
+(20 to 30 s over two first boots) substituted; it was not booted on its own.
+Two reload boots were measured (`load_weight` 75.7 s and 107 s); the
+difference is disk contention, not variance in the code path. Add whatever
+the previous server takes to stop: with requests in flight it drains them
+until the unit's 120 s stop timeout.
+
+**Why the normal load is slow.** It is not I/O. A direct read of a weight
+shard through dm-crypt runs at 4.2 GB/s (the 74 GB of non-PLE weights is
+about 18 s of disk), `safe_open().get_tensor()` is a zero-copy mmap view, and
+the loader's 8 threads (`enable_multithread_load`, already on) only parse
+headers. The main checkpoint holds **222,718 tensors with a median size of
+25 KiB** (per-expert INT4 weights, scales and zero points, split into files
+of 19 GB), and every one costs a Python `weight_loader` dispatch, a `narrow`
+and a tiny host-to-device copy: about 0.68 ms each, 152 s in total. The
+draft used to walk all 222k tensors too, because `Qwen4ExpForCausalLMMTP`
+had no `weight_files_to_skip`; patch 30 reads the index and skips the 31
+shards with no `mtp` key (the 3 `model-mtp-merged-rest*` shards hold all 31
+draft tensors).
+
+**Options that do not help here.** `--load-format npcache` only handles
+`.bin` checkpoints (it asserts `use_safetensors is False`).
+`--model-loader-extra-config` for the default loader only knows
+`enable_multithread_load` / `num_threads` (both already on) and
+`weight_loader_disable_mmap` (needs (workers + 2) × 19 GB of host RAM;
+the box has 32 GB). SGLang's weight-cache daemon
+(`sglang.srt.weight_cache`) shares GPU tensors over CUDA IPC on the same
+machine and only for unquantized or block-FP8 weights; it rejects
+`compressed-tensors` and needs `expandable_segments` off. The
+`remote_instance` loader copies from a peer GPU over NCCL; over 1 GbE it
+would be slower than the disk.
+
+**What does help: `--load-format presharded`** (`PreshardedModelLoader`,
+patch 31 makes it work with the host PLE table). The first boot loads
+normally, then dumps the post-processed state (a few thousand full-layer
+tensors, safetensors files, a `checksum.json` plan, a `READY` marker) into
+`<root>/TP-1-sig-<sha1>/`; later boots initialise the model, run
+`process_weights_after_loading` on the empty parameters and copy the dump
+straight in. The DERISKED dump is 69 GiB for the target and 7.3 GiB for the
+draft (the 47.7 GB PLE table is not in it); the first boot took 366 s for
+the target load plus dump and 20 s for the draft (about 7 min to Uvicorn).
+Enable it with `QWEN38_PRESHARDED_DIR=/opt/llm/presharded-<variant>` in the
+launcher env (compose: uncomment the mount and the two flags).
+
+Rules the cache follows:
+
+- **Key.** Quantization, dtype, parallel layout, the parameters' shapes, and
+  (patch 31) `SGLANG_PRESHARDED_STAMP`, which the launcher sets to the image
+  ID. A rebuilt image never reuses a dump its patches did not produce; it
+  costs one slow boot and 76 GiB more disk until the old dump is pruned.
+- **Interrupted dumps.** The current key's subfolder without `READY` is
+  removed at boot and the dump redone.
+- **Other subfolders** (older images, other configurations) are logged at
+  boot with size and completeness (`Presharded cache root ... also holds
+  TP-1-sig-... (complete, 68.1 GiB)`) and never removed: they may belong to
+  another deployment. Prune them by hand; they are root-owned, so
+  `docker run --rm -v /opt/llm/presharded-<variant>:/p debian:stable-slim rm -rf /p/target/TP-1-sig-<old>`.
+- **Host memory.** The dumper stages a whole output file in host RAM before
+  writing it and each hash thread holds a host copy of one tensor (up to
+  0.84 GB). With upstream's 20 GiB default file size the scheduler reached
+  18.4 GB anon RSS and was OOM-killed on this 32 GB box; the launcher passes
+  `max_file_bytes` 1 GiB and `hash_num_threads` 4, and the first boot then
+  peaked at about 18 GB used system-wide. Do not run other memory-hungry
+  services during the first boot.
+- **Disk.** Keep 80 GiB free on the dump's filesystem before a first boot
+  (the failure mode is `No space left on device` from `save_file` and a
+  restart loop). The dumps compress to about 85% with zstd (INT4 packed
+  data), not worth the decompression buffer on reload.
+- **Parity.** Greedy output (`temperature 0`, 8 prompts × thinking on/off,
+  160 tokens, 1485 tokens in total) from a presharded reload was
+  byte-identical to the normally loaded server; patch 27 parks the same
+  2.02 GiB.
+
+**Where the big files live on this box.** Local NVMe (`/opt/llm`):
+the DERISKED checkpoint, its PLE cache (`ple-cache-derisked`, 48 GiB) and its
+presharded dump (`presharded-derisked`). NFS `/scratch/converted/`: the stock
+`cyankiwi--Qwen3.8-Flash-Next-AWQ-INT4-ple-fp8` checkpoint (the local copy in
+`~/models` was verified byte-identical and removed), its PLE cache
+(`ple-cache-stock`, with the completion marker) and the DERISKED source. To
+serve the stock model again, copy both back to local disk first (the PLE
+table is random-read during decode; the launcher defaults still point at
+`~/models/...` and `/opt/llm/ple-cache`).
 
 ## Dummy-weights smoke test
 

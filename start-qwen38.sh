@@ -64,6 +64,17 @@
 #     QWEN38_SYSTEM_PROMPT (one line asking the model to say when it is
 #     unsure; it is rendered before the client's system message). Empty
 #     disables either. Needs python3 on the host to build the JSON.
+#   - QWEN38_PRESHARDED_DIR (off by default): upstream's `--load-format
+#     presharded`. The first boot loads normally and dumps the post-processed
+#     weights there (~75 GiB, target and draft in their own subtrees); later
+#     boots copy them straight into the model instead of walking the
+#     checkpoint's 222k small tensors, which is what makes the normal load
+#     slow (see the runbook's Load time section). Keyed by quantization,
+#     dtype, the model's parameter shapes and the image ID (patch 31): a new
+#     image means one slow boot and a fresh dump. An interrupted dump of the
+#     current key is removed and redone; other subfolders are only reported,
+#     never removed (they may serve another deployment), so prune them by hand
+#     to get the disk back. Keep it on local NVMe next to $PLE_DIR.
 
 set -euo pipefail
 
@@ -98,6 +109,8 @@ HOST_PARKED_PARAMS="${QWEN38_HOST_PARKED_PARAMS-embed_tokens.weight,visual.}"
 CHAT_TEMPLATE="${QWEN38_CHAT_TEMPLATE-$SCRIPT_DIR/configs/chat/qwen38.jinja}"
 REASONING_EFFORT="${QWEN38_REASONING_EFFORT-medium}"
 SYSTEM_PROMPT="${QWEN38_SYSTEM_PROMPT-If you are unsure or do not know something, say so plainly instead of guessing.}"
+# Post-processed weight dump for fast restarts (see header); empty = normal load.
+PRESHARDED_DIR="${QWEN38_PRESHARDED_DIR:-}"
 # QWEN38_VISION=0 skips the vision tower (~0.9 GB of weights, text-only API).
 MODEL_OVERRIDE='{}'
 if [ "${QWEN38_VISION:-1}" = "0" ]; then
@@ -134,6 +147,20 @@ fi
 if [ -n "$SYSTEM_PROMPT" ] && [ -z "$CHAT_TEMPLATE" ]; then
     echo "QWEN38_SYSTEM_PROMPT needs the repo template (default_system_prompt kwarg); the checkpoint's template ignores it" >&2
 fi
+PRESHARDED_ARGS=()
+PRESHARDED_FLAGS=()
+if [ -n "$PRESHARDED_DIR" ]; then
+    mkdir -p "$PRESHARDED_DIR/target" "$PRESHARDED_DIR/draft"
+    # The image ID goes into the dump's key so a rebuilt image (whose patches
+    # may post-process weights differently) never reuses the old dump.
+    STAMP="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
+    PRESHARDED_ARGS=(-v "$PRESHARDED_DIR:/presharded" -e "SGLANG_PRESHARDED_STAMP=$STAMP")
+    # 1 GiB files: the dumper stages a whole file's tensors in host RAM before
+    # writing it, and the 20 GiB default OOM-killed the scheduler on this
+    # 32 GB box. Hash threads each hold a host copy of one tensor (up to 0.84 GB).
+    PRESHARDED_FLAGS=(--load-format presharded
+        --model-loader-extra-config '{"presharded_path": "/presharded/target", "draft_presharded_path": "/presharded/draft", "max_file_bytes": 1073741824, "hash_num_threads": 4}')
+fi
 # Extra `docker run` arguments (word-split), e.g. -e VAR=1 for engine env knobs.
 read -r -a DOCKER_ARGS <<< "${SGLANG_DOCKER_ARGS:-}"
 
@@ -155,6 +182,7 @@ exec docker run --name "$NAME" \
     -v "$SGL_CACHE_DIR:/root/.cache/sglang" \
     "${MOE_ARGS[@]}" \
     "${TEMPLATE_ARGS[@]}" \
+    "${PRESHARDED_ARGS[@]}" \
     -e HF_TOKEN="${HF_TOKEN:-}" \
     -e PYTORCH_TUNABLEOP_TUNING="$TUNABLEOP_TUNING" \
     -e PYTORCH_CUDA_ALLOC_CONF="$ALLOC_CONF" \
@@ -184,4 +212,5 @@ exec docker run --name "$NAME" \
         --reasoning-parser qwen3 \
         --tool-call-parser qwen3_coder \
         "${TEMPLATE_KWARGS[@]}" \
+        "${PRESHARDED_FLAGS[@]}" \
         "$@"
