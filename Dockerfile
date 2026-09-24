@@ -317,6 +317,15 @@ RUN python3 /tmp/patch_host_parked_params.py && rm /tmp/patch_host_parked_params
 COPY patches/patch_ple_short_conv_packed.py /tmp/patch_ple_short_conv_packed.py
 RUN python3 /tmp/patch_ple_short_conv_packed.py && rm /tmp/patch_ple_short_conv_packed.py
 
+# --- request reasoning_effort beats --default-chat-template-kwargs (patch 29) ---
+# The OpenAI endpoint pops a request's reasoning_effort out of its
+# chat_template_kwargs, then setdefaults the server defaults into the
+# emptied slot and merges kwargs over the request field, so with a server
+# default every request renders at the default level. Seed the merge with
+# the request's effort first. See patches/29-default-effort-override.md.
+COPY patches/patch_default_effort_override.py /tmp/patch_default_effort_override.py
+RUN python3 /tmp/patch_default_effort_override.py && rm /tmp/patch_default_effort_override.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"

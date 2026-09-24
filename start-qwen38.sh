@@ -55,6 +55,15 @@
 #     2 GiB of host RAM on the scheduler's RSS. Neither is bandwidth-bound
 #     (a bs-row gather per step; idle without images). Set it empty to keep
 #     every weight in VRAM.
+#   - Chat template: configs/chat/qwen38.jinja, the checkpoint's stock template
+#     plus a `default_system_prompt` kwarg (QWEN38_CHAT_TEMPLATE= to use the
+#     checkpoint's own file). The server-wide defaults go in through
+#     --default-chat-template-kwargs and any request may override them:
+#     QWEN38_REASONING_EFFORT (medium; the template's own default is xhigh,
+#     which spends many times the thinking tokens on ordinary prompts) and
+#     QWEN38_SYSTEM_PROMPT (one line asking the model to say when it is
+#     unsure; it is rendered before the client's system message). Empty
+#     disables either. Needs python3 on the host to build the JSON.
 
 set -euo pipefail
 
@@ -85,6 +94,10 @@ ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # images), 2.0 GiB of VRAM back for 2.0 GiB of host RAM. `-` not `:-`: an
 # explicitly empty QWEN38_HOST_PARKED_PARAMS keeps everything in VRAM.
 HOST_PARKED_PARAMS="${QWEN38_HOST_PARKED_PARAMS-embed_tokens.weight,visual.}"
+# Chat template and its server-wide kwargs (see header). `-` not `:-` throughout.
+CHAT_TEMPLATE="${QWEN38_CHAT_TEMPLATE-$SCRIPT_DIR/configs/chat/qwen38.jinja}"
+REASONING_EFFORT="${QWEN38_REASONING_EFFORT-medium}"
+SYSTEM_PROMPT="${QWEN38_SYSTEM_PROMPT-If you are unsure or do not know something, say so plainly instead of guessing.}"
 # QWEN38_VISION=0 skips the vision tower (~0.9 GB of weights, text-only API).
 MODEL_OVERRIDE='{}'
 if [ "${QWEN38_VISION:-1}" = "0" ]; then
@@ -98,6 +111,28 @@ MOE_ARGS=()
 if [ -n "$MOE_CONFIG_DIR" ]; then
     test -d "$MOE_CONFIG_DIR" || { echo "missing $MOE_CONFIG_DIR (MOE_CONFIG_DIR= to run without tuned tiles)" >&2; exit 1; }
     MOE_ARGS=(-v "$MOE_CONFIG_DIR:/moe-configs:ro" -e SGLANG_MOE_CONFIG_DIR=/moe-configs)
+fi
+TEMPLATE_ARGS=()
+TEMPLATE_KWARGS=()
+if [ -n "$CHAT_TEMPLATE" ]; then
+    test -f "$CHAT_TEMPLATE" || { echo "missing $CHAT_TEMPLATE (QWEN38_CHAT_TEMPLATE= to use the checkpoint's template)" >&2; exit 1; }
+    TEMPLATE_ARGS+=(-v "$CHAT_TEMPLATE:/chat-template.jinja:ro")
+    TEMPLATE_KWARGS+=(--chat-template /chat-template.jinja)
+fi
+if [ -n "$REASONING_EFFORT$SYSTEM_PROMPT" ]; then
+    DEFAULT_KWARGS="$(REASONING_EFFORT="$REASONING_EFFORT" SYSTEM_PROMPT="$SYSTEM_PROMPT" python3 -c '
+import json, os
+kw = {}
+if os.environ["REASONING_EFFORT"]:
+    kw["reasoning_effort"] = os.environ["REASONING_EFFORT"]
+if os.environ["SYSTEM_PROMPT"]:
+    kw["default_system_prompt"] = os.environ["SYSTEM_PROMPT"]
+print(json.dumps(kw))
+')"
+    TEMPLATE_KWARGS+=(--default-chat-template-kwargs "$DEFAULT_KWARGS")
+fi
+if [ -n "$SYSTEM_PROMPT" ] && [ -z "$CHAT_TEMPLATE" ]; then
+    echo "QWEN38_SYSTEM_PROMPT needs the repo template (default_system_prompt kwarg); the checkpoint's template ignores it" >&2
 fi
 # Extra `docker run` arguments (word-split), e.g. -e VAR=1 for engine env knobs.
 read -r -a DOCKER_ARGS <<< "${SGLANG_DOCKER_ARGS:-}"
@@ -119,6 +154,7 @@ exec docker run --name "$NAME" \
     -v "$TUNABLE_DIR:/root/.tunableop" \
     -v "$SGL_CACHE_DIR:/root/.cache/sglang" \
     "${MOE_ARGS[@]}" \
+    "${TEMPLATE_ARGS[@]}" \
     -e HF_TOKEN="${HF_TOKEN:-}" \
     -e PYTORCH_TUNABLEOP_TUNING="$TUNABLEOP_TUNING" \
     -e PYTORCH_CUDA_ALLOC_CONF="$ALLOC_CONF" \
@@ -145,6 +181,7 @@ exec docker run --name "$NAME" \
         --max-running-requests "$MAX_RUNNING_REQUESTS" \
         --max-mamba-cache-size "$MAMBA_CACHE_SIZE" \
         --mamba-ssm-dtype bfloat16 \
-        --reasoning-parser qwen3-thinking \
+        --reasoning-parser qwen3 \
         --tool-call-parser qwen3_coder \
+        "${TEMPLATE_KWARGS[@]}" \
         "$@"
