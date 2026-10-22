@@ -12,7 +12,32 @@
        them straight through): minimal -> low, high -> xhigh, none -> low (SGLang
        turns a top-level none into enable_thinking=false before the template runs;
        this covers none inside chat_template_kwargs); empty -> the template default.
-       Anything else still raises, as in the stock template. -#}
+       Anything else still raises, as in the stock template.
+    3. Control strings inside message content are HTML-entity escaped before
+       tokenization (<|im_end|> becomes &lt;|im_end|&gt;): <|im_start|>, <|im_end|>,
+       <|endoftext|>, <think>, </think>, <tool_call>, </tool_call>, <tool_response>,
+       </tool_response>. The server tokenizes the rendered prompt with special
+       tokens enabled, so a tool result or user message that merely quotes one of
+       these would otherwise put the real control token into the context (a quoted
+       <|im_end|> becomes the EOS token); the model then reproduces that token when
+       it quotes the text back, and inside <think> strict thinking masks it so the
+       model falls through to </think> and the rest of its reasoning streams as
+       content. Escaped, the string tokenizes as plain text and the model echoes
+       the escaped form. The change has to be inside the string: the tokenizer
+       matches added tokens wherever they occur, so a prefix such as a backslash
+       leaves the control token intact. The rewrite is one level of a two-level
+       scheme shared with the server's output un-escape (patch 32): a control
+       string that already arrives in entity form, say &lt;/think&gt; inside an
+       HTML file, is encoded one level further (&amp;lt;/think&amp;gt;) so the
+       output side can tell the two apart and return each to its original form.
+       The server un-escapes one level on every chat completion, so history the
+       client sends back carries the original forms again and the encoding does
+       not accumulate across turns. The template's own
+       structural tokens and the tool list (tojson already encodes '<') are not
+       affected. In a user message that is itself a <tool_response> wrapper (how
+       qwen-agent style clients return tool results, possibly several blocks per
+       message) the tool_response tags are left alone and everything else is
+       escaped; no parser acts on that tag. -#}
 {%- set image_count = namespace(value=0) %}
 {%- set video_count = namespace(value=0) %}
 {%- macro render_content(content, do_vision_count, is_system_content=false) %}
@@ -54,6 +79,16 @@
         {{- raise_exception('Unexpected content type.') }}
     {%- endif %}
 {%- endmacro %}
+{%- macro escape_control(text, keep_tool_response=false) %}
+    {%- set esc = namespace(t=text) %}
+    {%- for s in ['<|im_start|>', '<|im_end|>', '<|endoftext|>', '<think>', '</think>', '<tool_call>', '</tool_call>', '<tool_response>', '</tool_response>'] %}
+        {%- if not (keep_tool_response and s in ('<tool_response>', '</tool_response>')) %}
+            {%- set e = '&lt;' ~ s[1:-1] ~ '&gt;' %}
+            {%- set esc.t = esc.t|replace(e, '&amp;lt;' ~ s[1:-1] ~ '&amp;gt;')|replace(s, e) %}
+        {%- endif %}
+    {%- endfor %}
+    {{- esc.t }}
+{%- endmacro %}
 {%- if not messages %}
     {{- raise_exception('No messages provided.') }}
 {%- endif %}
@@ -92,7 +127,7 @@
     {%- if messages[0].role == 'system' %}
         {%- set content = render_content(messages[0].content, false, true)|trim %}
         {%- if content %}
-            {{- '\n\n' + content }}
+            {{- '\n\n' + escape_control(content) }}
         {%- endif %}
     {%- endif %}
     {{- '<|im_end|>\n' }}
@@ -107,7 +142,7 @@
     {%- if messages[0].role == 'system' %}
         {%- set content = render_content(messages[0].content, false, true)|trim %}
         {%- if content %}
-            {%- set system_block.parts = system_block.parts + [content] %}
+            {%- set system_block.parts = system_block.parts + [escape_control(content)] %}
         {%- endif %}
     {%- endif %}
     {%- if system_block.parts %}
@@ -135,7 +170,8 @@
             {{- raise_exception('System message must be at the beginning.') }}
         {%- endif %}
     {%- elif message.role == "user" %}
-        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+        {%- set wrapped = content.startswith('<tool_response>') and content.endswith('</tool_response>') %}
+        {{- '<|im_start|>' + message.role + '\n' + escape_control(content, wrapped) + '<|im_end|>' + '\n' }}
     {%- elif message.role == "assistant" %}
         {%- set reasoning_content = '' %}
         {%- if message.reasoning_content is string %}
@@ -143,9 +179,9 @@
         {%- endif %}
         {%- set reasoning_content = reasoning_content|trim %}
         {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}
-            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+            {{- '<|im_start|>' + message.role + '\n<think>\n' + escape_control(reasoning_content) + '\n</think>\n\n' + escape_control(content) }}
         {%- else %}
-            {{- '<|im_start|>' + message.role + '\n' + content }}
+            {{- '<|im_start|>' + message.role + '\n' + escape_control(content) }}
         {%- endif %}
         {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
             {%- for tool_call in message.tool_calls %}
@@ -165,7 +201,7 @@
                     {%- for args_name, args_value in tool_call.arguments|items %}
                         {{- '<parameter=' + args_name + '>\n' }}
                         {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}
-                        {{- args_value }}
+                        {{- escape_control(args_value) }}
                         {{- '\n</parameter>\n' }}
                     {%- endfor %}
                 {%- endif %}
@@ -178,7 +214,7 @@
             {{- '<|im_start|>user' }}
         {%- endif %}
         {{- '\n<tool_response>\n' }}
-        {{- content }}
+        {{- escape_control(content) }}
         {{- '\n</tool_response>' }}
         {%- if not loop.last and loop.nextitem.role != "tool" %}
             {{- '<|im_end|>\n' }}
