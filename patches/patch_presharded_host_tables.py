@@ -38,6 +38,14 @@ And two things about the cache directory itself:
      orphans from a differently planned file layout); any other subfolder,
      stale or another deployment's, is reported with its size and
      completeness and left alone.
+  6. The load walks 222k tensors, the dump hashes every tensor and writes
+     ~70 GB of files, and a later boot copies them back, all without a line
+     in the log. Each phase now logs its size up front, a progress line
+     every 15 s (items, GiB, rate, estimated time left) and a summary at the
+     end. The load wrapper is in DefaultModelLoader._get_weights_iterator,
+     so every load format gets it. Upstream's tqdm shard bars, which redraw
+     with carriage returns and turn the surrounding log into "[N blob
+     data]" under journald, are kept only when stderr is a TTY.
 
 Every anchor is asserted; an upstream rewrite fails the build.
 See patches/31-presharded-host-tables.md.
@@ -225,6 +233,263 @@ new = """        shard_config = self._collect_shard_config(model_config)
         if self._presharded_ready(presharded_dir) and self._shard_config_matches(
 """
 text = text.replace(old, new, 1)
+
+# 6. progress lines for the dump's hash and write phases and the reload's copy
+old = """class PreshardedModelLoader(DefaultModelLoader):
+    \"\"\"Dump/reload post-process weights under ``<model_path>/presharded/<subdir>/``."""
+assert text.count(old) == 1, "loader.py: PreshardedModelLoader class anchor not found"
+new = """class _LoadProgress:
+    \"\"\"gfx1151 patch 31: periodic progress for the weight load, the presharded
+    dump and the reload, which otherwise run for minutes (222k tensors,
+    hashing and writing ~70 GB) without a line in the log. One line at the
+    start, one every `every_s` seconds with rate and estimated time left, one
+    at the end. total_items is None when only the byte total is known.\"\"\"
+
+    def __init__(
+        self,
+        phase: str,
+        total_bytes: int,
+        total_items: Optional[int],
+        unit: str = "items",
+        every_s: float = 15.0,
+    ):
+        self.phase = phase
+        self.total_bytes = total_bytes
+        self.total_items = total_items
+        self.unit = unit
+        self.every_s = every_s
+        self.started = self.last = time.perf_counter()
+        self.done_bytes = 0
+        self.done_items = 0
+        logger.info(
+            "%s: %s%.1f GiB",
+            phase,
+            f"{total_items} {unit}, " if total_items is not None else "",
+            total_bytes / 2**30,
+        )
+
+    def _items(self) -> str:
+        if self.total_items is None:
+            return f"{self.done_items} {self.unit}"
+        return f"{self.done_items}/{self.total_items} {self.unit}"
+
+    def step(self, nbytes: int) -> None:
+        self.done_bytes += nbytes
+        self.done_items += 1
+        now = time.perf_counter()
+        if now - self.last < self.every_s:
+            return
+        if self.total_items is not None and self.done_items >= self.total_items:
+            return
+        self.last = now
+        elapsed = now - self.started
+        rate = self.done_bytes / elapsed if elapsed > 0 else 0.0
+        left = (self.total_bytes - self.done_bytes) / rate if rate > 0 else float("inf")
+        logger.info(
+            "%s: %s, %.1f/%.1f GiB (%.0f%%), %.0f MiB/s, %.0f s elapsed, ~%.0f s left",
+            self.phase,
+            self._items(),
+            self.done_bytes / 2**30,
+            self.total_bytes / 2**30,
+            100.0 * self.done_bytes / self.total_bytes if self.total_bytes else 100.0,
+            rate / 2**20,
+            elapsed,
+            max(left, 0.0),
+        )
+
+    def finish(self) -> None:
+        elapsed = time.perf_counter() - self.started
+        rate = self.done_bytes / elapsed if elapsed > 0 else 0.0
+        logger.info(
+            "%s: done, %s, %.1f GiB in %.0f s (%.0f MiB/s)",
+            self.phase,
+            self._items(),
+            self.done_bytes / 2**30,
+            elapsed,
+            rate / 2**20,
+        )
+
+
+def _progress_weights_iterator(weights_iterator, weight_files):
+    \"\"\"gfx1151 patch 31: progress lines while the model consumes the weights.
+    The byte total is the shard files' size; a filtered iterator (the MTP
+    draft keeps a few tensors of each file) ends below 100%.\"\"\"
+    total = 0
+    for f in weight_files:
+        with suppress(OSError):
+            total += os.path.getsize(f)
+    progress = _LoadProgress(
+        f"Weights load ({len(weight_files)} shard files)", total, None, unit="tensors"
+    )
+    for name, tensor in weights_iterator:
+        progress.step(tensor.numel() * tensor.element_size())
+        yield name, tensor
+    progress.finish()
+
+
+class PreshardedModelLoader(DefaultModelLoader):
+    \"\"\"Dump/reload post-process weights under ``<model_path>/presharded/<subdir>/``."""
+text = text.replace(old, new, 1)
+
+old = """        if self.counter_before_loading_weights == 0.0:
+            self.counter_before_loading_weights = time.perf_counter()
+        # Apply the prefix.
+        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+"""
+assert text.count(old) == 1, "loader.py: _get_weights_iterator return anchor not found"
+new = """        if self.counter_before_loading_weights == 0.0:
+            self.counter_before_loading_weights = time.perf_counter()
+        # Apply the prefix.
+        weights_iterator = (
+            (source.prefix + name, tensor) for (name, tensor) in weights_iterator
+        )
+        return _progress_weights_iterator(weights_iterator, hf_weights_files)  # gfx1151 patch 31
+"""
+text = text.replace(old, new, 1)
+
+old = """        manifest: Dict[str, Dict[str, Any]] = {}
+        num_workers = min(max(1, len(items)), self._hash_num_threads)
+        if num_workers <= 1:
+            for it in items:
+                name, info = _entry(it)
+                manifest[name] = info
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=num_workers,
+                thread_name_prefix="presharded-hash",
+            ) as ex:
+                for name, info in ex.map(_entry, items):
+                    manifest[name] = info
+"""
+assert text.count(old) == 1, "loader.py: presharded dump hash loop anchor not found"
+new = """        manifest: Dict[str, Dict[str, Any]] = {}
+        num_workers = min(max(1, len(items)), self._hash_num_threads)
+        progress = _LoadProgress(  # gfx1151 patch 31
+            f"Presharded dump rank {rank}, hashing ({num_workers} threads)",
+            sum(t.numel() * t.element_size() for _, t, _ in items),
+            len(items),
+        )
+        if num_workers <= 1:
+            for it in items:
+                name, info = _entry(it)
+                manifest[name] = info
+                progress.step(info["size"])
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=num_workers,
+                thread_name_prefix="presharded-hash",
+            ) as ex:
+                for name, info in ex.map(_entry, items):
+                    manifest[name] = info
+                    progress.step(info["size"])
+        progress.finish()
+"""
+text = text.replace(old, new, 1)
+
+old = """        from safetensors.torch import save_file
+
+        for f in plan["files"]:
+            if f["writer_rank"] != rank:
+                continue
+            tensors_to_save: Dict[str, torch.Tensor] = {}
+"""
+assert text.count(old) == 1, "loader.py: _dump_files_for_rank loop anchor not found"
+new = """        from safetensors.torch import save_file
+
+        mine = [f for f in plan["files"] if f["writer_rank"] == rank]
+        progress = _LoadProgress(  # gfx1151 patch 31
+            f"Presharded dump rank {rank}, writing to {presharded_dir}",
+            sum(t["size"] for f in mine for t in f["tensors"]),
+            len(mine),
+        )
+        for f in mine:
+            tensors_to_save: Dict[str, torch.Tensor] = {}
+"""
+text = text.replace(old, new, 1)
+
+old = """                tensors_to_save[t["stored_key"]] = tensor
+            save_file(tensors_to_save, os.path.join(presharded_dir, f["filename"]))
+"""
+assert text.count(old) == 1, "loader.py: _dump_files_for_rank save_file anchor not found"
+new = """                tensors_to_save[t["stored_key"]] = tensor
+            save_file(tensors_to_save, os.path.join(presharded_dir, f["filename"]))
+            progress.step(sum(t["size"] for t in f["tensors"]))
+        progress.finish()
+"""
+text = text.replace(old, new, 1)
+
+old = """            loaded_param_keys: set = set()
+            verify_hashes: List[Tuple[str, str]] = []
+            for filename, items in by_file.items():
+                stored_keys = list(dict.fromkeys(r["stored_key"] for r in items))
+                cached = self._read_presharded_file(
+                    os.path.join(presharded_dir, filename), stored_keys
+                )
+                self._apply_presharded_file(
+                    items=items,
+                    cached=cached,
+                    model=model,
+                    state_dict=state_dict,
+                    target_device=target_device,
+                    loaded_param_keys=loaded_param_keys,
+                    verify_hashes=verify_hashes,
+                )
+"""
+assert text.count(old) == 1, "loader.py: _load_from_presharded file loop anchor not found"
+new = """            loaded_param_keys: set = set()
+            verify_hashes: List[Tuple[str, str]] = []
+            file_bytes = {  # gfx1151 patch 31
+                fn: os.path.getsize(os.path.join(presharded_dir, fn)) for fn in by_file
+            }
+            progress = _LoadProgress(
+                f"Presharded reload rank {rank}, copying from {presharded_dir}"
+                + (" with verification" if self._verify_on_load else ""),
+                sum(file_bytes.values()),
+                len(by_file),
+            )
+            for filename, items in by_file.items():
+                stored_keys = list(dict.fromkeys(r["stored_key"] for r in items))
+                cached = self._read_presharded_file(
+                    os.path.join(presharded_dir, filename), stored_keys
+                )
+                self._apply_presharded_file(
+                    items=items,
+                    cached=cached,
+                    model=model,
+                    state_dict=state_dict,
+                    target_device=target_device,
+                    loaded_param_keys=loaded_param_keys,
+                    verify_hashes=verify_hashes,
+                )
+                progress.step(file_bytes[filename])
+            progress.finish()
+"""
+text = text.replace(old, new, 1)
+
+open(p, "w").write(text)
+print("patched", p)
+
+# 7. weight_utils.py: upstream's tqdm shard bars redraw with carriage returns
+# and never end their line. Under journald that whole stretch of the log,
+# including the progress lines above, shows as "[N blob data]". Keep the bars
+# for interactive runs only; the line-based progress covers the rest.
+p = f"{path}/python/sglang/srt/model_loader/weight_utils.py"
+text = open(p).read()
+
+old = "import struct\n"
+assert text.count(old) == 1, "weight_utils.py: import anchor not found"
+text = text.replace(old, "import struct\nimport sys\n", 1)
+
+old = """    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+"""
+assert text.count(old) == 6, "weight_utils.py: enable_tqdm blocks changed"
+new = """    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    ) and sys.stderr.isatty()  # gfx1151 patch 31: no CR-redrawn bars in a log pipe
+"""
+text = text.replace(old, new)
 
 open(p, "w").write(text)
 print("patched", p)

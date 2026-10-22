@@ -64,11 +64,27 @@
 #     QWEN38_SYSTEM_PROMPT (one line asking the model to say when it is
 #     unsure; it is rendered before the client's system message). Empty
 #     disables either. Needs python3 on the host to build the JSON.
+#     The repo template also HTML-entity escapes control strings quoted in
+#     message content (<|im_end|>, </think>, <tool_call>, ...) so they cannot
+#     become real control tokens in the prompt; the detokenizer escapes the
+#     same strings when the model spells them out as plain tokens (patch 33),
+#     and the server decodes them again on output (patch 32). Both on the one
+#     switch SGLANG_UNESCAPE_CONTROL_TAGS=1, set here whenever that template
+#     is the one mounted. QWEN38_UNESCAPE_CONTROL_TAGS=0/1 overrides it.
 #   - QWEN38_STRICT_THINKING (on by default): --enable-strict-thinking masks
 #     the EOS and <tool_call> tokens while the model is inside <think>, so a
 #     stray end-of-turn mid-reasoning (the model's own habit on list-heavy
 #     prompts) cannot end the request with reasoning_content and no answer.
 #     0 disables.
+#   - QWEN38_MAX_THINK_TOKENS (3000, only with strict thinking): the hard
+#     budget for the thinking phase, passed as SGLANG_MAX_THINK_TOKENS. It is
+#     required, not optional: masking EOS removes the only exit from a runaway
+#     reasoning block, and _can_think_more() short-circuits true whenever
+#     max_think_tokens < 0, so strict thinking with no budget can never force
+#     </think>. At the cap the grammar allows only the think-end token and the
+#     model has to answer. A per-request max_thinking_tokens is NOT honoured on
+#     the OpenAI chat endpoint (silently dropped), so this is the only lever.
+#     0 or negative restores the unbounded (unsafe) behaviour.
 #   - QWEN38_PRESHARDED_DIR (off by default): upstream's `--load-format
 #     presharded`. The first boot loads normally and dumps the post-processed
 #     weights there (~75 GiB, target and draft in their own subtrees); later
@@ -152,6 +168,13 @@ fi
 if [ -n "$SYSTEM_PROMPT" ] && [ -z "$CHAT_TEMPLATE" ]; then
     echo "QWEN38_SYSTEM_PROMPT needs the repo template (default_system_prompt kwarg); the checkpoint's template ignores it" >&2
 fi
+# Output escaping (patches 32/33) only makes sense with a template that escapes;
+# on by default exactly when the repo template is mounted.
+UNESCAPE_DEFAULT=0
+if [ "$CHAT_TEMPLATE" = "$SCRIPT_DIR/configs/chat/qwen38.jinja" ]; then
+    UNESCAPE_DEFAULT=1
+fi
+UNESCAPE_ARGS=(-e "SGLANG_UNESCAPE_CONTROL_TAGS=${QWEN38_UNESCAPE_CONTROL_TAGS:-$UNESCAPE_DEFAULT}")
 # The model sometimes makes <|im_end|> its top token while still inside
 # <think> (Qwen3.8 issue 216: list-heavy reasoning, worst at xhigh, roughly
 # one call in five), which ends the turn with reasoning_content only and no
@@ -159,8 +182,11 @@ fi
 # the logits until </think> has been emitted, so the model takes its next-best
 # token and finishes the block. Clients can cap a loop with max_thinking_tokens.
 STRICT_THINKING_FLAGS=()
+STRICT_THINKING_ARGS=()
 if [ "${QWEN38_STRICT_THINKING:-1}" != "0" ]; then
     STRICT_THINKING_FLAGS=(--enable-strict-thinking)
+    # Pair the mask with a budget; see QWEN38_MAX_THINK_TOKENS in the header.
+    STRICT_THINKING_ARGS=(-e "SGLANG_MAX_THINK_TOKENS=${QWEN38_MAX_THINK_TOKENS:-3000}")
 fi
 PRESHARDED_ARGS=()
 PRESHARDED_FLAGS=()
@@ -205,6 +231,8 @@ exec docker run --name "$NAME" \
     -e SGLANG_USE_AITER=0 \
     -e SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1 \
     -e SGLANG_HOST_PARKED_PARAMS="$HOST_PARKED_PARAMS" \
+    "${STRICT_THINKING_ARGS[@]}" \
+    "${UNESCAPE_ARGS[@]}" \
     "${DOCKER_ARGS[@]}" \
     "$IMAGE" \
     python3 -m sglang.launch_server \

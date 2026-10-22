@@ -210,9 +210,11 @@ def main() -> int:
     src: Path = args.src
     dst: Path = args.dst
 
-    files = sorted(src.glob("model-*.safetensors"))
+    # Some checkpoints keep the PLE tables in their own files
+    # (embedding-model-*.safetensors) and the MTP head in model_mtp.safetensors.
+    files = sorted(src.glob("*.safetensors"))
     if not files:
-        print(f"no model-*.safetensors under {src}", file=sys.stderr)
+        print(f"no *.safetensors under {src}", file=sys.stderr)
         return 1
     dst.mkdir(parents=True, exist_ok=True)
 
