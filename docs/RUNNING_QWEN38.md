@@ -644,7 +644,10 @@ structured tool calls (`finish_reason: tool_calls`), vision (exact OCR of
 rendered text plus shape/color identification, 128 image tokens), video
 (`video_url`, a 16-frame clip described frame-accurately; the image ships
 `decord` as the decoder backend, SGLang's `srt_hip` extras install none), 8
-concurrent streams, 6302-token prompt with radix-cache reuse.
+concurrent streams, 6302-token prompt with radix-cache reuse. The prompts
+that trip, or once tripped, the server over control tokens are collected in
+[CONTROL_TOKEN_EDGES.md](CONTROL_TOKEN_EDGES.md) with a live probe
+([`tests/live_control_token_edges.py`](../tests/live_control_token_edges.py)).
 
 On HIP upstream switches EAGLE/NEXTN to rejection sampling
 (`speculative_use_rejection_sampling`, log line "ROCm needs rejection
