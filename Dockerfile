@@ -374,6 +374,18 @@ RUN python3 /tmp/patch_control_token_encoder.py && rm /tmp/patch_control_token_e
 COPY patches/patch_control_token_parsers.py /tmp/patch_control_token_parsers.py
 RUN python3 /tmp/patch_control_token_parsers.py && rm /tmp/patch_control_token_parsers.py
 
+# --- requests with images or video keep the split-encoded prompt ids (patch 34) ---
+# With media the chat endpoint sent the rendered text, because the Qwen-VL
+# processor expands image and video placeholders in text and tokenizes the
+# whole prompt with the added tokens enabled (a list of ids was decoded back
+# to text first), so a quoted "<|im_end|>" next to an image was a control
+# token again. The processor now accepts prompt ids: the media pipeline runs
+# on a placeholder-only text derived from them, and SGLang's own id-level
+# expansion rebuilds the final ids in place after it is checked against the
+# processor's result token for token. Falls back to the text path with one
+# warning on any disagreement. See patches/34-control-token-media.md.
+COPY patches/patch_control_token_mm.py /tmp/patch_control_token_mm.py
+RUN python3 /tmp/patch_control_token_mm.py && rm /tmp/patch_control_token_mm.py
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"
