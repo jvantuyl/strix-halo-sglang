@@ -140,6 +140,14 @@ PYEOF
 RUN PIP_CONSTRAINT=/tmp/rocm-constraints.txt pip install --no-deps -e python \
     && (pip cache purge 2>/dev/null || true)
 
+# Video input needs a decoder backend: sglang.srt.utils.video_decoder imports
+# torchcodec, else decord, and the srt_hip extras install neither, so every
+# video_url request failed with "No module named 'decord'". torchcodec must
+# match the torch build (none for the base image's gfx1151 torch); decord's
+# CPU wheel bundles its own FFmpeg and only needs numpy (13 MB).
+RUN PIP_CONSTRAINT=/tmp/rocm-constraints.txt pip install decord==0.6.0 \
+    && python3 -c "import decord" \
+    && (pip cache purge 2>/dev/null || true)
 # --- gfx1151 Qwen4-Exp fixes (patch 11) ---
 # CPU-side PLE gather (the UVA kernel would fault on Strix Halo), QSA decode
 # via the pure-Triton sm121 kernel, fast_topk fallback chain. See
