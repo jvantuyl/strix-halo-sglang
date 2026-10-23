@@ -77,8 +77,8 @@ Keep structure and content apart at the tokenizer, not in the text.
    the rendered text whenever the encoder exists, so the tokenizer manager
    does not re-tokenize (this model reports multimodal, which otherwise
    routes the text back through the tokenizer). A request that carries
-   media still has to take the processor's text path; that logs a warning,
-   because the processor tokenizes the text itself.
+   images or video keeps the ids too since [patch 34](34-control-token-media.md);
+   audio still takes the processor's text path, with a warning.
 
 Prompts whose content never spells a control token encode to the same ids
 as before, so prefix caching and model behaviour are unchanged. The
