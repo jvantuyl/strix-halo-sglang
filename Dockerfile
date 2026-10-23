@@ -349,31 +349,6 @@ RUN python3 /tmp/patch_draft_mtp_shards.py && rm /tmp/patch_draft_mtp_shards.py
 COPY patches/patch_presharded_host_tables.py /tmp/patch_presharded_host_tables.py
 RUN python3 /tmp/patch_presharded_host_tables.py && rm /tmp/patch_presharded_host_tables.py
 
-# --- un-escape control strings in chat completion output (patch 32) ---
-# The repo chat template HTML-entity escapes <|im_end|>, </think>, <tool_call>
-# and friends inside message content, so a quoted control string no longer
-# becomes the real token in the prompt (the model copied it back inside
-# <think>, strict thinking masked it, and the fallback </think> ended the
-# reasoning mid-sentence). Decode one level on the way out, after the
-# reasoning and tool-call parsers, in content, reasoning_content and tool-call
-# arguments; streaming holds back a possible entity prefix across deltas.
-# /v1/completions text and /generate output get the same decode.
-# SGLANG_UNESCAPE_CONTROL_TAGS=1 enables. See patches/32-unescape-control-tags.md.
-COPY patches/patch_unescape_control_tags.py /tmp/patch_unescape_control_tags.py
-RUN python3 /tmp/patch_unescape_control_tags.py && rm /tmp/patch_unescape_control_tags.py
-
-# --- entity-escape spelled-out control strings in detokenizer output (patch 33) ---
-# The model does not echo the template's entities; it spells </think> and
-# <tool_call> out as plain tokens ("</", "think", ">"), and the text-based
-# reasoning and tool-call parsers match those like the real tokens. The
-# detokenizer decodes each row in runs between the real control token ids
-# and rewrites the nine control strings to &lt;…&gt; inside the runs, holding
-# back a partial string across streaming steps; patch 32 decodes them again
-# for the client. Same switch, SGLANG_UNESCAPE_CONTROL_TAGS=1. See
-# patches/33-escape-control-text.md.
-COPY patches/patch_escape_control_text.py /tmp/patch_escape_control_text.py
-RUN python3 /tmp/patch_escape_control_text.py && rm /tmp/patch_escape_control_text.py
-
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"
