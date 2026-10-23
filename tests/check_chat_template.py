@@ -2,9 +2,11 @@
 """Render configs/chat/qwen38.jinja against the checkpoint's stock template.
 
 Without `default_system_prompt` every rendering must be byte-identical to the
-stock template; with it, the prompt must appear once, in the system block,
-after the reasoning-effort instruction and before the client's own system
-message. Runs inside the image (needs the tokenizer):
+stock template once the control-token marks (U+E000/U+E001, consumed by patch
+32's encoder; tests/check_control_token_encoder.py covers them) are removed;
+with it, the prompt must appear once, in the system block, after the
+reasoning-effort instruction and before the client's own system message. Runs
+inside the image (needs the tokenizer):
 
     docker run --rm -v <model>:/models/qwen38:ro -v <repo>:/repo:ro \
         strix-halo-sglang:dev python3 /repo/tests/check_chat_template.py
@@ -69,6 +71,11 @@ def load(path):
         return "".join(f.readlines()).strip("\n").replace("\\n", "\n")
 
 
+def unmark(rendered):
+    # The text as patch 32's encoder presents it to the model.
+    return rendered.replace("\ue000", "").replace("\ue001", "")
+
+
 def main():
     tok = AutoTokenizer.from_pretrained(MODEL)
     stock = tok.chat_template
@@ -82,9 +89,11 @@ def main():
         tok.chat_template = stock
         want = tok.apply_chat_template(msgs, **common)
         tok.chat_template = ours
-        got = tok.apply_chat_template(msgs, **common)
-        got_empty = tok.apply_chat_template(msgs, default_system_prompt="", **common)
-        got_prompt = tok.apply_chat_template(msgs, default_system_prompt=PROMPT, **common)
+        got = unmark(tok.apply_chat_template(msgs, **common))
+        got_empty = unmark(tok.apply_chat_template(msgs, default_system_prompt="", **common))
+        got_prompt = unmark(
+            tok.apply_chat_template(msgs, default_system_prompt=PROMPT, **common)
+        )
         label = f"{name} | {kwargs or 'defaults'} | tools={'yes' if tools else 'no'}"
         cases += 1
         if got != want or got_empty != want:
@@ -129,12 +138,14 @@ def main():
             print(f"FAIL {label}: prompt changes more than its own paragraph")
             continue
     tok.chat_template = ours
-    sample = tok.apply_chat_template(
-        CONVERSATIONS["system + user"],
-        tokenize=False,
-        add_generation_prompt=True,
-        reasoning_effort="medium",
-        default_system_prompt=PROMPT,
+    sample = unmark(
+        tok.apply_chat_template(
+            CONVERSATIONS["system + user"],
+            tokenize=False,
+            add_generation_prompt=True,
+            reasoning_effort="medium",
+            default_system_prompt=PROMPT,
+        )
     )
     print("sample (medium effort, prompt, client system message):")
     print(sample)

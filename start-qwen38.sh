@@ -83,12 +83,18 @@
 #     weights there (~75 GiB, target and draft in their own subtrees); later
 #     boots copy them straight into the model instead of walking the
 #     checkpoint's 222k small tensors, which is what makes the normal load
-#     slow (see the runbook's Load time section). Keyed by quantization,
-#     dtype, the model's parameter shapes and the image ID (patch 31): a new
-#     image means one slow boot and a fresh dump. An interrupted dump of the
-#     current key is removed and redone; other subfolders are only reported,
-#     never removed (they may serve another deployment), so prune them by hand
-#     to get the disk back. Keep it on local NVMe next to $PLE_DIR.
+#     slow (see the runbook's Load time section). The dump lives in
+#     <dir>/{target,draft}/TP-1-v<version>-m<sha1 of config.json content+mtime>
+#     (patch 31): the model part tells checkpoints apart, the version is
+#     QWEN38_PRESHARDED_VERSION (default below; QWEN38_PRESHARDED_DRAFT_VERSION
+#     for the draft, same default). Bump the default here when a patch changes
+#     how weights are post-processed (quantization unpacking, fusion, parking);
+#     an image rebuild that does not touch the weights keeps the dump. The
+#     stored configuration is still compared on reload: a dump made under
+#     another configuration with the same name is removed and redone, as is
+#     an interrupted one; other subfolders are only reported, never removed
+#     (they may serve another deployment), so prune them by hand to get the
+#     disk back. Keep it on local NVMe next to $PLE_DIR.
 
 set -euo pipefail
 
@@ -125,6 +131,10 @@ REASONING_EFFORT="${QWEN38_REASONING_EFFORT-medium}"
 SYSTEM_PROMPT="${QWEN38_SYSTEM_PROMPT-If you are unsure or do not know something, say so plainly instead of guessing.}"
 # Post-processed weight dump for fast restarts (see header); empty = normal load.
 PRESHARDED_DIR="${QWEN38_PRESHARDED_DIR:-}"
+# Cache version of the dump (see header). Bump when a patch changes how the
+# weights are post-processed; patches 1-33 all produce the v1 layout.
+PRESHARDED_VERSION="${QWEN38_PRESHARDED_VERSION:-1}"
+PRESHARDED_DRAFT_VERSION="${QWEN38_PRESHARDED_DRAFT_VERSION:-$PRESHARDED_VERSION}"
 # QWEN38_VISION=0 skips the vision tower (~0.9 GB of weights, text-only API).
 MODEL_OVERRIDE='{}'
 if [ "${QWEN38_VISION:-1}" = "0" ]; then
@@ -178,10 +188,11 @@ PRESHARDED_ARGS=()
 PRESHARDED_FLAGS=()
 if [ -n "$PRESHARDED_DIR" ]; then
     mkdir -p "$PRESHARDED_DIR/target" "$PRESHARDED_DIR/draft"
-    # The image ID goes into the dump's key so a rebuilt image (whose patches
-    # may post-process weights differently) never reuses the old dump.
-    STAMP="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
-    PRESHARDED_ARGS=(-v "$PRESHARDED_DIR:/presharded" -e "SGLANG_PRESHARDED_STAMP=$STAMP")
+    # The explicit cache version names the dump (with the model's config.json
+    # hash); the loader adds the hash itself. See the header.
+    PRESHARDED_ARGS=(-v "$PRESHARDED_DIR:/presharded"
+        -e "SGLANG_PRESHARDED_VERSION=$PRESHARDED_VERSION"
+        -e "SGLANG_PRESHARDED_DRAFT_VERSION=$PRESHARDED_DRAFT_VERSION")
     # 1 GiB files: the dumper stages a whole file's tensors in host RAM before
     # writing it, and the 20 GiB default OOM-killed the scheduler on this
     # 32 GB box. Hash threads each hold a host copy of one tensor (up to 0.84 GB).

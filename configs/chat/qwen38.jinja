@@ -12,7 +12,16 @@
        them straight through): minimal -> low, high -> xhigh, none -> low (SGLang
        turns a top-level none into enable_thinking=false before the template runs;
        this covers none inside chat_template_kwargs); empty -> the template default.
-       Anything else still raises, as in the stock template. -#}
+       Anything else still raises, as in the stock template.
+    3. Every control token the template emits (<|im_start|>, <|im_end|>, <think>,
+       </think>, <tool_call>, </tool_call>, <tool_response>, </tool_response> and
+       the vision placeholders) is wrapped in U+E000 ... U+E001. Patch 32's encoder
+       turns the marked names into the control token ids and tokenizes everything
+       else, message content included, with the added tokens disabled, so a quoted
+       "<|im_end|>" or "</think>" in a tool result stays ordinary text and reaches
+       the model as written. The resulting ids are identical to the stock template's
+       whenever no content spells a control token. Without patch 32 the marks would
+       reach the model as text; this template is for use with the patched server. -#}
 {%- set image_count = namespace(value=0) %}
 {%- set video_count = namespace(value=0) %}
 {%- macro render_content(content, do_vision_count, is_system_content=false) %}
@@ -30,7 +39,7 @@
                 {%- if add_vision_id %}
                     {{- 'Picture ' ~ image_count.value ~ ': ' }}
                 {%- endif %}
-                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+                {{- '\ue000<|vision_start|>\ue001\ue000<|image_pad|>\ue001\ue000<|vision_end|>\ue001' }}
             {%- elif 'video' in item or item.type == 'video' %}
                 {%- if is_system_content %}
                     {{- raise_exception('System message cannot contain videos.') }}
@@ -41,7 +50,7 @@
                 {%- if add_vision_id %}
                     {{- 'Video ' ~ video_count.value ~ ': ' }}
                 {%- endif %}
-                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}
+                {{- '\ue000<|vision_start|>\ue001\ue000<|video_pad|>\ue001\ue000<|vision_end|>\ue001' }}
             {%- elif 'text' in item %}
                 {{- item.text }}
             {%- else %}
@@ -75,7 +84,7 @@
 {%- endif %}
 {%- set server_system_prompt = (default_system_prompt|default('', true))|trim %}
 {%- if tools and tools is iterable and tools is not mapping %}
-    {{- '<|im_start|>system\n' }}
+    {{- '\ue000<|im_start|>\ue001system\n' }}
     {%- if reasoning_instructions %}
         {{- reasoning_instructions + '\n\n' }}
     {%- endif %}
@@ -88,14 +97,14 @@
         {{- tool | tojson }}
     {%- endfor %}
     {{- "\n</tools>" }}
-    {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
+    {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n\ue000<tool_call>\ue001\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n\ue000</tool_call>\ue001\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within \ue000<tool_call>\ue001\ue000</tool_call>\ue001 XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
     {%- if messages[0].role == 'system' %}
         {%- set content = render_content(messages[0].content, false, true)|trim %}
         {%- if content %}
             {{- '\n\n' + content }}
         {%- endif %}
     {%- endif %}
-    {{- '<|im_end|>\n' }}
+    {{- '\ue000<|im_end|>\ue001\n' }}
 {%- else %}
     {%- set system_block = namespace(parts=[]) %}
     {%- if reasoning_instructions %}
@@ -111,7 +120,7 @@
         {%- endif %}
     {%- endif %}
     {%- if system_block.parts %}
-        {{- '<|im_start|>system\n' + system_block.parts|join('\n\n') + '<|im_end|>\n' }}
+        {{- '\ue000<|im_start|>\ue001system\n' + system_block.parts|join('\n\n') + '\ue000<|im_end|>\ue001\n' }}
     {%- endif %}
 {%- endif %}
 {%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
@@ -135,7 +144,7 @@
             {{- raise_exception('System message must be at the beginning.') }}
         {%- endif %}
     {%- elif message.role == "user" %}
-        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+        {{- '\ue000<|im_start|>\ue001' + message.role + '\n' + content + '\ue000<|im_end|>\ue001' + '\n' }}
     {%- elif message.role == "assistant" %}
         {%- set reasoning_content = '' %}
         {%- if message.reasoning_content is string %}
@@ -143,9 +152,9 @@
         {%- endif %}
         {%- set reasoning_content = reasoning_content|trim %}
         {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}
-            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+            {{- '\ue000<|im_start|>\ue001' + message.role + '\n\ue000<think>\ue001\n' + reasoning_content + '\n\ue000</think>\ue001\n\n' + content }}
         {%- else %}
-            {{- '<|im_start|>' + message.role + '\n' + content }}
+            {{- '\ue000<|im_start|>\ue001' + message.role + '\n' + content }}
         {%- endif %}
         {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
             {%- for tool_call in message.tool_calls %}
@@ -154,12 +163,12 @@
                 {%- endif %}
                 {%- if loop.first %}
                     {%- if content|trim %}
-                        {{- '\n\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                        {{- '\n\n\ue000<tool_call>\ue001\n<function=' + tool_call.name + '>\n' }}
                     {%- else %}
-                        {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                        {{- '\ue000<tool_call>\ue001\n<function=' + tool_call.name + '>\n' }}
                     {%- endif %}
                 {%- else %}
-                    {{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                    {{- '\n\ue000<tool_call>\ue001\n<function=' + tool_call.name + '>\n' }}
                 {%- endif %}
                 {%- if tool_call.arguments is defined and tool_call.arguments != '' %}
                     {%- for args_name, args_value in tool_call.arguments|items %}
@@ -169,31 +178,31 @@
                         {{- '\n</parameter>\n' }}
                     {%- endfor %}
                 {%- endif %}
-                {{- '</function>\n</tool_call>' }}
+                {{- '</function>\n\ue000</tool_call>\ue001' }}
             {%- endfor %}
         {%- endif %}
-        {{- '<|im_end|>\n' }}
+        {{- '\ue000<|im_end|>\ue001\n' }}
     {%- elif message.role == "tool" %}
         {%- if loop.previtem and loop.previtem.role != "tool" %}
-            {{- '<|im_start|>user' }}
+            {{- '\ue000<|im_start|>\ue001user' }}
         {%- endif %}
-        {{- '\n<tool_response>\n' }}
+        {{- '\n\ue000<tool_response>\ue001\n' }}
         {{- content }}
-        {{- '\n</tool_response>' }}
+        {{- '\n\ue000</tool_response>\ue001' }}
         {%- if not loop.last and loop.nextitem.role != "tool" %}
-            {{- '<|im_end|>\n' }}
+            {{- '\ue000<|im_end|>\ue001\n' }}
         {%- elif loop.last %}
-            {{- '<|im_end|>\n' }}
+            {{- '\ue000<|im_end|>\ue001\n' }}
         {%- endif %}
     {%- else %}
         {{- raise_exception('Unexpected message role.') }}
     {%- endif %}
 {%- endfor %}
 {%- if add_generation_prompt %}
-    {{- '<|im_start|>assistant\n' }}
+    {{- '\ue000<|im_start|>\ue001assistant\n' }}
     {%- if enable_thinking is defined and enable_thinking is false %}
-        {{- '<think>\n\n</think>\n\n' }}
+        {{- '\ue000<think>\ue001\n\n\ue000</think>\ue001\n\n' }}
     {%- else %}
-        {{- '<think>\n' }}
+        {{- '\ue000<think>\ue001\n' }}
     {%- endif %}
 {%- endif %}

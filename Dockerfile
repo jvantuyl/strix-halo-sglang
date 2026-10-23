@@ -341,13 +341,38 @@ RUN python3 /tmp/patch_draft_mtp_shards.py && rm /tmp/patch_draft_mtp_shards.py
 # completion marker is only checked from load_weights (which the reload never
 # calls), and load_weights ends with the GDN in_proj fusion. Skip host tensors,
 # check the marker before trusting a dump, run the fusion after the copy.
-# SGLANG_PRESHARDED_STAMP (the image ID) joins the cache key; an interrupted
-# dump is removed and redone, other subfolders are reported, never removed.
+# The dump is named by an explicit cache version (SGLANG_PRESHARDED_VERSION,
+# the launcher's QWEN38_PRESHARDED_VERSION) and a hash of the model's
+# config.json; an interrupted or mismatched dump is removed and redone, other
+# subfolders are reported, never removed.
 # The weight load, hash, write and copy-back phases log progress every 15 s;
 # upstream's CR-redrawn tqdm shard bars stay off unless stderr is a TTY.
 # See patches/31-presharded-host-tables.md.
 COPY patches/patch_presharded_host_tables.py /tmp/patch_presharded_host_tables.py
 RUN python3 /tmp/patch_presharded_host_tables.py && rm /tmp/patch_presharded_host_tables.py
+
+# --- content can never become a control token (patch 32) ---
+# The chat endpoint renders the template to one string and tokenizes it with
+# the added tokens enabled, so a tool result quoting "<|im_end|>" or
+# "</think>" becomes the real control token: strict thinking then masks it
+# and the turn structure breaks, and the model never sees the quoted text.
+# The repo template marks the control tokens it emits (U+E000 name U+E001);
+# a split encoder turns the marks into ids and tokenizes everything else
+# with the added-token table emptied. Request strings are escaped so they
+# cannot forge a mark. Ids are unchanged for prompts that quote nothing.
+# Inert with a template that carries no marks. See patches/32-control-token-encoder.md.
+COPY patches/patch_control_token_encoder.py /tmp/patch_control_token_encoder.py
+RUN python3 /tmp/patch_control_token_encoder.py && rm /tmp/patch_control_token_encoder.py
+
+# --- reasoning and tool-call parsers match control tokens by id (patch 33) ---
+# The qwen3 reasoning parser and the qwen3_coder tool parser work on text, so
+# a "</think>" or "<tool_call>" the model spells with ordinary tokens ends the
+# thinking block or opens a call. A per-choice ControlTokenStream decodes the
+# output ids beside the text and the parsers search a view in which only
+# real control tokens keep their first character. Falls back to text matching
+# with one warning if ids and text ever disagree. See patches/33-control-token-parsers.md.
+COPY patches/patch_control_token_parsers.py /tmp/patch_control_token_parsers.py
+RUN python3 /tmp/patch_control_token_parsers.py && rm /tmp/patch_control_token_parsers.py
 
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.

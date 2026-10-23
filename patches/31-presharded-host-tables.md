@@ -39,11 +39,13 @@ returns, so both paths park identically.
 
 And two things about the cache directory itself:
 
-4. **The key does not cover the code.** The subfolder name hashes
-   quantization, dtype, parallel layout and the parameters' shapes, but not
-   the code that post-processed the values. A rebuilt image whose patches
-   change that post-processing (patch 12's zero points, say) would reuse the
-   old dump and serve wrong numerics silently.
+4. **The key covers neither the code nor the model.** The subfolder name
+   hashes quantization, dtype, parallel layout and the parameters' shapes,
+   but not the code that post-processed the values, so a rebuilt image whose
+   patches change that post-processing (patch 12's zero points, say) would
+   reuse the old dump and serve wrong numerics silently; nor the checkpoint,
+   so a cache root shared by two models of the same shape would hand one
+   the other's weights.
 5. **Interrupted and stale dumps are indistinguishable.** A dump killed
    mid-write (the first attempt here was OOM-killed) leaves a subfolder
    without `READY` that the next boot rewrites file by file, possibly with a
@@ -62,13 +64,23 @@ And two things about the cache directory itself:
   the hook or without file tables (the MTP draft) pass.
 - After the copy, every module's `finalize_fused_in_proj` is run, so the
   fused GEMM path and its numerics match the normal load.
-- `SGLANG_PRESHARDED_STAMP`, when set, joins the shard config (and so the
-  subfolder name and the stored `shard_config` that is compared on reload).
-  The launcher passes the image ID, so every rebuild dumps afresh. Unset,
-  the key is upstream's.
-- Before choosing dump or reload, the cache root is audited. The current
-  key's subfolder without `READY` is an interrupted dump: rank 0 removes it
-  and the dump starts clean. Every other subfolder is logged with its size
+- The shard config gains `model_config_sha` (sha1 over the checkpoint's
+  `config.json` content and mtime, 8 hex) and, when the launcher sets
+  `SGLANG_PRESHARDED_VERSION` (`SGLANG_PRESHARDED_DRAFT_VERSION` for the
+  draft, falling back to the target's), `cache_version`. With a version the
+  subfolder is `TP-<tp>-v<version>-m<model_config_sha>` rather than a hash
+  of every setting: an image rebuild keeps the dump, a version bump (made in
+  the launcher when a patch changes the post-processing) forces a new one,
+  and a second checkpoint under the same root gets its own. The stored
+  `shard_config` is still compared on reload. Without a version the name is
+  upstream's hash, with the model hash inside it. (An earlier form of this
+  patch hashed the image ID into the key, which redumped 76 GiB on every
+  rebuild whether or not the weights changed.)
+- Before choosing dump or reload, the cache root is audited and the key is
+  logged. The current key's subfolder without `READY` is an interrupted
+  dump, and one with `READY` whose stored `shard_config` differs from this
+  launch's (same version and model, another configuration) is stale: rank 0
+  removes either and the dump starts clean. Every other subfolder is logged with its size
   and whether it is complete, and left alone; it may be another
   deployment's, so pruning is a manual step.
 - Progress. After "doing first-time load and dump" the log went quiet for

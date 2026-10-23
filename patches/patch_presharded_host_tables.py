@@ -27,17 +27,26 @@ copies bounded by NVMe speed. Three things on this model break it:
 And two things about the cache directory itself:
 
   4. The dump's key covers quantization, dtype, parallel layout and the
-     parameters' shapes, not the code that produced the values. A rebuilt
-     image whose patches change a weight's post-processing (patch 12's zero
-     points, say) would reuse the old dump and serve wrong numerics without
-     a word. `SGLANG_PRESHARDED_STAMP` (the launcher passes the image ID)
-     joins the key, so every rebuild gets its own subfolder.
+     parameters' shapes, not the code that produced the values nor the
+     model it came from. A rebuilt image whose patches change a weight's
+     post-processing (patch 12's zero points, say) would reuse the old dump
+     and serve wrong numerics without a word; a cache root shared by two
+     checkpoints would hand one the other's weights. The key gains the
+     sha1 of the model's config.json (content and mtime) and, when the launcher sets
+     `SGLANG_PRESHARDED_VERSION` (`SGLANG_PRESHARDED_DRAFT_VERSION` for the
+     draft), an explicit cache version: the subfolder is then named
+     `TP-<tp>-v<version>-m<sha1[:8]>` instead of a hash of every setting,
+     so the same version reuses the dump across image rebuilds and a bump
+     forces a new one. Without a version the upstream hashed name is kept
+     (with the config.json sha inside the hash).
   5. Before choosing a path, the cache root is audited: the current
-     subfolder without its READY marker is an interrupted dump and is
-     removed so the redo starts clean (the writer would otherwise leave
-     orphans from a differently planned file layout); any other subfolder,
-     stale or another deployment's, is reported with its size and
-     completeness and left alone.
+     subfolder without its READY marker is an interrupted dump, and a
+     complete one whose stored configuration differs from this launch's
+     under the same name is stale; both are removed so the redo starts
+     clean (the writer would otherwise leave orphans from a differently
+     planned file layout); any other subfolder, another version's or
+     another deployment's, is reported with its size and completeness and
+     left alone.
   6. The load walks 222k tensors, the dump hashes every tensor and writes
      ~70 GB of files, and a later boot copies them back, all without a line
      in the log. Each phase now logs its size up front, a progress line
@@ -166,21 +175,64 @@ new = old + """
         hook(hf_folder, list(weight_files))
         return bool(getattr(model, "_ple_table_reused", False))
 
-    def _audit_presharded_root(self, presharded_dir: str) -> None:
-        \"\"\"gfx1151 patch 31: drop an interrupted dump of this configuration;
-        report, but keep, every other subfolder under the same root.\"\"\"
+    @staticmethod
+    def _model_config_sha(model_config: ModelConfig) -> str:
+        \"\"\"gfx1151 patch 31: sha1 of the model's config.json content and its
+        mtime, the part of the cache key that tells one checkpoint from
+        another (two fine-tunes of one base share the content, not the time
+        they were written).\"\"\"
+        path = os.path.join(model_config.model_path, "config.json")
+        try:
+            with open(path, "rb") as f:
+                content = f.read()
+            mtime_ns = os.stat(path).st_mtime_ns
+        except OSError:
+            return "noconfig"
+        return hashlib.sha1(content + b"\\n" + str(mtime_ns).encode()).hexdigest()[:8]
+
+    @staticmethod
+    def _cache_version(model_config: ModelConfig) -> Optional[str]:
+        \"\"\"gfx1151 patch 31: the explicit cache version for this dump type,
+        from SGLANG_PRESHARDED_VERSION (target) or SGLANG_PRESHARDED_DRAFT_VERSION
+        (draft, falling back to the target's). None when unset.\"\"\"
+        value = None
+        if model_config.is_draft_model:
+            value = os.environ.get("SGLANG_PRESHARDED_DRAFT_VERSION")
+        if not value:
+            value = os.environ.get("SGLANG_PRESHARDED_VERSION")
+        if not value or not value.strip():
+            return None
+        return re.sub(r"[^A-Za-z0-9._-]", "_", value.strip())
+
+    def _audit_presharded_root(
+        self, presharded_dir: str, shard_config: Dict[str, Any]
+    ) -> None:
+        \"\"\"gfx1151 patch 31: drop an interrupted dump of this key, or a complete
+        one made under another configuration; report, but keep, every other
+        subfolder under the same root.\"\"\"
         rank, _ = self._world_rank_and_size()
         root, current = os.path.split(presharded_dir)
-        if os.path.isdir(presharded_dir) and not self._presharded_ready(presharded_dir):
-            if rank == 0:
-                logger.warning(
-                    "Presharded dump at %s has no %s marker (interrupted dump); "
-                    "removing it before dumping again.",
-                    presharded_dir,
-                    self.READY_FILENAME,
-                )
-                shutil.rmtree(presharded_dir, ignore_errors=True)
-            self._world_barrier()
+        logger.info(
+            "Presharded key %s: cache version %s, model config.json (content+mtime) sha1 %s",
+            current,
+            shard_config.get("cache_version", "unset (hashed key)"),
+            shard_config.get("model_config_sha"),
+        )
+        if os.path.isdir(presharded_dir):
+            stale = None
+            if not self._presharded_ready(presharded_dir):
+                stale = f"has no {self.READY_FILENAME} marker (interrupted dump)"
+            elif not self._shard_config_matches(presharded_dir, shard_config):
+                stale = "was dumped under another configuration with the same key"
+            if stale is not None:
+                if rank == 0:
+                    logger.warning(
+                        "Presharded dump at %s %s; removing it before dumping again.",
+                        presharded_dir,
+                        stale,
+                    )
+                    shutil.rmtree(presharded_dir, ignore_errors=True)
+                self._world_barrier()
         if rank != 0 or not os.path.isdir(root):
             return
         for name in sorted(os.listdir(root)):
@@ -204,20 +256,38 @@ new = old + """
 """
 text = text.replace(old, new, 1)
 
-# 4. code stamp in the cache key (only when the launcher sets it)
+# 4. the model's config.json and an explicit cache version in the key
 old = """            "structural_signature": self._compute_structural_signature(model_config),
         }
 """
 assert text.count(old) == 1, "loader.py: _collect_shard_config anchor not found"
 new = """            "structural_signature": self._compute_structural_signature(model_config),
-            # gfx1151 patch 31: the code that post-processed the weights is
-            # part of the key; the launcher passes the image ID.
+            # gfx1151 patch 31: which checkpoint, and which version of the code
+            # that post-processes it (the launcher bumps the version when a
+            # patch changes the post-processing; unset keeps the hashed key).
+            "model_config_sha": self._model_config_sha(model_config),
             **(
-                {"code_stamp": os.environ["SGLANG_PRESHARDED_STAMP"]}
-                if os.environ.get("SGLANG_PRESHARDED_STAMP")
+                {"cache_version": version}
+                if (version := self._cache_version(model_config)) is not None
                 else {}
             ),
         }
+"""
+text = text.replace(old, new, 1)
+
+old = """    def _build_subfolder_name(self, shard_config: Dict[str, Any]) -> str:
+        combined = hashlib.sha1(
+"""
+assert text.count(old) == 1, "loader.py: _build_subfolder_name anchor not found"
+new = """    def _build_subfolder_name(self, shard_config: Dict[str, Any]) -> str:
+        # gfx1151 patch 31: with an explicit cache version the name is the
+        # version and the model, not a hash of every setting, so the dump
+        # survives image rebuilds until the version is bumped. The stored
+        # shard config is still compared on reload.
+        version = shard_config.get("cache_version")
+        if version is not None:
+            return f"TP-{shard_config['tp']}-v{version}-m{shard_config['model_config_sha']}"
+        combined = hashlib.sha1(
 """
 text = text.replace(old, new, 1)
 
@@ -229,7 +299,7 @@ old = """        shard_config = self._collect_shard_config(model_config)
 assert text.count(old) == 1, "loader.py: presharded load_model anchor not found"
 new = """        shard_config = self._collect_shard_config(model_config)
         presharded_dir = self._presharded_dir(model_config, shard_config)
-        self._audit_presharded_root(presharded_dir)  # gfx1151 patch 31
+        self._audit_presharded_root(presharded_dir, shard_config)  # gfx1151 patch 31
         if self._presharded_ready(presharded_dir) and self._shard_config_matches(
 """
 text = text.replace(old, new, 1)
