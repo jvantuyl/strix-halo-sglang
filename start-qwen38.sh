@@ -64,13 +64,6 @@
 #     QWEN38_SYSTEM_PROMPT (one line asking the model to say when it is
 #     unsure; it is rendered before the client's system message). Empty
 #     disables either. Needs python3 on the host to build the JSON.
-#     The repo template also HTML-entity escapes control strings quoted in
-#     message content (<|im_end|>, </think>, <tool_call>, ...) so they cannot
-#     become real control tokens in the prompt; the detokenizer escapes the
-#     same strings when the model spells them out as plain tokens (patch 33),
-#     and the server decodes them again on output (patch 32). Both on the one
-#     switch SGLANG_UNESCAPE_CONTROL_TAGS=1, set here whenever that template
-#     is the one mounted. QWEN38_UNESCAPE_CONTROL_TAGS=0/1 overrides it.
 #   - QWEN38_STRICT_THINKING (on by default): --enable-strict-thinking masks
 #     the EOS and <tool_call> tokens while the model is inside <think>, so a
 #     stray end-of-turn mid-reasoning (the model's own habit on list-heavy
@@ -168,13 +161,6 @@ fi
 if [ -n "$SYSTEM_PROMPT" ] && [ -z "$CHAT_TEMPLATE" ]; then
     echo "QWEN38_SYSTEM_PROMPT needs the repo template (default_system_prompt kwarg); the checkpoint's template ignores it" >&2
 fi
-# Output escaping (patches 32/33) only makes sense with a template that escapes;
-# on by default exactly when the repo template is mounted.
-UNESCAPE_DEFAULT=0
-if [ "$CHAT_TEMPLATE" = "$SCRIPT_DIR/configs/chat/qwen38.jinja" ]; then
-    UNESCAPE_DEFAULT=1
-fi
-UNESCAPE_ARGS=(-e "SGLANG_UNESCAPE_CONTROL_TAGS=${QWEN38_UNESCAPE_CONTROL_TAGS:-$UNESCAPE_DEFAULT}")
 # The model sometimes makes <|im_end|> its top token while still inside
 # <think> (Qwen3.8 issue 216: list-heavy reasoning, worst at xhigh, roughly
 # one call in five), which ends the turn with reasoning_content only and no
@@ -232,7 +218,6 @@ exec docker run --name "$NAME" \
     -e SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1 \
     -e SGLANG_HOST_PARKED_PARAMS="$HOST_PARKED_PARAMS" \
     "${STRICT_THINKING_ARGS[@]}" \
-    "${UNESCAPE_ARGS[@]}" \
     "${DOCKER_ARGS[@]}" \
     "$IMAGE" \
     python3 -m sglang.launch_server \

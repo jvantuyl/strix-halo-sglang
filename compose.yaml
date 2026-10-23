@@ -83,10 +83,6 @@ services:
       # With the presharded dump enabled, set this to the image ID (docker
       # image inspect -f '{{.Id}}') so a rebuilt image gets its own dump.
       SGLANG_PRESHARDED_STAMP: "${SGLANG_PRESHARDED_STAMP:-}"
-      # Decode the repo template's control-string escaping on output (patch
-      # 32). Set to 0 if QWEN38_CHAT_TEMPLATE points at a template that does
-      # not escape.
-      SGLANG_UNESCAPE_CONTROL_TAGS: "${SGLANG_UNESCAPE_CONTROL_TAGS:-1}"
     volumes:
       - ${QWEN38_MODEL_DIR:-~/models/Qwen3.8-Flash-Next-AWQ-INT4-ple-fp8}:/models/qwen38:ro
       - ${QWEN38_PLE_DIR:-/opt/llm/ple-cache}:/ple
