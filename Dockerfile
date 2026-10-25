@@ -394,6 +394,17 @@ RUN python3 /tmp/patch_control_token_parsers.py && rm /tmp/patch_control_token_p
 # warning on any disagreement. See patches/34-control-token-media.md.
 COPY patches/patch_control_token_mm.py /tmp/patch_control_token_mm.py
 RUN python3 /tmp/patch_control_token_mm.py && rm /tmp/patch_control_token_mm.py
+
+# --- low-level event stream over ZMQ PUB (patch 35) ---
+# SGLANG_EVENT_STREAM_PORT=<port>: the scheduler publishes prefill/decode batch
+# events with per-request lists (rid, prompt length, cached, prefilled so far,
+# generated so far, age; waiting queue with wait times) on tcp://127.0.0.1:<port>,
+# the API process publishes req_received / req_first_token / req_finished on
+# <port+1>. SGLANG_EVENT_STREAM_STEPS=1 adds a per-forward step event. Off when
+# unset; non-blocking sends, so no subscriber ever stalls the server.
+# See patches/35-event-stream.md.
+COPY patches/patch_event_stream.py /tmp/patch_event_stream.py
+RUN python3 /tmp/patch_event_stream.py && rm /tmp/patch_event_stream.py
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"
