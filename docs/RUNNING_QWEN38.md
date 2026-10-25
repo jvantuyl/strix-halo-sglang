@@ -41,6 +41,7 @@ off.
 | [32](../patches/32-control-token-encoder.md) | Chat prompts encoded with control tokens and content kept apart: the template marks the control tokens it emits, a split encoder tokenizes everything else with the added-token table emptied | Rendered to one string and tokenized whole, a tool result quoting `<|im_end|>` or `</think>` *is* the control token: strict thinking masks it, the turn structure breaks, the model never sees the quote (the early `</think>` under agents). Ids unchanged when nothing is quoted; inert without the marked template. Not gfx1151-specific |
 | [33](../patches/33-control-token-parsers.md) | The qwen3 reasoning parser and the qwen3_coder tool parser switch state on control token ids, not on the same strings spelled out | Both parse detokenized text, so a `</think>` the model writes with ordinary tokens ended the thinking block and a spelled-out `<tool_call>` opened a call. A per-choice stream decodes the output ids beside the text; the parsers search a view with look-alikes defused. Text fallback with one warning if ids and text disagree. Not gfx1151-specific |
 | [34](../patches/34-control-token-media.md) | Requests with images or video keep patch 32's prompt ids: the Qwen-VL processor accepts ids, runs the media pipeline on a placeholder-only text derived from them and expands the placeholders inside the original ids with SGLang's id-level builder | With media the endpoint sent the rendered text and the processor re-tokenized it with the added tokens enabled, so a quoted `<|im_end|>` next to a screenshot was the control token again. The id-level expansion is checked token for token against the processor's own result per request; text path with one warning on any disagreement. Not gfx1151-specific |
+| [35](../patches/35-event-stream.md) | Low-level event stream over ZMQ PUB (`SGLANG_EVENT_STREAM_PORT`): batch events with per-request lists from the scheduler, request received/first-token/finished from the API process, optional per-forward step events | The journal only has aggregates, so concurrent requests cannot be told apart and a live view shows totals only; non-blocking sends cost nothing without a subscriber. Consumer: `~/scratch/sgl_top.py`. Not gfx1151-specific |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
@@ -142,6 +143,7 @@ on local NVMe: it is random-read during decode.
 | `--default-chat-template-kwargs '{"reasoning_effort": "medium", "default_system_prompt": "..."}'` | Server-wide template kwargs; a request's own `chat_template_kwargs` (or top-level `reasoning_effort`) win key by key, which for `reasoning_effort` needs [patch 29](../patches/29-default-effort-override.md): upstream refills the request's popped effort with the server default and every request rendered at `medium`. **`reasoning_effort`**: the template's default is `xhigh`, which prepends "Please think carefully through the task, validate key assumptions, consider plausible alternatives..." to every request and is what every Qwen 3.8 overthinking report traces back to (Simon Willison's 21-minute SVG at 22k reasoning tokens; the model repo's "This model cannot stop thinking" thread, where `medium` measured a third less thinking with no quality drop and a proxy forcing `medium` for everything was ~3× faster and "no longer does stuff I didn't ask for"). `medium` emits no instruction text; `low` emits a "keep your thinking brief" one. The stock template rejects every other value with a 400; clients that pass the OpenAI scale straight through (Hermes sent `minimal`) would fail, so the repo template maps `minimal` to `low` and `high` to `xhigh` (case-insensitively; an empty value means the default; anything else still errors). A top-level `reasoning_effort: "none"` never reaches the template: SGLang turns it into `enable_thinking: false`, the OpenAI meaning; inside `chat_template_kwargs` the template maps it to `low`. Verified: `prompt_tokens` 59 / 71 / 35 for `minimal` / `high` / `none`, matching `low` / `xhigh` / thinking off. Qwen's card cautions that in multi-turn agentic work lower effort can cost more through retries, so clients doing that may pass `xhigh`. **`default_system_prompt`**: one line asking the model to say when it is unsure, rendered after the effort instruction and before the client's own system message (so it is part of the shared radix-cache prefix). `QWEN38_REASONING_EFFORT` / `QWEN38_SYSTEM_PROMPT` set them; empty disables. Note the kwargs live at the top of the prompt: changing them per request invalidates the prefix cache for that conversation. |
 | `PYTORCH_TUNABLEOP_TUNING=0` | The image enables PyTorch TunableOp, which benchmarks every GEMM solution for each *new* M (= tokens in the prefill chunk). That is 14–20 s of TTFT for every novel prompt length (measured; the recorded results persist in `~/.cache/strix-halo-sglang-tunableop` so a repeated length is fast). With tuning off the recorded solutions are still used and untuned shapes take hipBLASLt's heuristic pick. `SGLANG_TUNABLEOP_TUNING=1 ./start-qwen38.sh` to deliberately record more. |
 | `SGLANG_USE_AITER=0` | Set in the image. |
+| `LD_PRELOAD=/opt/rocm/lib/libhsa-runtime64.so.1` (via `SGLANG_DOCKER_ARGS` in the service env file) | The ROCr runtime inside the Python wheel (`_rocm_sdk_core`, rocm-sdk-core 7.13.0a20260422) leaves one native thread spinning at 100% CPU for the life of any process that has submitted work to the GPU once (a kernel, an event record, an H2D copy); the HTTP/tokenizer process does that at startup and then burned a core forever while idle. Found by sampling the thread's instruction pointer (always inside `libhsa-runtime64.so.1`, never in a syscall); reproduced with a bare torch probe; no HSA/HIP env knob stops it. The system ROCr in `/opt/rocm` (same 7.13.0, different build) does not spin, and preloading it binds every process in the container to it. Dispatch, sync, matmul and copy timings are identical between the two builds; decode speed and numerics unchanged. Oddly the scheduler process never spun even with the wheel library; unexplained. |
 
 ### What to look for in the log
 
@@ -157,6 +159,41 @@ QSA decode on HIP: using Triton qwen38_qsa kernel (heads=(12,1) head_dim=256)
 
 If you see `QSA decode on HIP: using flash_attn varlen fallback`, the QSA
 kernel's shape contract was not met; the fallback is correct but slow.
+
+### Live view: event stream and `sgl_top`
+
+Patch 35 gives the server a low-level event stream over ZMQ PUB when
+`SGLANG_EVENT_STREAM_PORT` is set (the launcher passes it through
+`SGLANG_DOCKER_ARGS`, see the service env file):
+
+```
+SGLANG_DOCKER_ARGS=-e SGLANG_EVENT_STREAM_PORT=8010 -e SGLANG_EVENT_STREAM_STEPS=1
+```
+
+The scheduler publishes on `tcp://127.0.0.1:8010` (`prefill_batch` and
+`decode_batch` with per-request lists: rid, prompt length, cached, prefilled
+so far, generated so far, age; the waiting queue with wait times; and, with
+`_STEPS=1`, a `step` event per forward), the API process on `8011`
+(`req_received`, `req_first_token`, `req_finished` with TTFT, e2e and accept
+length). Sends are non-blocking, so nobody listening costs nothing. Event
+fields are listed in [patches/35-event-stream.md](../patches/35-event-stream.md).
+
+`~/scratch/sgl_top.py` is the consumer (curses, pyzmq; top pane SGLang,
+bottom pane FLM on the NPU from its journal):
+
+```
+python3 ~/scratch/sgl_top.py [--record ~/scratch/events-$(date +%F).jsonl]
+```
+
+Keys: `q` quit, `p` pause, `1`-`5` sparkline bucket (1/2/5/10/30 s), `[`/`]`
+move the split. Requests first seen inside a batch snapshot (already running
+when the view connected) are marked `~`. Without the stream (older image or
+port unset) the SGLang pane falls back to the journal's aggregate batch lines
+and has no per-request matrix. `--record` appends every raw event as JSONL for
+later analysis of scheduler experiments. The view also polls `/v1/loads` and
+`/server_info` once a second (the older `/get_load` and `/get_server_info`
+log a deprecation warning on every call) and hides those access lines from
+its log pane and request counts.
 
 ## Load time
 
@@ -645,8 +682,8 @@ module, 3.3 pools net of the placeholder reuse, 0.1 graphs) and ~0.3 GB of
 host memory. One thing both configurations share: in the mixed run the 18
 short streams decode at 2.1–2.3 tok/s each and the last of them waits 21 s
 for a first token while the two long prompts prefill in 8k chunks. That is
-the chunked-prefill scheduler favouring prefill over decode, not memory,
-and it has not been looked into.
+the chunked-prefill scheduler favouring prefill over decode, not memory;
+see "Scheduling: prefill against decode" below.
 
 With patches 27 and 28 the worst case measured leaves 5.8 GiB; before
 them 1.5 GiB was thin and one prompt mix reached 0.1. `QWEN38_CUDA_GRAPH_MAX_BS=10` remains the conservative choice
@@ -725,6 +762,62 @@ prompt 128 tokens 3/3, 14k-token prompt 64 tokens 3/3. Before the two
 patches the 96-token probe differed 3/3 (same tokens, logprobs from
 position 6–7, a token flip at 79 in one run, `spec_verify_ct` 40–42).
 
+### Scheduling: prefill against decode
+
+SGLang's scheduler is prefill-first: while anything is waiting to prefill it
+runs prefill chunks back to back and the running decode batch gets no step.
+With `--chunked-prefill-size 1024` a chunk is ~1.3 s here, so one 40k
+cache-miss prompt freezes every stream that is decoding for about a minute,
+and a queue of them for as long as the queue lasts. 512-token chunks cost
+~40% of prefill throughput and 1024 none (vs 8192), so the chunk stays at
+1024; what fixes the freeze is `--prefill-decode-interval N`, which forces a
+decode step after at most N prefill chunks. The policy
+(`--schedule-policy`) then decides who waits.
+
+Measured 2026-10-25 with [`~/scratch/run_sched_bank.sh`](../../scratch/run_sched_bank.sh)
+(`sglang_workload_bench.py`, 420 s closed loop: 4 agent sessions with
+cached-prefix turns, a short 750-token prompt every 40 s, 12 fan-out 40k
+cache-miss prompts in two waves, two 50k prompts; ~700k prefill tokens, so
+about 20 min of prefill work; client TTFT and token gaps, plus the patch 35
+event stream recorded per config with `record_events.py`; summary from
+`analyze_bank.py`). Worst decode gap = the longest wait for the next token
+of a request that was already decoding:
+
+| config | out tok/s | agent turns | worst decode gap | agent decode tok/s | short TTFT p50/max | agent TTFT p50/p95 |
+|---|---|---|---|---|---|---|
+| fcfs (old default) | 10.6 | 7 | **275 s** | 1.7 | 1 / 192 s | 174 / 246 s |
+| fcfs + interval 10 / 20 / 40 | 9.0–9.2 | 8 | 2.6–2.7 s | 12–20 | 1 / 346–356 s | 346–363 / 408–424 s |
+| hrrn / lpm / spf | 12.8 / 11.9 / 11.1 | 5 | 204–273 s | 1.5–2.2 | 1 / 329–135 s | 115–175 / 226–232 s |
+| hrrn + interval 20 | 14.4 | 13 | 2.0 s | 13.6 | 71 / 180 s | 67 / 400 s |
+| **spf + interval 20** | **15.4** | **14** | 2.2 s | 13.6 | 71 / **86 s** | **66 / 313 s** |
+| lpm + interval 20 | 14.7 | 14 | 2.6 s | 13.3 | 1 / 299 s | 81 / 313 s |
+
+The interval is the decisive knob: without it every policy freezes decode
+for minutes; with it the worst gap is ~2 s and agent turns complete at
+10–20 tok/s. Its cost under a flood is 10–20% slower prefill drain, which
+the real traffic here (decode concurrency ~1, 45% of prefills mostly
+cached) never sees. The interval value barely matters (10/20/40 within
+noise); 20 is roughly equal GPU time for a chunk and a decode step.
+
+Policy matters once the interval is on: fcfs + interval was the slowest
+configuration of all, `shortest-prefill-first` the fastest, and the only one
+where no short prompt waited more than ~86 s (one 40k prefill: an arrival
+waits for the in-progress chunked request to finish, since that request
+takes the whole chunk budget each step; new requests join between
+requests, not between chunks). hrrn rates a fresh short prompt below a
+large one that has been waiting (response ratio ≈ 1 vs 3+), so shorts
+waited up to 180 s; lpm let one wait 299 s. The price of spf is that big
+uncached prompts queue behind small ones (the 50k prompt waited 476 s in
+the flood vs 241 s under fcfs); under sustained short traffic a huge prompt
+could in principle wait indefinitely, which the measured traffic does not
+produce.
+
+Default now: `--schedule-policy shortest-prefill-first
+--prefill-decode-interval 20` (in `QWEN38_EXTRA_ARGS`), with
+`--enable-cache-report` so `usage.prompt_tokens_details.cached_tokens` is
+returned. Raw results: `~/scratch/workload_results.jsonl`,
+`~/scratch/events/<label>.jsonl`, thermal CSVs in `~/scratch/thermal/`
+(GPU at the 135 W power limit throughout, 70–80 °C).
 ## Running the abliterated variant (DERISKED)
 
 `davetha/Qwen3.8-Flash-Next-DERISKED-W4A16-AWQ` is a refusal-ablated requant
