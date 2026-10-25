@@ -459,15 +459,42 @@ the measured ~225 GB/s) plus a long tail of small kernels; the MoE is now
 Upstream ships no fused-MoE Triton configs for `Radeon_8060S_Graphics`, so
 the int4 expert GEMMs ran on a generic tile. [`tools/tune_moe_gfx1151.py`](../tools/tune_moe_gfx1151.py)
 drives upstream's `benchmark/kernels/fused_moe_triton` tuner with a gfx1151
-search space (1,560 configs) and an early bail-out: a single eager run and
-then the first graph replay are timed, and a config is dropped as soon as it
-is 3× slower than the best so far. 35–60% of configs bail at each M, which
-took the sweep from an estimated day to about 7 GPU-hours on one 8060S with
-the server left running (it needs ~1.5 GB of VRAM). Each batch size runs in
-its own process (the Ray worker keeps every compiled kernel resident and the
-kernel OOM-killed a single-process sweep at M=64 on this 31 GB-host-RAM
-box), results are saved per M, and compiled kernels persist in the Triton
-cache, so an interrupted run resumes at replay speed.
+search space (1,560 configs) and three bail-outs against the best time so
+far: an eager run before graph capture (compared with the winner's own eager
+time, since at small M both are mostly launch overhead), the first replay
+after capture (dropped at 3×, `MOE_TUNE_BAIL_FACTOR`), and a running total
+in the timed loop that stops the moment it reaches what the winner needed
+for the whole loop (exact: the average can no longer be lower). The winners
+of the nearest finished batch sizes and of `MOE_TUNE_SEED_FILE` (an existing
+config file, e.g. the one being re-tuned) are benchmarked first, so the
+budget is tight from config #1: a full M=2 sweep with compiles cached bails
+1,558 of 1,560 configs and takes ~2.5 minutes. The original 3×-only version
+took about 7 GPU-hours for 18 sizes. The server can stay up (the int4 sweep
+needs ~1.5 GB of VRAM, the bf16 draft sweep ~4.5 GB).
+
+Each batch size runs in its own process (the Ray worker keeps every compiled
+kernel resident and the kernel OOM-killed a single-process sweep at M=64 on
+this 31 GB-host-RAM box). Results are written as they happen with fsync and
+an atomic rename: `M=<m>.json` when a size finishes (finished sizes are
+skipped on rerun) and `progress-M=<m>.json` after every config, so a crash
+resumes at the next config and skips the one that killed the worker. The
+partial directory defaults to `~/.cache/sglang/moe-tune/<tag>` inside the
+container, i.e. `~/.cache/strix-halo-sglang-cache/moe-tune/` on the host
+(the launcher's cache mount), and compiled kernels go to the same persisted
+Triton cache the server uses, so a container restart loses nothing. Pass
+`MOE_TUNE_PARTIAL_DIR` to name the directory yourself.
+
+Batch sizes are visited by bisection (smallest, largest, then the midpoint
+of each unresolved interval). When the nearest finished sizes on both sides
+of an M picked the same tile and are adjacent to it in the size list
+(`MOE_TUNE_BISECT_MAX_GAP`, default 2, so no bracket wider than 4× is ever
+skipped), that M only gets a quick check of the neighbours' winners instead
+of a full sweep; where they disagree the regime is changing and the midpoint
+is swept in full. `MOE_TUNE_BISECT=0` restores the ascending sweep. At the
+large sizes a full sweep is replay-bound (one bf16 draft invocation at
+M=1024 is 23 ms, so a config costs ~3 s and an M about 85 minutes); sizes
+above the prefill chunk (`--chunked-prefill-size`, 1024 here) are never
+run by the server and are not worth tuning.
 
 Kernel time for one MoE layer (M = tokens in the step; ×48 layers per step):
 
@@ -485,6 +512,10 @@ Kernel time for one MoE layer (M = tokens in the step; ×48 layers per step):
 | 1,024 | 12,671 µs | 5,814 µs | 32×16×64, 1 warp |
 | 2,048 | 14,314 µs | 9,145 µs | 64×16×32, 1 warp |
 | 4,096 | 22,483 µs | 14,761 µs | 128×64×32, 4 warps |
+
+(Table from the cyankiwi g32 checkpoint, half-width shard. It does not carry
+over to g128: `group_size` is a kernel constexpr, and on the Swift checkpoint
+`16×32×64` measures 228 µs at M=1 where `16×16×64` takes 98 µs.)
 
 The same lesson as the Qwen3.5 hand sweep: at decode sizes the kernel is
 bound by how many workgroups it can put on 40 CUs, so the smallest tiles
