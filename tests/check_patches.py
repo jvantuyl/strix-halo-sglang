@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import py_compile
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -146,7 +147,14 @@ def main() -> int:
     except subprocess.CalledProcessError as e:
         print(f"  ✗ fetch failed: {e.stderr.decode()[:300]}")
         return 1
+    # The clone is ~175 MB and lands under TMPDIR, often a tmpfs; never leave it.
+    try:
+        return check_pinned_tree(src, steps)
+    finally:
+        shutil.rmtree(src, ignore_errors=True)
 
+
+def check_pinned_tree(src: Path, steps: list[tuple[str, str]]) -> int:
     print("Dependency groups at the pin:")
     pyproject = src / "python" / "pyproject_other.toml"
     text = pyproject.read_text() if pyproject.is_file() else ""
