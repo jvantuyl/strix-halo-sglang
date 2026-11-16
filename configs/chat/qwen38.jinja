@@ -69,16 +69,18 @@
 {%- set reasoning_instructions = '' %}
 {%- if enable_thinking is undefined or enable_thinking is true %}
     {%- set resolved_reasoning_effort = (reasoning_effort|default('xhigh', true))|string|lower %}
-    {%- set effort_aliases = {'none': 'low', 'minimal': 'low', 'high': 'xhigh'} %}
+    {%- set effort_aliases = {'none': 'low', 'minimal': 'low', 'high': 'xhigh', 'max': 'xhigh', 'ultra': 'xhigh'} %}
     {%- if resolved_reasoning_effort in effort_aliases %}
         {%- set resolved_reasoning_effort = effort_aliases[resolved_reasoning_effort] %}
     {%- endif %}
     {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
-        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low; none, minimal and high are mapped onto them.') }}
+        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low; none, minimal, high, max and ultra are mapped onto them.') }}
     {%- endif %}
     {%- if resolved_reasoning_effort == 'xhigh' %}
         {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
-    {%- elif resolved_reasoning_effort == 'low' %}
+    {%- elif resolved_reasoning_effort == 'medium' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to medium. Think through the task with moderate depth, checking the key assumptions, and do not spend more thinking than the task needs.' %}
+    {%- else %}
         {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
     {%- endif %}
 {%- endif %}

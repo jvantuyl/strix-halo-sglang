@@ -3,10 +3,13 @@
 
 Without `default_system_prompt` every rendering must be byte-identical to the
 stock template once the control-token marks (U+E000/U+E001, consumed by patch
-32's encoder; tests/check_control_token_encoder.py covers them) are removed;
-with it, the prompt must appear once, in the system block, after the
-reasoning-effort instruction and before the client's own system message. Runs
-inside the image (needs the tokenizer):
+32's encoder; tests/check_control_token_encoder.py covers them) are removed,
+except for the one paragraph the repo template adds: an instruction for
+`reasoning_effort="medium"`, which stock leaves without one. With the prompt,
+it must appear once, in the system block, after the reasoning-effort
+instruction and before the client's own system message. The effort aliases
+(stock's none/minimal/high plus the repo's max/ultra) must render exactly as
+their targets. Runs inside the image (needs the tokenizer):
 
     docker run --rm -v <model>:/models/qwen38:ro -v <repo>:/repo:ro \
         strix-halo-sglang:dev python3 /repo/tests/check_chat_template.py
@@ -23,6 +26,12 @@ TEMPLATE = os.environ.get(
     "CHAT_TEMPLATE", os.path.join(os.path.dirname(__file__), "..", "configs", "chat", "qwen38.jinja")
 )
 PROMPT = "If you are unsure or do not know something, say so plainly instead of guessing."
+# The repo template's own paragraph; stock gives medium effort no instruction.
+MEDIUM = (
+    "Reasoning effort is set to medium. Think through the task with moderate depth, "
+    "checking the key assumptions, and do not spend more thinking than the task needs."
+)
+ALIASES = {"none": "low", "minimal": "low", "high": "xhigh", "max": "xhigh", "ultra": "xhigh"}
 
 TOOLS = [
     {
@@ -76,6 +85,17 @@ def unmark(rendered):
     return rendered.replace("\ue000", "").replace("\ue001", "")
 
 
+def without(rendered, paragraph):
+    # Remove one paragraph: either a whole system block of its own, or one
+    # paragraph of a larger one (followed or preceded by a blank line).
+    alone = "<|im_start|>system\n" + paragraph + "<|im_end|>\n"
+    if alone in rendered:
+        return rendered.replace(alone, "", 1)
+    if paragraph + "\n\n" in rendered:
+        return rendered.replace(paragraph + "\n\n", "", 1)
+    return rendered.replace("\n\n" + paragraph, "", 1)
+
+
 def main():
     tok = AutoTokenizer.from_pretrained(MODEL)
     stock = tok.chat_template
@@ -96,7 +116,14 @@ def main():
         )
         label = f"{name} | {kwargs or 'defaults'} | tools={'yes' if tools else 'no'}"
         cases += 1
-        if got != want or got_empty != want:
+        medium = kwargs.get("reasoning_effort") == "medium"
+        if medium and got.count(MEDIUM) != 1:
+            failures += 1
+            print(f"FAIL {label}: medium instruction appears {got.count(MEDIUM)} times")
+            continue
+        # Stock has no medium paragraph; everything else must match it exactly.
+        norm = (lambda s: without(s, MEDIUM)) if medium else (lambda s: s)
+        if norm(got) != want or norm(got_empty) != want:
             failures += 1
             print(f"FAIL {label}: differs from stock without a prompt")
             continue
@@ -123,21 +150,28 @@ def main():
             failures += 1
             print(f"FAIL {label}: tool list precedes the prompt")
             continue
-        # Removing the prompt paragraph must give the stock rendering back: the
-        # prompt is either a whole system block of its own, or one paragraph
-        # of a larger one (followed or preceded by a blank line).
-        alone = "<|im_start|>system\n" + PROMPT + "<|im_end|>\n"
-        if alone in got_prompt:
-            stripped = got_prompt.replace(alone, "", 1)
-        elif PROMPT + "\n\n" in got_prompt:
-            stripped = got_prompt.replace(PROMPT + "\n\n", "", 1)
-        else:
-            stripped = got_prompt.replace("\n\n" + PROMPT, "", 1)
-        if stripped != want:
+        # Removing the prompt paragraph must give the stock rendering back.
+        if norm(without(got_prompt, PROMPT)) != want:
             failures += 1
             print(f"FAIL {label}: prompt changes more than its own paragraph")
             continue
     tok.chat_template = ours
+    for alias, target in ALIASES.items():
+        cases += 1
+        renders = [
+            unmark(
+                tok.apply_chat_template(
+                    CONVERSATIONS["system + user"],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    reasoning_effort=effort,
+                )
+            )
+            for effort in (alias, target)
+        ]
+        if renders[0] != renders[1]:
+            failures += 1
+            print(f"FAIL alias {alias}: does not render as {target}")
     sample = unmark(
         tok.apply_chat_template(
             CONVERSATIONS["system + user"],
@@ -149,7 +183,7 @@ def main():
     )
     print("sample (medium effort, prompt, client system message):")
     print(sample)
-    print(f"{cases - failures}/{cases} cases identical to stock modulo the prompt paragraph")
+    print(f"{cases - failures}/{cases} cases identical to stock modulo the prompt and medium paragraphs")
     sys.exit(1 if failures else 0)
 
 
