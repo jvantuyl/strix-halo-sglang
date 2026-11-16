@@ -37,7 +37,10 @@ upstream rewrite fails the build. See patches/35-event-stream.md.
 import os
 import sys
 
-SRT = "/sgl-workspace/sglang/python/sglang/srt"
+# The tree to patch: the image's checkout by default, or the one named on the
+# command line (tests/check_patches.py replays every step against a clone).
+TREE = sys.argv[1] if len(sys.argv) > 1 else "/sgl-workspace/sglang"
+SRT = f"{TREE}/python/sglang/srt"
 MODULE = f"{SRT}/observability/event_stream.py"
 REPORTER = f"{SRT}/managers/scheduler_components/metrics_reporter.py"
 TOKENIZER = f"{SRT}/managers/tokenizer_manager.py"
