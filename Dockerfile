@@ -405,6 +405,19 @@ RUN python3 /tmp/patch_control_token_mm.py && rm /tmp/patch_control_token_mm.py
 # See patches/35-event-stream.md.
 COPY patches/patch_event_stream.py /tmp/patch_event_stream.py
 RUN python3 /tmp/patch_event_stream.py && rm /tmp/patch_event_stream.py
+
+# --- tool-call parameters survive a missing closer and an unread schema (patch 36) ---
+# The qwen3_coder parser hands an array/object value the model ended one
+# closer short ("...}}" for "...}}}") to the client as a string, which then
+# fails the client's schema check as the wrong shape; 14 of 18 journal cases
+# were exactly that. A value that ends outside a string with containers still
+# open is closed and accepted only when its type matches the schema, with one
+# warning. get_schema_properties() also merges anyOf/oneOf/allOf branches with
+# top-level properties and resolves local $ref, so a property it could not see
+# is typed instead of returned as text. See patches/36-tool-param-recovery.md.
+COPY patches/patch_tool_param_recovery.py /tmp/patch_tool_param_recovery.py
+RUN python3 /tmp/patch_tool_param_recovery.py && rm /tmp/patch_tool_param_recovery.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"
