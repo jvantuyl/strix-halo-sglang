@@ -55,13 +55,14 @@ def test_cache_semantics():
 
     slots1 = np.full(32, -2, dtype=np.int32)
     c.prepare(keys, slots1, fill)
-    check("first-touch-enqueue-only", len(filled) == 0 and (slots1 < 0).all())
+    check("first-touch-all-miss", (slots1 < 0).all())
 
-    keys_b = np_from(list(range(500, 532)))
-    slots_b = np.full(32, -2, dtype=np.int32)
-    c.prepare(keys_b, slots_b, fill)
-    check("lag-fill-on-second-prepare", len(filled) == 1 and (filled[0] == keys).all())
-    c._insert_batch(keys, payload)  # what the fill actually does
+    # the caller flushes after its own compute: this batch's misses are
+    # filled post-compute (one-chunk lag relative to the miss, off the
+    # critical path)
+    c.flush_pending(fill)
+    check("fill-on-flush", len(filled) == 1 and (filled[0] == keys).all())
+    c._insert_batch(keys, payload)  # overwrite the zeros the test fill gave
 
     slots2 = np.full(32, -2, dtype=np.int32)
     c.prepare(keys, slots2, fill)
@@ -71,7 +72,7 @@ def test_cache_semantics():
         (c.payload[slots2] == payload).all(),
         "cached bytes must match mmap bytes",
     )
-    check("counters", c._cumulative["hits"] == 32 and c._cumulative["misses"] == 64)
+    check("counters", c._cumulative["hits"] == 32 and c._cumulative["misses"] == 32)
 
     # SIEVE eviction under pressure + survivor payload integrity
     more = np_from(list(range(1000, 1100)))

@@ -272,7 +272,7 @@ class PleHotsetCache:
     # ---- public API -----------------------------------------------------
     def prepare(self, local_ids: np.ndarray, slots_out: np.ndarray,
                 fill_rows_fn) -> None:
-        """Probe this batch, write slot indices, fill the previous misses.
+        """Probe this batch, write slot indices, defer the previous fills.
 
         local_ids: LOCAL row ids for every gather position (out-of-window
         positions arrive as -1 and keep slot -1). slots_out: int32 array of
@@ -299,13 +299,11 @@ class PleHotsetCache:
                     -1,
                 )
                 slots_out[:] = flat_slots.astype(np.int32)
-                # fill the previous batch's misses (one-chunk lag)
-                pending = self._pending_misses
+                # Defer the previous batch's fills to flush_pending: the
+                # caller fills AFTER its own output is computed, so the fill
+                # cost lands outside the prep critical path (order-based
+                # overlap — same thread, no races).
                 self._pending_misses = uniq[hit < 0]
-                if pending.size:
-                    rows = fill_rows_fn(pending)
-                    self._insert_batch(pending, rows)
-                    self._bump(fills=int(pending.size))
                 self._bump(
                     gathers=1, rows=int(local_ids.size),
                     rows_unique=int(uniq.size), hits=hits,
@@ -315,6 +313,22 @@ class PleHotsetCache:
                 self.enabled = False
                 self.errors += 1
                 slots_out[:] = -1
+
+    def flush_pending(self, fill_rows_fn) -> None:
+        """Fill the previous batch's misses from the mmap (one-chunk lag)."""
+        if not self.enabled:
+            return
+        with self._lock:
+            try:
+                pending = self._pending_misses
+                self._pending_misses = np.zeros(0, dtype=np.int64)
+                if pending.size:
+                    rows = fill_rows_fn(pending)
+                    self._insert_batch(pending, rows)
+                    self._bump(fills=int(pending.size))
+            except Exception:
+                self.enabled = False
+                self.errors += 1
 
     def drain(self, cumulative: bool = False):
         with self._lock:
@@ -438,6 +452,9 @@ CPU_GATHER_NEW = """    host_ids = flat_ids.detach().to("cpu")
                 0, local_idx[miss_pos]
             ).to(torch.bfloat16)
         output.view(-1, embedding.embedding_dim).copy_(rows)
+        cache.flush_pending(
+            lambda hit_rows: embedding.weight.view(torch.uint8)[hit_rows].numpy()
+        )
         return
     rows = embedding.weight.data.index_select(0, local_idx).to(torch.bfloat16)
     rows = torch.where(in_range.unsqueeze(1), rows, torch.zeros_like(rows))
