@@ -12,6 +12,7 @@ real mapping, not mocks):
   data, and returns "" when the counters are empty
 """
 
+import inspect
 import mmap
 import os
 import sys
@@ -74,6 +75,13 @@ def check_stats_counters():
 def check_reporter_suffix():
     from sglang.srt.managers.scheduler_components import metrics_reporter
 
+    # the reporter must actually CALL the suffix on the prefill message
+    # (a missing call site once shipped: def present, call forgotten)
+    src = inspect.getsource(metrics_reporter)
+    assert "msg += _ple_stats_msg_suffix()" in src, (
+        "metrics_reporter never appends the PLE suffix to the status line"
+    )
+
     m.PLE_HIT_STATS.record(1024, 1000, 990, 300)
     suffix = metrics_reporter._ple_stats_msg_suffix()
     assert "PLE: 1000/1024 rows" in suffix, suffix
@@ -84,10 +92,39 @@ def check_reporter_suffix():
     )
 
 
+def check_decorator_placement():
+    """Patch 45 once inserted its helper between @triton.jit and the kernel
+    def, stealing the decorator — the boot then died at graph capture with
+    "Cannot call @triton.jit'd outside of the scope of a kernel". Assert the
+    decorator sits directly above the kernel definition.
+    """
+    import inspect
+
+    import sglang.srt.models.qwen4_exp as qe
+
+    src = inspect.getsource(qe)
+    lines = src.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("def _gather_ple_embedding_from_pinned_kernel("):
+            decor = lines[i - 1].strip()
+            assert decor == "@triton.jit", (
+                f"kernel def not decorated by @triton.jit, got: {decor!r}"
+            )
+            return
+        if line.startswith("def _ple_record_gather_stats("):
+            continue  # helper must NOT be decorated; checked implicitly below
+    raise AssertionError("kernel def not found in qwen4_exp source")
+    # also: the helper must not have become a JITFunction
+    assert not hasattr(qe._ple_record_gather_stats, "fn"), (
+        "_ple_record_gather_stats became a @triton.jit JITFunction again"
+    )
+
+
 def main():
     check_pages_for_rows()
     check_mincore_ground_truth()
     check_stats_counters()
+    check_decorator_placement()
     check_reporter_suffix()
     print("check_ple_hit_stats: all green")
 

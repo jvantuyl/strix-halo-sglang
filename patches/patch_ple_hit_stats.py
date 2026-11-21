@@ -169,7 +169,8 @@ GATHER_ANCHOR = """        if flat_ids.numel():
 GATHER_NEW = GATHER_ANCHOR + """
             _ple_record_gather_stats(self, flat_ids)"""
 
-HELPER_ANCHOR = """def _gather_ple_embedding_from_pinned_kernel("""
+HELPER_ANCHOR = """@triton.jit
+def _gather_ple_embedding_from_pinned_kernel("""
 
 HELPER_NEW = '''def _ple_record_gather_stats(embedding, flat_ids) -> None:
     """gfx1151 patch 45: count rows/pages and mincore their residency.
@@ -202,6 +203,7 @@ HELPER_NEW = '''def _ple_record_gather_stats(embedding, flat_ids) -> None:
         stats.note_error()
 
 
+@triton.jit
 def _gather_ple_embedding_from_pinned_kernel('''
 
 REPORTER_MODULE_ANCHOR = "LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()"
@@ -283,6 +285,7 @@ def main() -> None:
         REPORTER_MODULE_ANCHOR + "\n\n" + _build_reporter_suffix_block().rstrip(),
         1,
     )
+    rtext = rtext.replace(REPORTER_PREFILL_ANCHOR, REPORTER_PREFILL_NEW, 1)
     with open(rep, "w") as f:
         f.write(rtext)
 
