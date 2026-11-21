@@ -15,8 +15,13 @@ evictable, 8 GiB-budget trimmer; the hot set is private and pinned.
 
 * `SGLANG_QWEN4_PLE_HOTSET_ROWS` (default 1048576 ≈ 152 MiB ≈ the census's
   99%-coverage point; `0` disables).
-* Cold on restart (no persistence in the MVP; keys-only snapshot is the
-  planned follow-up).
+* Warm start: a keys-only checksummed snapshot beside the table
+  (`<table dir>/hotset-snapshot.bin`, ~8 B/row, atomic rename, sha256
+  digest, fingerprinted to the table file's size+mtime and the shard
+  range). On boot the key set is restored and the payload bytes are
+  re-gathered from the mmap in row-id order (a sorted ~39k-page sweep,
+  a few seconds), so the cache is warm from the first prefill. Saved by
+  the scheduler thread at most every 5 minutes when the size changed.
 * Capacity overflow, mlock failure, or any internal error degrades to the
   stock mmap path — the cache can only fail towards today's behavior.
 
@@ -79,5 +84,4 @@ unchanged.
 
 ## Follow-up (scheduled)
 
-* Keys-only checksummed snapshot (~5 MiB, atomic rename) to warm-start
-  after restart; payloads are a pure function of the read-only table.
+* (none currently; snapshot persistence shipped)

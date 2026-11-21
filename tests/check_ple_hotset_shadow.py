@@ -111,6 +111,68 @@ def test_cache_semantics():
     check("rehash-consistent", r.size == len(np.unique(r.keys[r.keys >= 0])))
 
 
+def test_snapshot():
+    """Keys-only snapshot: round-trip, fingerprint rejection, corruption."""
+    import hashlib
+    import os
+    import tempfile
+
+    from sglang.srt.utils.ple_hotset import (
+        PleHotsetCache,
+        load_hotset_snapshot,
+        save_hotset_snapshot,
+    )
+
+    ROW = 160
+    keys = np.arange(100, 132)
+    payload = np.arange(32 * ROW, dtype=np.uint8).reshape(32, ROW)
+    src = PleHotsetCache(64, ROW)
+    src._insert_batch(keys, payload)
+    with tempfile.TemporaryDirectory() as d:
+        tbl = os.path.join(d, "table.bin")
+        with open(tbl, "wb") as f:
+            f.write(b"x" * 1024)
+        path = os.path.join(d, "hotset-snapshot.bin")
+        ok = save_hotset_snapshot(path, src, 0, 10000, tbl)
+        check("snapshot-save", ok and os.path.exists(path))
+        k = load_hotset_snapshot(path, 0, 10000, tbl)
+        check("snapshot-roundtrip", k is not None and (k == keys).all())
+
+        # restore: same keys, re-gathered payloads, fully warm on first probe
+        dst = PleHotsetCache(64, ROW)
+        n = dst.restore(keys, payload)
+        slots = np.full(32, -2, dtype=np.int32)
+        dst.prepare(keys, slots, lambda rows: None)
+        check(
+            "snapshot-restore-warm",
+            n == 32 and (slots >= 0).all() and (dst.payload[slots] == payload).all(),
+        )
+
+        # fingerprint mismatch (different table) must reject
+        tbl2 = os.path.join(d, "table2.bin")
+        with open(tbl2, "wb") as f:
+            f.write(b"y" * 1024)
+        check(
+            "snapshot-foreign-rejected",
+            load_hotset_snapshot(path, 0, 10000, tbl2) is None,
+        )
+        # shard mismatch must reject
+        check(
+            "snapshot-shard-rejected",
+            load_hotset_snapshot(path, 5, 10005, tbl) is None,
+        )
+        # corrupted bytes must reject (digest)
+        blob = bytearray(open(path, "rb").read())
+        blob[60] ^= 0xFF
+        bad = os.path.join(d, "bad.bin")
+        open(bad, "wb").write(bytes(blob))
+        check("snapshot-corrupt-rejected", load_hotset_snapshot(bad, 0, 10000, tbl) is None)
+
+        # snapshot size: keys-only ~8 B/row
+        sz = os.path.getsize(path)
+        check("snapshot-size", sz < 64 + keys.size * 8 + 64, f"{sz} bytes")
+
+
 def np_from(vals, dtype=None, flat=False):
     if dtype is None:
         dtype = np.int64
@@ -196,6 +258,7 @@ def main():
     import numpy as np
 
     test_cache_semantics()
+    test_snapshot()
     test_numerics()
     print(f"\n{'FAILED: ' + ', '.join(FAILURES) if FAILURES else 'ALL PASS'}")
     sys.exit(1 if FAILURES else 0)

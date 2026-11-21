@@ -38,7 +38,9 @@ HOTSET_MODULE = '''"""gfx1151 patch 46: PLE read-through hot-set cache (RAM MVP)
 
 import ctypes
 import os
+import struct
 import threading
+import time
 
 import numpy as np
 
@@ -82,6 +84,13 @@ class PleHotsetCache:
         self._interval = self._zero()
         self._cumulative = self._zero()
         self._pending_misses = np.zeros(0, dtype=np.int64)
+        self.snapshot_path = ""
+        self.save_interval_s = 300.0
+        self._last_save = time.monotonic()
+        self._saved_size = -1
+        self._shard_start = 0
+        self._shard_end = 0
+        self._table_path = ""
         self.errors = 0
         self.enabled = True
         self._mlock()
@@ -319,6 +328,18 @@ class PleHotsetCache:
         if not self.enabled:
             return
         with self._lock:
+            now = time.monotonic()
+            if (
+                self.snapshot_path
+                and now - self._last_save >= self.save_interval_s
+                and self.size != self._saved_size
+            ):
+                self._last_save = now
+                self._saved_size = self.size
+                save_hotset_snapshot(
+                    self.snapshot_path, self, self._shard_start,
+                    self._shard_end, self._table_path,
+                )
             try:
                 pending = self._pending_misses
                 self._pending_misses = np.zeros(0, dtype=np.int64)
@@ -330,6 +351,24 @@ class PleHotsetCache:
                 self.enabled = False
                 self.errors += 1
 
+    def restore(self, keys: np.ndarray, payloads: np.ndarray) -> int:
+        """Bulk-load a warm snapshot: keys + payload bytes, mmap-sorted.
+
+        Called once at construction, before any serving; bypasses the
+        SIEVE order (FIFO in row-id order) and never evicts: the caller
+        must keep keys.size <= capacity.
+        """
+        if keys.size > self.n:
+            keys = keys[: self.n]
+            payloads = payloads[: self.n]
+        inserted = 0
+        chunk = 1 << 16
+        for i in range(0, keys.size, chunk):
+            self._insert_batch(keys[i: i + chunk], payloads[i: i + chunk])
+            inserted += min(chunk, keys.size - i)
+        self._bump(fills=inserted)
+        return inserted
+
     def drain(self, cumulative: bool = False):
         with self._lock:
             d = dict(self._cumulative if cumulative else self._interval)
@@ -340,6 +379,81 @@ class PleHotsetCache:
             d["size"] = self.size
             d["mlocked"] = self.mlocked
             return d
+
+
+_SNAPSHOT_MAGIC = b"PLHS"
+_SNAPSHOT_VERSION = 1
+
+
+def _snapshot_fingerprint(table_path: str) -> tuple:
+    st = os.stat(table_path)
+    return st.st_size, st.st_mtime_ns
+
+
+def save_hotset_snapshot(path: str, cache: "PleHotsetCache",
+                         shard_start: int, shard_end: int,
+                         table_path: str) -> bool:
+    """Keys-only, checksummed snapshot; atomic rename. ~8 B/row.
+
+    Payloads are a pure function of the read-only table, so only the key
+    set is persisted; restore re-gathers bytes from the mmap.
+    """
+    try:
+        keys = cache.keys[cache.keys >= 0]
+        import hashlib
+        header = (
+            _SNAPSHOT_MAGIC
+            + struct.pack(
+                "<BQQqqQQ", _SNAPSHOT_VERSION, cache.n, keys.size,
+                shard_start, shard_end, *_snapshot_fingerprint(table_path),
+            )
+        )
+        digest = hashlib.sha256(header + keys.tobytes()).digest()
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(header)
+            f.write(keys.tobytes())
+            f.write(digest)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def load_hotset_snapshot(path: str, shard_start: int, shard_end: int,
+                         table_path: str):
+    """Return the validated key array, or None (absent/corrupt/foreign)."""
+    try:
+        import hashlib
+        st_size = os.path.getsize(path)
+        if st_size < 64:
+            return None
+        with open(path, "rb") as f:
+            blob = f.read()
+        # header: 4-byte magic + packed "<BQQqqQQ" (1+8*6) = 53 bytes
+        header = blob[:53]
+        if header[:4] != _SNAPSHOT_MAGIC or header[4] != _SNAPSHOT_VERSION:
+            return None
+        ver, n, size, s_start, s_end, fp_size, fp_mtime = struct.unpack(
+            "<BQQqqQQ", header[4:]
+        )
+        if ver != _SNAPSHOT_VERSION:
+            return None
+        if (fp_size, fp_mtime) != _snapshot_fingerprint(table_path):
+            return None
+        if s_start != shard_start or s_end != shard_end:
+            return None
+        keys = np.frombuffer(blob, dtype=np.int64, count=size, offset=53).copy()
+        digest = blob[53 + keys.nbytes: 53 + keys.nbytes + 32]
+        if hashlib.sha256(blob[:53 + keys.nbytes]).digest() != digest:
+            return None
+        if keys.size and (keys.min() < 0 or keys.max() >= shard_end - shard_start):
+            return None
+        return keys
+    except Exception:
+        return None
 
 
 _PLE_HOTSET = None
@@ -476,6 +590,42 @@ HOTSET_ATTACH_NEW = """        # gfx1151 patch 46: read-through hot-set cache (R
             else None
         )
         self._hotset_slots = np.zeros(1 << 18, dtype=np.int32)
+        # gfx1151 patch 46: warm-start from the keys-only snapshot beside
+        # the table (payloads are re-gathered from the mmap, row-id-sorted
+        # so the scattered 4 KiB page reads sweep the file in order).
+        if self._hotset is not None:
+            from sglang.srt.utils.ple_hotset import load_hotset_snapshot
+
+            _tbl = getattr(host_table, "_sglang_ple_file_path", None)
+            _s = self.shard_indices
+            self._hotset._shard_start = _s.org_vocab_start_index
+            self._hotset._shard_end = _s.org_vocab_end_index
+            self._hotset._table_path = _tbl or ""
+            self._hotset.snapshot_path = (
+                _os.path.join(_os.path.dirname(_tbl), "hotset-snapshot.bin")
+                if _tbl
+                else ""
+            )
+            if self._hotset.snapshot_path and _tbl:
+                try:
+                    _keys = load_hotset_snapshot(
+                        self._hotset.snapshot_path,
+                        _s.org_vocab_start_index,
+                        _s.org_vocab_end_index,
+                        _tbl,
+                    )
+                    if _keys is not None and _keys.size:
+                        _order = np.argsort(_keys)
+                        _keys = _keys[_order]
+                        _payloads = (
+                            host_table.view(torch.uint8)[
+                                torch.from_numpy(_keys)
+                            ]
+                            .numpy()
+                        )
+                        self._hotset.restore(_keys, _payloads)
+                except Exception:
+                    pass  # a failed warm start is just a cold start
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)"""
 
@@ -500,22 +650,67 @@ def main() -> None:
     qwen = os.path.join(root, "models", "qwen4_exp.py")
     with open(qwen) as f:
         text = f.read()
-    # Idempotent re-apply: if a previous run of this patch is present,
-    # unapply its qwen4_exp.py edits first (the module file is rewritten
-    # from scratch below; the reporter edit is reversed the same way).
+    # Idempotent re-apply: excise any previous variant of this patch's
+    # edits by their comment markers (version-skew-proof), then re-apply.
+    # qwen4_exp.py: numpy import, ple_hotset import lines, attach block,
+    # gather fast path.
     if "ple_hotset" in text:
-        text = text.replace(NP_IMPORT_NEW, NP_IMPORT_OLD, 1)
-        text = text.replace(QWEN_IMPORT_NEW, QWEN_IMPORT_ANCHOR, 1)
-        text = text.replace(HOTSET_ATTACH_NEW, HOTSET_ATTACH_OLD, 1)
-        text = text.replace(CPU_GATHER_NEW, CPU_GATHER_OLD, 1)
+        text = text.replace("import numpy as np\nimport torch", "import torch")
+        _out, _skip = [], False
+        for ln in text.split("\n"):
+            if "ple_hotset import" in ln:
+                _skip = ln.rstrip().endswith("(")
+                continue
+            if _skip:
+                _skip = not ln.rstrip().startswith(")")
+                continue
+            _out.append(ln)
+        text = "\n".join(_out)
+        while True:
+            a = text.find(
+                "        # gfx1151 patch 46: read-through hot-set cache (RAM MVP)."
+            )
+            if a < 0:
+                break
+            b = text.find(
+                "        # Only the file backend has anything to prefetch",
+                a,
+            )
+            if b < 0:
+                break
+            text = text[:a] + text[b:]
+        while True:
+            a = text.find("    cache = embedding._hotset")
+            if a < 0:
+                break
+            b = text.find(
+                "    rows = embedding.weight.data.index_select", a
+            )
+            if b < 0:
+                break
+            text = text[:a] + text[b:]
     rep = os.path.join(root, "managers", "scheduler_components",
                        "metrics_reporter.py")
     with open(rep) as f:
         rtext = f.read()
-    if REPORTER_NEW in rtext:
-        rtext = rtext.replace(REPORTER_NEW, REPORTER_OLD, 1)
-        with open(rep, "w") as f:
-            f.write(rtext)
+    if "ple_hotset" in rtext:
+        a = rtext.find(
+            "        from sglang.srt.utils.ple_hotset import get_ple_hotset"
+        )
+        b = rtext.find('    except Exception:\n        return ""', a)
+        if a >= 0 and b >= 0:
+            rtext = (
+                rtext[:a]
+                + """        return (
+            f", PLE: {s['rows_unique']}/{s['rows']} rows, "
+            f"{s['pages_resident']}/{s['pages']} pages res, "
+            f"{s['errors']} err"
+        )
+"""
+                + rtext[b:]
+            )
+            with open(rep, "w") as f:
+                f.write(rtext)
     for name, anchor in (
         ("import", QWEN_IMPORT_ANCHOR),
         ("cpu-gather", CPU_GATHER_OLD),
