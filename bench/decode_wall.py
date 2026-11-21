@@ -54,6 +54,42 @@ LONG_SYSTEM = (
 )
 
 
+def build_paragraph_prompt(corpus_path, n_paragraphs, shuffle_seed):
+    """Paragraph-shuffle probe: same paragraph multiset, randomized order.
+
+    The radix cache kills any repeated prompt, and fully different text
+    changes the n-gram (PLE row) working set. Shuffling a fixed set of
+    independent paragraphs defeats the radix prefix (the order differs
+    from the very first paragraph) while keeping the overall n-gram
+    distribution identical across runs — so run-to-run TTFT deltas
+    measure PLE row-cache warmth, not content differences.
+
+    Paragraph selection is deterministic (selection seed 0); only the
+    order varies with shuffle_seed.
+    """
+    rng = random.Random(0)
+    with open(corpus_path) as f:
+        lines = f.readlines()
+    rng.shuffle(lines)
+    paragraphs = []
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        text = d.get("chosen", "").strip()
+        # Independent significant paragraphs: long enough to carry real
+        # n-gram content, short enough to be one coherent unit.
+        if 400 <= len(text) <= 4000:
+            paragraphs.append(text)
+        if len(paragraphs) >= n_paragraphs:
+            break
+    if len(paragraphs) < n_paragraphs:
+        raise SystemExit(f"corpus only yielded {len(paragraphs)} paragraphs")
+    random.Random(shuffle_seed).shuffle(paragraphs)
+    return "\n\n".join(paragraphs) + LONG_TASK
+
+
 def build_long_prompt(corpus_path, target_tokens, seed=0):
     """Concatenate corpus 'prompt'/'chosen' fields up to ~target_tokens."""
     rng = random.Random(seed)
@@ -98,6 +134,7 @@ def run_once(url, model, prompt, max_tokens, system=None):
     t0 = time.time()
     ttft = None
     tokens = 0
+    prompt_tokens = None
     with urllib.request.urlopen(req, timeout=1200) as r:
         for line in r:
             if not line.startswith(b"data: "):
@@ -106,8 +143,11 @@ def run_once(url, model, prompt, max_tokens, system=None):
             if body == b"[DONE]":
                 break
             d = json.loads(body)
-            if d.get("usage", {}).get("completion_tokens"):
-                tokens = d["usage"]["completion_tokens"]
+            usage = d.get("usage") or {}
+            if usage.get("completion_tokens"):
+                tokens = usage["completion_tokens"]
+            if usage.get("prompt_tokens"):
+                prompt_tokens = usage["prompt_tokens"]
             elif d.get("choices"):
                 # One token per choices-carrying delta chunk in SGLang
                 # streaming; the usage chunk (if any) overrides above.
@@ -117,7 +157,7 @@ def run_once(url, model, prompt, max_tokens, system=None):
                     if delta.get("reasoning_content") or delta.get("content"):
                         ttft = time.time() - t0
     wall = time.time() - t0
-    return wall, ttft, tokens
+    return wall, ttft, tokens, prompt_tokens
 
 
 def main():
@@ -129,34 +169,53 @@ def main():
     ap.add_argument("--context-tokens", type=int, default=None,
                     help="build an ~N-token prompt from --corpus")
     ap.add_argument("--corpus", default=None)
+    ap.add_argument("--paragraphs", type=int, default=None,
+                    help="paragraph-shuffle mode: N independent paragraphs, "
+                         "same multiset every run, order shuffled per run "
+                         "(defeats the radix cache, keeps the PLE row "
+                         "working set identical)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--prompt-file", default=None,
                     help="override the built-in short prompt")
     args = ap.parse_args()
 
-    if args.context_tokens:
+    if args.paragraphs:
+        if not args.corpus:
+            ap.error("--paragraphs requires --corpus")
+        mode = "paragraphs"
+        n_par = args.paragraphs
+        system = LONG_SYSTEM
+    elif args.context_tokens:
         if not args.corpus:
             ap.error("--context-tokens requires --corpus")
-        prompt = build_long_prompt(args.corpus, args.context_tokens, args.seed)
+        mode = "chars"
         system = LONG_SYSTEM
     else:
-        prompt = open(args.prompt_file).read().strip() if args.prompt_file else PROMPT
-        system = None
-
+        mode = None
+    system = LONG_SYSTEM if mode else None
     url = args.url.rstrip("/") + "/v1/chat/completions"
     results = []
     for i in range(args.runs):
-        if args.context_tokens:
+        if mode == "paragraphs":
+            prompt = build_paragraph_prompt(args.corpus, n_par, args.seed + i)
+        elif mode == "chars":
             # Vary the seed per run: an identical repeat prompt hits the
             # radix prefix cache and the TTFT stops measuring prefill.
             prompt = build_long_prompt(args.corpus, args.context_tokens,
                                        args.seed + i)
-        wall, ttft, tokens = run_once(url, args.model, prompt, args.max_tokens, system)
+        else:
+            prompt = PROMPT
+        wall, ttft, tokens, prompt_tokens = run_once(
+            url, args.model, prompt, args.max_tokens, system)
         results.append((wall, ttft, tokens))
         gen_tok = max(tokens - 0, 1)
+        extra = ""
+        if prompt_tokens and ttft:
+            extra = f"  prefill {prompt_tokens / ttft:6.0f} tok/s ({prompt_tokens} tok)"
         print(
             f"run {i + 1}: wall {wall:7.2f} s  ttft {ttft:6.2f} s  "
             f"gen {tokens:5d} tok  decode {gen_tok / max(wall - ttft, 1e-9):6.2f} tok/s"
+            + extra
         )
     walls = [w for w, _, _ in results]
     ttfts = [t for _, t, _ in results]
