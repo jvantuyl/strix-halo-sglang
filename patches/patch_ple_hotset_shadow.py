@@ -305,6 +305,7 @@ class PleHotsetCache:
                 if pending.size:
                     rows = fill_rows_fn(pending)
                     self._insert_batch(pending, rows)
+                    self._bump(fills=int(pending.size))
                 self._bump(
                     gathers=1, rows=int(local_ids.size),
                     rows_unique=int(uniq.size), hits=hits,
