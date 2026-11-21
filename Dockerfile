@@ -489,3 +489,18 @@ RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.pat
 EXPOSE 30000
 
 CMD ["python3", "-m", "sglang.launch_server", "--help"]
+
+# --- gfx1151 patch 47: unregistered model_type fallback (ROCm 10 base) ---
+# The ROCm 10 base ships transformers >= 5.12, whose AutoConfig raises for
+# model types outside its registry (5.5 returned a generic config); Qwen4Exp
+# checkpoints are exactly such an unregistered type. Keep the resolver's
+# transformers; fall back to a manual config.json load in the loader.
+COPY patches/patch_hf_unknown_model_type.py /tmp/patch_hf_unknown_model_type.py
+RUN python3 /tmp/patch_hf_unknown_model_type.py && rm /tmp/patch_hf_unknown_model_type.py
+
+# --- gfx1151 patch 48: SGLANG_QSA_TILELANG gate (ROCm 10 base) ---
+# The base's tilelang cannot compile the QSA indexer decode GEMM for our
+# geometry and dies at graph capture; SGLANG_QSA_TILELANG=0 selects the
+# validated Triton MQA kernels (patches 24/26). Default stays TileLang.
+COPY patches/patch_qsa_tilelang_gate.py /tmp/patch_qsa_tilelang_gate.py
+RUN python3 /tmp/patch_qsa_tilelang_gate.py && rm /tmp/patch_qsa_tilelang_gate.py

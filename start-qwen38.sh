@@ -202,6 +202,10 @@ fi
 # Extra `docker run` arguments (word-split), e.g. -e VAR=1 for engine env knobs.
 read -r -a DOCKER_ARGS <<< "${SGLANG_DOCKER_ARGS:-}"
 
+# Optional command prefix inside the container (word-split), e.g. wrap the
+# server in a profiler: SGLANG_COMMAND_PREFIX="rocprofv3 --kernel-trace ..." 
+read -r -a COMMAND_PREFIX <<< "${SGLANG_COMMAND_PREFIX:-}"
+
 if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
     echo "Note: removing existing container '$NAME'." >&2
     docker rm -f "$NAME" >/dev/null
@@ -239,6 +243,7 @@ docker run --name "$NAME" \
     "${STRICT_THINKING_ARGS[@]}" \
     "${DOCKER_ARGS[@]}" \
     "$IMAGE" \
+    "${COMMAND_PREFIX[@]}" \
     python3 -m sglang.launch_server \
         --model-path /models/qwen38 \
         --served-model-name "$SERVED_NAME" \

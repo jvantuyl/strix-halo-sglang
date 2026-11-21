@@ -35,15 +35,24 @@ ARCH_INFO = "/opt/venv/lib64/python3.12/site-packages/aiter/ops/triton/utils/_tr
 def patch_arch_info():
     with open(ARCH_INFO, encoding="utf-8") as f:
         t = f.read()
-    old = 'def is_fp4_avail():\n    return get_arch() in ("gfx950")'
-    new = 'def is_fp4_avail():\n    return get_arch() in ("gfx950", "gfx1151")'
-    if new in t:
+    # aiter's whitelist tuple changes between versions (gfx950 alone in the
+    # old base; gfx950+gfx1250 in the ROCm 10 base) — match it with a regex
+    # and append gfx1151 when missing, whatever the current set is.
+    m = re.search(
+        r'def is_fp4_avail\(\):\n    return get_arch\(\) in \(([^)]*)\)', t
+    )
+    assert m, f"arch_info anchor not found in {ARCH_INFO}"
+    arches = [a.strip().strip('"\'') for a in m.group(1).split(",") if a.strip()]
+    if "gfx1151" in arches:
         print("is_fp4_avail already patched")
         return
-    assert old in t, f"arch_info anchor not found in {ARCH_INFO}"
+    arches.append("gfx1151")
+    repl = 'def is_fp4_avail():\n    return get_arch() in (%s)' % ", ".join(
+        f'"{a}"' for a in arches
+    )
     with open(ARCH_INFO, "w", encoding="utf-8") as f:
-        f.write(t.replace(old, new))
-    print("patched is_fp4_avail")
+        f.write(t.replace(m.group(0), repl))
+    print("patched is_fp4_avail:", repl.splitlines()[-1])
 
 
 # RDNA 3.5 (wave32) exposes 64KB of LDS per workgroup, against the 160KB the
@@ -95,7 +104,22 @@ def create_and_clamp_configs():
     # No makedirs: a missing directory means aiter's layout moved, and a run
     # that creates it, matches nothing and reports success is how a build ships
     # an image whose first FP4 request dies on a missing config file.
-    assert os.path.isdir(CFG), f"aiter gemm config dir not found: {CFG}"
+    if not os.path.isdir(CFG):
+        # ROCm 10 base: aiter moved to per-arch dirs (configs/<arch>/triton/gemm
+        # with per-M-range buckets plus a DEFAULT.json fallback) and now ships
+        # gfx1151 natively. The clamped gfx950 set was authored for the flat
+        # per-shape layout; cloning it into the new format is its own project.
+        # The DEFAULT fallback serves FP4 there; tile quality is re-judged
+        # when the rocpro10 image is profiled end to end.
+        new_style = os.path.isdir(
+            "/opt/venv/lib64/python3.12/site-packages/aiter/ops/triton/configs/gfx1151"
+        )
+        assert new_style, f"aiter gemm config dir not found: {CFG}"
+        print(
+            "skipping config clone: new aiter layout ships gfx1151 configs "
+            "(DEFAULT fallback); clamped-set port deferred"
+        )
+        return
     srcs = sorted(glob.glob(f"{CFG}/gfx950-*FP4*.json"))
     assert srcs, f"no gfx950-*FP4*.json configs in {CFG}: aiter's config layout changed"
 
