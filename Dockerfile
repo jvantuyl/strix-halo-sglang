@@ -467,6 +467,14 @@ RUN python3 /tmp/patch_presharded_load_readahead.py && rm /tmp/patch_presharded_
 COPY patches/patch_umem_carve_budget.py /tmp/patch_umem_carve_budget.py
 RUN python3 /tmp/patch_umem_carve_budget.py && rm /tmp/patch_umem_carve_budget.py
 
+# gfx1151 patch 45: report PLE row/page-cache hit statistics on the Prefill
+# batch status line. Residency comes from mincore(2) on the table mapping
+# (kernel ground truth, no estimates); counters drain per report interval.
+# Diagnostics-only: recording disables itself on its first internal error.
+# See patches/45-ple-hit-stats.md.
+COPY patches/patch_ple_hit_stats.py /tmp/patch_ple_hit_stats.py
+RUN python3 /tmp/patch_ple_hit_stats.py && rm /tmp/patch_ple_hit_stats.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"
