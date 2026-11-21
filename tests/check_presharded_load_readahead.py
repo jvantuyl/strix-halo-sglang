@@ -127,30 +127,4 @@ if torch.cuda.is_available():
     torch.cuda.synchronize()
     assert torch.equal(gpu_b2.cpu(), tiny)
 
-# --- prepark + host-side fill through the parked alias --------------------
-if torch.cuda.is_available():
-    import torch.nn as nn
-
-    from sglang.srt.model_executor.host_parked_params import (
-        is_parked,
-        parked_buffer,
-        prepark_parameter,
-    )
-
-    p = nn.Parameter(torch.zeros(1000, 4, dtype=torch.bfloat16, device="cuda"))
-    prepark_parameter(p)
-    assert is_parked(p), "preparked param not registered"
-    src = torch.randn(1000, 4).to(torch.bfloat16)
-    loader = object.__new__(PML)
-    loader._copy_to_gpu(p.data, src, None)  # must take the parked branch
-    torch.cuda.synchronize()
-    assert torch.equal(p.data.cpu(), src), "parked fill mismatch"
-    assert parked_buffer(p.data) is not None
-    # a non-parked param still goes through the normal paths
-    q = nn.Parameter(torch.zeros(3, device="cuda"))
-    loader._copy_to_gpu(q.data, torch.tensor([1.0, 2.0, 3.0]), None)
-    torch.cuda.synchronize()
-    assert torch.equal(q.data.cpu(), torch.tensor([1.0, 2.0, 3.0]))
-    assert not is_parked(q)
-
 print("check_presharded_load_readahead: ok")

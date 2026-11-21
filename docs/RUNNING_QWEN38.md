@@ -48,7 +48,8 @@ off.
 | [39](../patches/39-qsa-host-metadata.md) | QSA speculative metadata builds from host-published lengths (`extend_seq_lens_cpu`, `req_pool_indices_cpu`); no `.item()`/`.tolist()` device readbacks in the hot paths | py-spy on the scheduler put 75% of its busy time in the draft-extend metadata chain, whose `.item()` syncs the plan stream against whatever forward is in flight — ~1 s per 1024-token prefill chunk (thread-bound prefill, the amdgpu_top oscillation) and a share of every decode round. The mapping is now built host-side and moved once; values identical, no numerics change. Measured: 64k prefill 98→82 s (tok/s p50 655→712); decode probes unchanged (GPU-bound). `tests/check_qsa_host_metadata.py` |
 | [40](../patches/40-qsa-rope-host-bound.md) | QSA indexer rope cache sized from a monotone host-side bound (`QSA_HOST_MAX_POSITION`); drops `positions.max().item()` from `project_qk`/`apply_rope` | With 39 fixed, py-spy's next prefill dominator was the indexer rope path at 83% of the scheduler thread: a device reduction + D2H sync per QSA layer per prefill chunk just to ask how large the lazy rope cache should be. The backends now record `max(seq_lens_cpu) + draft_window` in both metadata entry points; the indexer ensures against that. Cache contents identical, fallback preserved. `tests/check_qsa_rope_host_bound.py` |
 | [41](../patches/41-qsa-prefill-host-mirrors.md) | QSA prefill MQA inputs from host mirrors: `QSAIndexerMetadata` carries `sequence_lengths_cpu` (non-spec branch only), chunk-prefill kernel grid bound comes from `max(extend_seq_lens_cpu)` | Sequential per-layer syncs mask each other — after 40, py-spy's next prefill dominator was `get_prefill_mqa_inputs`'s `sequence_lengths.tolist()` at 82% of the thread, plus the chunk kernel's `cu_q` readback for its grid bound, both per QSA layer per prefill chunk. Both read host-published values now; speculative-paged metadata deliberately keeps the mirror None (its rows are per-token). `tests/check_qsa_prefill_host_mirrors.py` (exercises the real method against a fake pool) |
-| [42](../patches/42-presharded-load-readahead.md) | Presharded reload stages each file in pinned memory one read ahead (`os.preadv` + O_DIRECT, buffered fallback ladder); consumer `copy_`s from pinned | Reload ran at 758 MiB/s vs a 4.2 GiB/s device: `get_tensor` returns zero-copy mmap views, so all page-in happened inside the GPU copy's pin-fault path (0.79 GiB/s measured; the copy from pinned memory is 66 GiB/s; fadvise WILLNEED is a no-op on this kernel). Staging moves the IO to the optimal kernel path and overlaps it with the previous file's GPU copies. `tests/check_presharded_load_readahead.py` |
+| [42](../patches/42-presharded-load-readahead.md) | Presharded reload stages each file into an aligned pageable buffer one read ahead (`os.preadv` + O_DIRECT, buffered fallback ladder); large GPU copies go through one fixed 64 MiB pinned stage block | Reload ran at 758 MiB/s vs a 4.2 GiB/s device: `get_tensor` returns zero-copy mmap views, so all page-in happened inside the GPU copy's pin-fault path (0.79 GiB/s measured; H2D from pinned memory is 66 GiB/s; fadvise WILLNEED is a no-op on this kernel). Pageable staging instead of pinning the whole file because pinned host allocations are charged against device memory on this UMA box; the fixed stage block avoids torch's per-size pinned cache, which left ~3 GiB behind after one reload. Reload 101 s → ~26 s. A prepark variant (fill the parking set from the staged views before the reload) was rejected: it broke MTP draft acceptance to 0.00 — the draft shares embedding storage with the target. `tests/check_presharded_load_readahead.py` |
+| [43](../patches/43-umem-carve-budget.md) | KV budget from the VRAM carve: when sysfs shows a dedicated carve (`mem_info_vram_total` > 1.5× system RAM), `get_available_gpu_memory` returns carve free minus a 2 GiB reserve; psutil MemAvailable stays the fallback for true-UMA devices | Upstream assumes integrated = sysmem-as-device-mem; here 96 GiB is carved for the iGPU and device allocations never appear in Linux page accounting, while `mem_get_info` inside the container reports the 8 GiB GTT overflow window. The psutil metric made the KV budget track Linux page-cache noise at the instant of measurement (477k mmap vs 270-304k O_DIRECT for identical device footprints). Carve accounting needs `SGLANG_MEM_FRAC=0.985` (the weights are 86.7% of the carve; the old 0.85 default's sanity check was vacuous under the old metric) and lifts `max_total_num_tokens` to the configured 524288 cap (509504 aligned). `tests/check_umem_carve_budget.py` |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
@@ -207,14 +208,14 @@ A warm restart (PLE table already on disk, kernel cache warm) of the
 DERISKED deployment with MTP and a cap of 16 measured, from `docker run` to
 Uvicorn, with the phases from the journal:
 
-| Phase | Normal load | With patch 30 | Presharded reload |
-|---|---|---|---|
-| Container start, imports, tokenizer | 37 s | 37 s | 37 s |
-| Target weights | 152 s | 152 s | 72 to 98 s |
-| MTP draft weights | 49 s | 30 s | 4 to 9 s |
-| CUDA graphs (target verify + draft decode) | 14 s | 14 s | 11 s |
-| Memory pools | 1.4 s | 1.4 s | 1.6 s |
-| **Uvicorn up** | **259 s** | **~240 s** | **133 to 169 s** |
+| Phase | Normal load | With patch 30 | Presharded reload | Presharded + patch 42 |
+|---|---|---|---|---|
+| Container start, imports, tokenizer | 37 s | 37 s | 37 s | 37 s |
+| Target weights | 152 s | 152 s | 72 to 98 s | 24 to 31 s |
+| MTP draft weights | 49 s | 30 s | 4 to 9 s | 2.5 to 3.4 s |
+| CUDA graphs (target verify + draft decode) | 14 s | 14 s | 11 s | 11 s |
+| Memory pools | 1.4 s | 1.4 s | 1.6 s | 1.6 s |
+| **Uvicorn up** | **259 s** | **~240 s** | **133 to 169 s** | **~95 s** |
 
 The patch 30 column is the normal-load column with the measured draft time
 (20 to 30 s over two first boots) substituted; it was not booted on its own.

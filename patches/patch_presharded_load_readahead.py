@@ -50,36 +50,7 @@ old = """            for filename, items in by_file.items():
                     verify_hashes=verify_hashes,
                 )
                 progress.step(file_bytes[filename])"""
-new = """            # gfx1151 patch 42: park the bandwidth-idle params BEFORE the
-            # reload and fill them from the staged host buffers. The old
-            # order copied them into VRAM and back out at park time, and on
-            # this iGPU freeing those VRAM-backed pages stopped showing up
-            # as available system memory, shrinking the KV budget by ~3 GB
-            # (measured 2026-11-20; see patches/42-presharded-load-readahead.md).
-            preparked_bytes = 0
-            if (
-                not model_config.is_draft_model
-                and os.environ.get("QWEN38_PRESHARDED_PREPARK", "1") != "0"
-            ):
-                from sglang.srt.model_executor.host_parked_params import (
-                    host_parked_patterns,
-                    is_parked,
-                    prepark_parameter,
-                )
-
-                patterns = host_parked_patterns()
-                for name, param in model.named_parameters():
-                    if any(p in name for p in patterns) and not is_parked(param):
-                        prepark_parameter(param)
-                        preparked_bytes += param.numel() * param.element_size()
-                if preparked_bytes:
-                    logger.info(
-                        "Preparked %.2f GiB of parameters before the reload "
-                        "(filled from the staged host buffers)",
-                        preparked_bytes / 2**30,
-                    )
-
-            # gfx1151 patch 42: each file is staged into an aligned CPU
+new = """            # gfx1151 patch 42: each file is staged into an aligned CPU
             # buffer one read ahead of the apply loop, so the NVMe transfer
             # overlaps the previous file's GPU copies instead of
             # page-faulting inside them. copy_stage: one fixed pinned block
@@ -374,21 +345,6 @@ new = """    @staticmethod
     _COPY_STAGE_MIN = 1 << 20
 
     def _copy_to_gpu(self, param_data, src, stage):
-        # gfx1151 patch 42: a parked parameter's storage is host-mapped
-        # memory aliased as a CUDA tensor (patch 27). Fill that mapping
-        # directly from the staged host view — pure CPU memcpy — so the
-        # bytes never enter VRAM at all.
-        from sglang.srt.model_executor.host_parked_params import parked_buffer
-
-        buf = parked_buffer(param_data)
-        if buf is not None:
-            import ctypes
-
-            nbytes = param_data.numel() * param_data.element_size()
-            host = (ctypes.c_uint8 * nbytes).from_address(buf._host_ptr)
-            flat = torch.frombuffer(host, dtype=param_data.dtype)
-            flat.copy_(src.reshape(-1))
-            return
         src_flat = src.reshape(-1)
         dst_flat = param_data.reshape(-1)
         if (
@@ -413,37 +369,7 @@ assert text.count(old) == 1, "_read_presharded_file anchor not found"
 text = text.replace(old, new)
 open(p, "w").write(text)
 
-# --- 2b. prepark_parameter in the host-parked-params helper ---------------
-p = f"{path}/python/sglang/srt/model_executor/host_parked_params.py"
-text = open(p).read()
-
-old = """def park_parameter_in_host_memory(param: torch.nn.Parameter) -> HostParkedBuffer:"""
-new = """def prepark_parameter(param: torch.nn.Parameter) -> HostParkedBuffer:
-    \"\"\"gfx1151 patch 42: point ``param.data`` at a fresh host-mapped buffer
-    without copying anything. The presharded reload then fills the mapping
-    directly from its staged host buffer, so the data never enters VRAM.
-    \"\"\"
-    buf = HostParkedBuffer(param.numel() * param.element_size())
-    device = (
-        param.device
-        if param.device.type == "cuda"
-        else torch.device("cuda", torch.cuda.current_device())
-    )
-    alias = torch.as_tensor(buf, device=device)
-    if alias.data_ptr() != buf.data_ptr():
-        raise RuntimeError("host-mapped alias does not share the buffer address")
-    alias = alias.view(param.dtype).view(param.shape)
-    param.data = alias
-    _PARKED[buf.data_ptr()] = weakref.ref(buf)
-    return buf
-
-
-def park_parameter_in_host_memory(param: torch.nn.Parameter) -> HostParkedBuffer:"""
-assert text.count(old) == 1, "park_parameter anchor not found in host_parked_params"
-text = text.replace(old, new)
-open(p, "w").write(text)
-
-# --- 2c. back to the loader: staged fill for parked params ----------------
+# --- 2b. loader, continued: apply signature takes the stage ---------------
 p = f"{path}/python/sglang/srt/model_loader/loader.py"
 text = open(p).read()
 

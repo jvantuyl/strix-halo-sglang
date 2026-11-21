@@ -417,3 +417,61 @@ source-assert test must exercise the real method (the first patch-41 draft
 added the mirror field to `QwenSparseAttnMetadata` while
 `get_prefill_mqa_inputs` lives on `QSAIndexerMetadata`; the AttributeError
 surfaced only in the production warmup).
+
+### Weight reload and the KV budget: patches 42/43 (2026-11-21)
+
+The presharded reload streamed 75.1 GiB at 758 MiB/s (101 s) while the
+device sustains 4.2 GiB/s with O_DIRECT. Microbenchmarks pinned the
+mechanism (all in-container, 2026-11-20):
+
+| path | rate |
+|---|---|
+| `get_tensor` mmap view → consumer `copy_` (cold, pin-fault) | 0.79 GiB/s |
+| buffered read into a buffer | 1.15 GiB/s |
+| O_DIRECT `os.preadv` into a prepared buffer, 1 stream | 4.24 GiB/s |
+| H2D from a warm mmap view | 4.79 GiB/s |
+| H2D from pinned memory | 66.6 GiB/s |
+
+Patch 42 stages each dump file one read ahead into an aligned pageable
+buffer (O_DIRECT whole-file `preadv`; fadvise WILLNEED measured as a
+no-op on this kernel, so v1 gained nothing) and routes large copies
+through one fixed 64 MiB pinned stage. Whole-file pinning was tried and
+rejected: pinned host allocations are charged against the device memory
+accounting on this UMA box and that boot crashed the KV sizing.
+
+| reload variant | target 75.1 GiB | draft 7.2 GiB |
+|---|---|---|
+| patch 31 baseline (mmap views) | 101 s (758 MiB/s) | 10 s |
+| patch 42 staged (final) | 24–30.6 s (~2.9 GiB/s) | 2.5–3.4 s |
+
+**The KV-budget regression and its real cause.** The staged boots
+initially showed `max_total_num_tokens` 270–304k vs 473–485k for the mmap
+path — a ~3 GB difference in psutil MemAvailable at the instant of
+measurement, reproduced with the staging on and off, with parking before
+and after the load, and never explained by any allocation (per-file traces
+showed no accumulation). The resolution came from the host's memory
+layout: the BIOS carves **96 GiB** for the iGPU (sysfs `mem_info_vram_*`),
+Linux sees **32 GB**, and the 8 GiB GTT is only an overflow window.
+Device allocations (weights, draft, KV pool — `vram_used` tracked 88.3
+GiB loaded) never touch Linux page accounting; the psutil-based budget
+was reading Linux-side page-cache noise: the mmap path leaves ~3 GB of
+fresh dump-file cache sitting in RAM when measured, O_DIRECT leaves none.
+Patch 43 switches the integrated-GPU budget to the carve's own free space
+(2 GiB reserve) when a carve is detected. Consequences: the weights are
+86.7% of the carve, so `SGLANG_MEM_FRAC` moved 0.85 → 0.985 (the old
+value's sanity check was vacuous under the old metric), and the budget
+now settles at the configured `QWEN38_MAX_TOTAL_TOKENS=524288` cap —
+**509504** aligned tokens, above the old 473–485k, and identical for
+either load path.
+
+A prepark variant of patch 42 (fill the 2.02 GiB parking set from the
+staged views before the reload, so the bytes never enter VRAM) was
+rejected on evidence: MTP draft acceptance collapsed to 0.00 (decode
+18 → 8 tok/s) — the draft shares embedding storage with the target, which
+the pre-reload `param.data` swap strands unfilled. With the accounting
+fixed properly the variant has no remaining purpose.
+
+Decode after the final boot: accept len 3.77–3.88 on a counting probe,
+184 tokens in 6.7 s wall (0.13 s/step, matching the historical step time);
+draft acceptance on real traffic to be re-confirmed with the user's
+mission run.
