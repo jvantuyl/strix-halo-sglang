@@ -956,6 +956,31 @@ generations part at the next near-tie. Long-context concurrency stress
 With MTP on, the same holds since patches 22 and 23; numbers in
 [Speculative decoding](#speculative-decoding-mtp).
 
+## ROCm 10 base (image `strix-halo-sglang:rocpro10`)
+
+An alternative base built on `kyuz0/vllm-therock-gfx1151:latest`
+(`rocm10.0.0-torch2.11.0-vllm0.33.0`, pin `sha256:f8a7433d662b...cfa3966`)
+with the same patch chain. Launch it with
+`SGLANG_IMAGE=strix-halo-sglang:rocpro10 SGLANG_DOCKER_ARGS="-e SGLANG_QSA_TILELANG=0 -e SGLANG_QSA_DECODE_FLASH_ATTN=1"`.
+The two env gates stand down the pieces the new stack cannot run:
+
+- `SGLANG_QSA_TILELANG=0` (patch 48): TileLang codegen is broken on the new
+  Triton (`N must be divisible by 16, but got 8` at decode graph capture);
+  the gate selects the validated Triton MQA kernels (patches 24/26).
+- `SGLANG_QSA_DECODE_FLASH_ATTN=1` (existing patch 11 escape hatch): the
+  custom `qwen38_qsa_sm121` Triton kernel needs 73,728 B of shared memory on
+  the new compiler (over the 64 KiB RDNA limit) even with the HIP clamp, and
+  stage-forcing segfaults at the page level; the gate sends decode back to
+  the flash-attn varlen fallback that was already the outside-contract path.
+
+Everything else — PLE hot-set cache, presharded loader, MoE configs — runs
+unchanged; the hot-set snapshot restored warm on first prefill.
+Verified live (paragraph-shuffle bench, server-reported): 865-tok prefill
+664/664/710 tok/s, decode 21.0-21.5 tok/s; 1712-tok prefill 670/659/680.
+That is at parity with the 7.13 base (`:dev`) or slightly ahead, and
+`rocprofv3` profiling works on this base (it crashes the 7.13 server).
+Sanity: greedy 17×23 = 391, coherent 400-token generation.
+
 ## Known limitations
 
 - The "avail mem" log figure is not headroom; see Memory before adding
