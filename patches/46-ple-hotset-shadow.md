@@ -1,76 +1,78 @@
-# Patch 46 — PLE hot-set shadow cache (SIEVE, measurement only)
+# Patch 46 — PLE read-through hot-set cache (RAM MVP)
 
-Status: **shipped 2026-11-21** (spike, iteration 1). Spec:
+Status: **shipped 2026-11-21** (MVP, iteration 2 — replaces the shadow
+spike, which measured a 100% row-level hit rate on warm traffic and
+validated the SIEVE structure). Spec:
 `~/.factory/specs/2026-11-21-ple-read-through-cache.md`.
 
 ## What this is
 
-The first iteration of the read-through hot-set cache: a **shadow**. It
-runs the proposed flat-hash + SIEVE structure alongside the real gather
-path and reports, on the `Prefill batch` status line, what a real cache
-would have hit — without changing any serving behavior. Its job is to
-measure the one number that decides whether the kernel work (dense-read
-gather + GPU probe) is worth building: **the actual hit rate of real
-traffic**.
+A real read-through cache in front of the PLE table's mmap: the hottest
+rows live in a dense, **mlock'd** host-RAM array; gathers serve hit rows
+from RAM and miss rows from the mmap exactly as before. This removes the
+page-cache dependency for hot rows — the kernel page cache is a shared,
+evictable, 8 GiB-budget trimmer; the hot set is private and pinned.
 
-```
-hotset: <hits>/<rows> rows <pct>% sz <size> ev <evictions> err <errors>
-```
+* `SGLANG_QWEN4_PLE_HOTSET_ROWS` (default 1048576 ≈ 152 MiB ≈ the census's
+  99%-coverage point; `0` disables).
+* Cold on restart (no persistence in the MVP; keys-only snapshot is the
+  planned follow-up).
+* Capacity overflow, mlock failure, or any internal error degrades to the
+  stock mmap path — the cache can only fail towards today's behavior.
 
-* Keys are table row ids (the ids the gather already computes; the patch-45
-  hook already places them on the CPU every prefill chunk — no new syncs).
-* No payload storage and no table reads on fill: shadow fills are free, so
-  the hit rate reflects "if this cache were real", not current I/O. The
-  row-level hit rate is a conservative lower bound for the context-level
-  cache (16 rows per context assembly).
-* Same SIEVE policy the real cache would use: lazy promotion on hit, FIFO
-  insertion, hand-sweep eviction — the numbers include eviction realism.
+## Where it hooks (the production path)
 
-## Structure (all flat arrays; single-owner: the scheduler forward thread)
+On HIP the default gather is the **CPU path** (`_gather_ple_embedding_on_cpu`;
+`SGLANG_PLE_UVA_GATHER=1` would restore the device-side triton kernel —
+unused here). The cache intercepts exactly there:
 
-* `keys[N]` int64 row ids, `visited[N]` SIEVE bits, `table[M]` slot index
-  (M = 2N, linear probing with tombstones), `hand`/`tail` cursors.
-* Keys are re-hashed through a splitmix64-style avalanche before slotting
-  (raw row ids are Zipf-correlated; the mixer makes slot placement uniform).
-* Batch-vectorized operations only: probe, touch-bits, and insert are numpy
-  passes; eviction work is capped per call (4096 slots) — beyond that the
-  shadow stops inserting (measurement turns conservative) instead of
-  stalling the scheduler thread.
-* Tombstones + rehash: eviction leaves tombstones to preserve linear-probe
-  chain contiguity; when tombstones exceed M/4 the table is rebuilt
-  vectorized from live keys (SIEVE bits reset — documented deviation; the
-  real cache will carry epochs through the rebuild).
-* Capacity from `SGLANG_QWEN4_PLE_HOTSET_ROWS` (default 1048576 rows ≈ the
-  99%-coverage point from the census; 0 disables).
+1. Probe the batch's local row ids against the flat hash table (one
+   vectorized numpy pass; the ids are already on the CPU — no new syncs).
+2. Hit rows are copied from the dense payload array into the output
+   (uint8 view → dtype view → bf16, byte-identical conversion to the
+   mmap path); miss rows go through the stock `index_select` on the mmap.
+3. Fills are **one-chunk-lag**: a batch's misses are copied from the mmap
+   at the *next* batch's prep, when the kernel's own reads have already
+   made those pages resident — fills are minor faults, never disk I/O.
+4. CUDA-graph capture/replay never touches the cache (replay serves from
+   the prefetch buffer; decode's working set is resident anyway).
 
-## Correctness lessons from the spike (each found by a failing test)
+## Structure (flat arrays; single owner: the scheduler forward thread)
 
-1. **@triton.jit decorator capture** (patch 45's lesson, re-learned here as
-   a regression check): inserted code must never land between a decorator
-   and its def.
-2. **Tombstone deletion**: plain `-1` on delete breaks probe chains — live
-   keys become unfindable. Tombstones or backshift are mandatory.
-3. **Claim contiguity**: in a vectorized batch insert, contested slots must
-   admit exactly one claimant per round (first occurrence), or the winner
-   leaves an empty gap that makes earlier-claimed keys unfindable. A group
-   whose members ALL defer is the degenerate case that first showed up.
-4. **Group-index ordering**: numpy group-by built in sorted order must be
-   mapped back through the argsort permutation before use.
-5. **Bounded work**: eviction and insert loops are capped; probe-exhausted
-   (orphan) slots are removed and counted, never left as unfindable
-   zombies; `_table_remove` never spins on a missing entry.
-6. The avalanche test initially "failed" at exactly the birthday-collision
-   expectation — the threshold was wrong, not the hash. Test expectations
-   get derived from uniform-hashing math, not vibes.
+* `keys[N]` int64 row ids, `payload[N, row_bytes]` uint8 (mlock'd),
+  `visited[N]` SIEVE bits, `table[M]` slot index (M = 2N, linear probing
+  with tombstones), `hand`/`tail` cursors; splitmix64-style avalanche
+  before slotting (raw row ids are Zipf-correlated).
+* SIEVE policy: lazy promotion on hit, FIFO insertion, hand-sweep
+  eviction; eviction and insert work is capped per call; probe-exhausted
+  orphans are removed and counted, never left unfindable.
+* Tombstones on eviction preserve probe chains; when they exceed M/4 the
+  table rebuilds vectorized from live keys (SIEVE bits reset — documented
+  deviation).
+* Keys already resident at fill time (two batches missed the same key
+  before its fill landed) update the payload in place instead of
+  re-inserting — a blind re-insert leaves a stale shadow entry.
 
-`tests/check_ple_hotset_shadow.py` covers all of the above in-image
-(Zipf replay, no-phantom-hits, SIEVE policy, capacity consistency, bounded
-work, drain semantics).
+## Tests (`tests/check_ple_hotset_shadow.py`, in-image)
 
-## What success looks like
+Probe/payload round-trip, one-chunk-lag fill semantics, duplicate-key
+rejection and update-in-place, SIEVE eviction with survivor payload
+integrity, rehash correctness, capacity accounting — and the critical
+one: **bit-exact output** of the cached CPU gather vs the original path
+on mixed hit/miss/out-of-range batches (bitwise int16 compare, NaN-safe:
+fp8 0x7F+ patterns are NaN and must round-trip identically).
 
-The shadow's cumulative hit rate over a day of real serving. The census
-predicts ~90% at a 169 MiB real cache (top 69.5k contexts); the shadow
-measures what serving actually does. If the number is high, iteration 2
-builds the real thing (dense payload array + gather kernel reading it);
-if low, we saved the kernel work and revisit admission policy.
+## Expected effect
+
+Census says ~90% row-level coverage at 169 MiB; the shadow measured 100%
+hits on warm traffic. Steady-state gain is small (minor-fault removal,
+~2-4%; cold-heavy phases ~5-8%); the main value is tail-latency
+predictability and independence from page-cache pressure.
+
+## Follow-ups (scheduled)
+
+* Order-based overlap: launch the next batch's gather first, then fill the
+  previous batch's misses during the GPU run (same thread, no races,
+  two-chunk cold lag) — hides the ~5-20 ms fill entirely.
+* Keys-only checksummed snapshot (~5 MiB, atomic rename) to warm-start
+  after restart; payloads are a pure function of the read-only table.

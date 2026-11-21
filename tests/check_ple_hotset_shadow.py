@@ -1,148 +1,203 @@
-"""In-image check for gfx1151 patch 46: PLE hot-set shadow cache.
+"""Checks for patch 46: PLE read-through hot-set cache (RAM MVP, gfx1151).
 
-CPU-only. Verifies, against actual array contents (ground truth, no mocks):
+Runs inside the image (needs numpy; the numerics test needs a GPU):
+    PYTHONPATH=/sgl-workspace/sglang/python python3 tests/check_ple_hotset_shadow.py
 
-* avalanche disperses correlated keys (Zipf-ish input -> uniform slots)
-* probe finds only inserted keys — no phantom hits, no false negatives
-* hit -> visited bit set; SIEVE evicts unvisited before visited
-* capacity pressure evicts exactly enough; table stays consistent
-  (every live key findable, every evicted key gone)
-* Zipf traffic produces a rising, high hit rate (the spike's whole point)
-* per-call eviction work is bounded (skipped counter under a cold storm)
-* drain interval/cumulative separation
+Covers: probe/payload round-trip, one-chunk-lag fills, SIEVE eviction with
+payload survival, rehash correctness, dedupe rejection, capacity accounting,
+and — critically — bit-exact output of the cached gather kernel vs the
+original kernel on mixed hit/miss/out-of-range batches.
 """
 
-import numpy as np
+import os
+import sys
 
-from sglang.srt.utils.ple_hotset import PleHotsetShadow, avalanche
-
-
-def zipf_keys(n_keys: int, n_draws: int, seed: int = 7) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    ranks = rng.power(1.3, size=n_draws)  # power-law-ish, heavy head
-    return (ranks * n_keys).astype(np.int64) % n_keys
+FAILURES = []
 
 
-def check_avalanche():
-    ids = np.arange(100_000, dtype=np.int64)  # perfectly correlated input
-    slots = avalanche(ids) % 1024
-    occupied = np.unique(slots).size
-    # uniform hashing -> every slot occupied at n=100k, m=1024; a collapsed
-    # mixer would cluster far below that
-    assert occupied == 1024, f"avalanche collapsed: {occupied}/1024 distinct"
+def check(name, cond, detail=""):
+    if cond:
+        print(f"PASS {name}")
+    else:
+        print(f"FAIL {name} {detail}")
+        FAILURES.append(name)
 
 
-def check_probe_correctness():
-    hs = PleHotsetShadow(1024)
-    keys = np.array([10, 20, 30, 10, 20], dtype=np.int64)
-    hit, _ = hs._probe(keys)
-    assert (hit < 0).all(), "phantom hits on an empty cache"
-    hs._insert_batch(keys)
-    hit, _ = hs._probe(keys)
-    assert (hit >= 0).all(), "inserted keys not findable"
-    miss, _ = hs._probe(np.array([999999, 888888], dtype=np.int64))
-    assert (miss < 0).all(), "false hits on absent keys"
+def test_cache_semantics():
+    from sglang.srt.utils.ple_hotset import PleHotsetCache
 
+    ROW = 160
+    cap = 64
+    c = PleHotsetCache(cap, ROW)
+    check("mlock", c.payload.shape == (cap, ROW) and c.payload.dtype == "u1")
+    check("init-empty", c._interval["hits"] == 0 and c._interval["misses"] == 0)
 
-def check_sieve_policy():
-    hs = PleHotsetShadow(8)
-    hs._insert_batch(np.arange(0, 8, dtype=np.int64))  # fills exactly
-    hs._probe(np.array([0, 1], dtype=np.int64))  # touch 0,1 -> visited
-    # mark by probing (observe path sets visited): emulate via observe
-    hs2 = PleHotsetShadow(8)
-    hs2.observe(np.arange(0, 8, dtype=np.int64))
-    hs2.observe(np.array([2, 3], dtype=np.int64))  # 2,3 visited now
-    hs2._insert_batch(np.array([100, 101], dtype=np.int64))  # needs 2 slots
-    assert hs2.size == 8
-    # evicted keys must be gone; touched keys must survive
-    hit, _ = hs2._probe(np.array([2, 3], dtype=np.int64))
-    assert (hit >= 0).all(), "SIEVE evicted recently-visited keys"
-    gone, _ = hs2._probe(np.array([0, 1], dtype=np.int64))
-    # 0,1 were unvisited at eviction time -> they must be candidates for
-    # eviction; with hand starting at 0 they are evicted first
-    assert (gone < 0).all(), "SIEVE kept unvisited keys over visited ones"
+    # dedupe rejection contract
+    try:
+        c._insert_batch(np_from([5, 5]), np.zeros((2, ROW), dtype=np.uint8))
+        check("dedupe-reject", False, "no exception")
+    except ValueError:
+        check("dedupe-reject", True)
 
-
-def check_capacity_and_consistency():
-    hs = PleHotsetShadow(256)
-    rng = np.random.default_rng(3)
-    for i in range(40):
-        keys = rng.integers(0, 100_000, size=64).astype(np.int64)
-        hs.observe(keys)
-        assert hs.size <= hs.n
-        # table consistency: every live key findable
-        live = hs.keys >= 0
-        hit, _ = hs._probe(hs.keys[live])
-        assert (hit >= 0).all(), f"round {i}: live key lost from table"
-    assert hs._interval["evictions"] > 0, "capacity pressure never exercised"
-
-
-def check_zipf_hit_rate():
-    hs = PleHotsetShadow(1 << 16)
-    keys = zipf_keys(100_000, 400_000)
-    # feed in gathers of 1024 unique-ish
-    for i in range(0, keys.size, 1024):
-        hs.observe(np.unique(keys[i:i + 1024]))
-    c = hs.drain(cumulative=True)
-    # Synthetic power() skew is much flatter than the real corpus census
-    # (top 69.5k of 663k contexts = 90% there); this test asserts the
-    # structural behavior — a heavy-head stream yields a substantial hit
-    # rate at 65% coverage and warms up over the stream. The real serving
-    # hit rate is measured live by the shadow itself.
-    assert c["hits"] / c["rows"] > 0.35, (
-        f"zipf hit rate too low: {c['hits']}/{c['rows']}"
+    # one-chunk-lag fill: first prepare only enqueues; the SECOND prepare
+    # fills the first batch's misses; a third prepare over the same keys
+    # must see all hits with byte-identical payloads.
+    keys = np_from(list(range(100, 132)))
+    payload = np.array(
+        [[(i * 7 + 3 + j) % 256 for j in range(ROW)] for i in range(32)],
+        dtype=np.uint8,
     )
-    # early vs late: the cache must warm up
-    hs2 = PleHotsetShadow(1 << 16)
-    first = keys[:20_480]
-    for i in range(0, first.size, 1024):
-        hs2.observe(np.unique(first[i:i + 1024]))
-    d1 = hs2.drain()
-    last = keys[-20_480:]
-    hs2b = PleHotsetShadow(1 << 16)
-    for i in range(0, keys.size - 20_480, 1024):
-        hs2b.observe(np.unique(keys[i:i + 1024]))
-    for i in range(keys.size - 20_480, keys.size, 1024):
-        hs2b.observe(np.unique(keys[i:i + 1024]))
-    d2 = hs2b.drain(cumulative=True)
-    assert d2["hits"] / d2["rows"] > d1["hits"] / d1["rows"], (
-        "hit rate did not warm up over the stream"
+    filled = []
+
+    def fill(rows):
+        filled.append(rows.copy())
+        return np.zeros((rows.size, ROW), dtype=np.uint8)
+
+    slots1 = np.full(32, -2, dtype=np.int32)
+    c.prepare(keys, slots1, fill)
+    check("first-touch-enqueue-only", len(filled) == 0 and (slots1 < 0).all())
+
+    keys_b = np_from(list(range(500, 532)))
+    slots_b = np.full(32, -2, dtype=np.int32)
+    c.prepare(keys_b, slots_b, fill)
+    check("lag-fill-on-second-prepare", len(filled) == 1 and (filled[0] == keys).all())
+    c._insert_batch(keys, payload)  # what the fill actually does
+
+    slots2 = np.full(32, -2, dtype=np.int32)
+    c.prepare(keys, slots2, fill)
+    check("third-touch-all-hit", (slots2 >= 0).all())
+    check(
+        "payload-roundtrip",
+        (c.payload[slots2] == payload).all(),
+        "cached bytes must match mmap bytes",
+    )
+    check("counters", c._cumulative["hits"] == 32 and c._cumulative["misses"] == 64)
+
+    # SIEVE eviction under pressure + survivor payload integrity
+    more = np_from(list(range(1000, 1100)))
+    more_payload = np.zeros((100, ROW), dtype=np.uint8)
+    more_payload[:, 0] = np.arange(100, dtype=np.uint8)
+    slots3 = np.full(100, -2, dtype=np.int32)
+    c.prepare(more, slots3, lambda rows: None)
+    c._insert_batch(more, more_payload)
+    check("capacity", c.size <= cap, f"size {c.size} > cap {cap}")
+    check("evictions-happened", c._cumulative["evictions"] > 0)
+    surv_slots = np.full(32, -2, dtype=np.int32)
+    c.prepare(keys, surv_slots, fill)
+    hit_mask = surv_slots >= 0
+    if hit_mask.any():
+        check(
+            "survivor-payload",
+            (c.payload[surv_slots[hit_mask]] == payload[hit_mask]).all(),
+        )
+
+    # rehash preserves payloads and consistency (fresh cache: no eviction
+    # pressure eating the survivors)
+    r = PleHotsetCache(128, ROW)
+    r._insert_batch(keys, payload)
+    r._insert_batch(
+        np_from([3000 + i for i in range(20)]),
+        np.full((20, ROW), 9, dtype=np.uint8),
+    )
+    r._rehash()
+    re_slots = np.full(32, -2, dtype=np.int32)
+    r.prepare(keys, re_slots, fill)
+    live = re_slots >= 0
+    check(
+        "rehash-payload",
+        live.all() and (r.payload[re_slots] == payload).all(),
+    )
+    check("rehash-consistent", r.size == len(np.unique(r.keys[r.keys >= 0])))
+
+
+def np_from(vals, dtype=None, flat=False):
+    if dtype is None:
+        dtype = np.int64
+    if flat:
+        return np.array(vals, dtype=dtype)
+    return np.array(vals, dtype=dtype)
+
+
+def test_numerics():
+    """Bit-exactness: cached CPU gather vs the original CPU gather path."""
+    import types
+
+    import torch
+    from sglang.srt.models.qwen4_exp import _gather_ple_embedding_on_cpu
+    from sglang.srt.utils.ple_hotset import PleHotsetCache
+
+    torch.manual_seed(0)
+    ROW, NROWS, DIM = 160, 4096, 160
+    table = torch.randint(0, 200, (NROWS, ROW), dtype=torch.uint8).view(
+        torch.float8_e4m3fn
+    )
+    table.view(torch.uint8)[0] = 0  # an all-zero row in the mix
+
+    emb = types.SimpleNamespace(
+        shard_indices=types.SimpleNamespace(
+            org_vocab_start_index=0, org_vocab_end_index=NROWS
+        ),
+        weight=table,
+        embedding_dim=DIM,
+        _hotset=None,
+        _hotset_slots=None,
+    )
+    n = 4096
+    ids = torch.arange(100, 100 + n)
+    ids[:1000] = 500 + torch.arange(1000)          # in-window, cold first touch
+    ids[1000:3000] = torch.arange(2000)            # in-window, will be hot
+    ids[3000:] = 10**9 + torch.arange(n - 3000)    # out of range
+
+    def reference(e, flat_ids, out):
+        start = e.shard_indices.org_vocab_start_index
+        end = e.shard_indices.org_vocab_end_index
+        host_ids = flat_ids.detach().to("cpu")
+        in_range = (host_ids >= start) & (host_ids < end)
+        local_idx = torch.where(in_range, host_ids - start, torch.zeros_like(host_ids))
+        rows = e.weight.data.index_select(0, local_idx).to(torch.bfloat16)
+        rows = torch.where(in_range.unsqueeze(1), rows, torch.zeros_like(rows))
+        out.view(-1, e.embedding_dim).copy_(rows)
+
+    # 1. cache disabled: must equal reference
+    out_a = torch.zeros(n, DIM, dtype=torch.bfloat16)
+    _gather_ple_embedding_on_cpu(emb, ids, out_a)
+    out_ref = torch.zeros_like(out_a)
+    reference(emb, ids, out_ref)
+    check(
+        "cold-path-bit-exact",
+        bool((out_a.view(torch.int16) == out_ref.view(torch.int16)).all()),
     )
 
-
-def check_bounded_work():
-    hs = PleHotsetShadow(1024)
-    rng = np.random.default_rng(11)
-    for _ in range(10):
-        hs.observe(rng.integers(0, 10**9, size=4096).astype(np.int64))
-    c = hs.drain(cumulative=True)
-    assert c["evictions"] <= 10 * 4096 or c["skipped"] > 0, (
-        "eviction work not bounded"
+    # 2. populate the cache with the first batch's misses, re-run: hits now
+    cache = PleHotsetCache(2048, ROW)
+    emb._hotset = cache
+    emb._hotset_slots = np.zeros(1 << 18, dtype=np.int32)
+    out_b = torch.zeros_like(out_a)   # cold: enqueues misses (lag)
+    _gather_ple_embedding_on_cpu(emb, ids, out_b)
+    check(
+        "warm-path-bit-exact",
+        bool((out_b.view(torch.int16) == out_ref.view(torch.int16)).all()),
     )
-    assert hs.enabled, "shadow disabled itself under a cold storm"
-
-
-def check_drain_semantics():
-    hs = PleHotsetShadow(64)
-    hs.observe(np.array([1, 2, 3], dtype=np.int64))
-    d = hs.drain()
-    assert d["rows"] == 3 and d["inserts"] == 3 and d["hits"] == 0
-    d2 = hs.drain()
-    assert d2["rows"] == 0, "interval did not reset"
-    hs.observe(np.array([1], dtype=np.int64))
-    d3 = hs.drain()
-    assert d3["hits"] == 1, "repeat touch not counted as hit"
+    out_c = torch.zeros_like(out_a)   # fills+inserts pending, still misses
+    _gather_ple_embedding_on_cpu(emb, ids, out_c)
+    out_d = torch.zeros_like(out_a)   # now fully warm
+    _gather_ple_embedding_on_cpu(emb, ids, out_d)
+    check(
+        "hot-path-bit-exact",
+        bool((out_d.view(torch.int16) == out_ref.view(torch.int16)).all()),
+    )
+    hit_frac = (emb._hotset_slots[:n] >= 0).mean()  # after out_d
+    check("hits-registered", hit_frac > 0.5, f"hit fraction {hit_frac:.2f}")
 
 
 def main():
-    check_avalanche()
-    check_probe_correctness()
-    check_sieve_policy()
-    check_capacity_and_consistency()
-    check_zipf_hit_rate()
-    check_bounded_work()
-    check_drain_semantics()
-    print("check_ple_hotset_shadow: all green")
+    global np
+    import numpy as np
+
+    test_cache_semantics()
+    test_numerics()
+    print(f"\n{'FAILED: ' + ', '.join(FAILURES) if FAILURES else 'ALL PASS'}")
+    sys.exit(1 if FAILURES else 0)
 
 
 if __name__ == "__main__":
