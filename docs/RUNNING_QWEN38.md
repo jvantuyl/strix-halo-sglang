@@ -973,13 +973,31 @@ The two env gates stand down the pieces the new stack cannot run:
   stage-forcing segfaults at the page level; the gate sends decode back to
   the flash-attn varlen fallback that was already the outside-contract path.
 
-Everything else — PLE hot-set cache, presharded loader, MoE configs — runs
+Everything else — PLE hot-set cache, presharded loader — runs
 unchanged; the hot-set snapshot restored warm on first prefill.
 Verified live (paragraph-shuffle bench, server-reported): 865-tok prefill
 664/664/710 tok/s, decode 21.0-21.5 tok/s; 1712-tok prefill 670/659/680.
 That is at parity with the 7.13 base (`:dev`) or slightly ahead, and
 `rocprofv3` profiling works on this base (it crashes the 7.13 server).
 Sanity: greedy 17×23 = 391, coherent 400-token generation.
+
+Triton 3.8 MoE config note (found by kernel trace): the new base's Triton
+3.8.0 renames the device to `AMD_Radeon_8060S_Graphics`, so the tuned
+configs in `configs/moe/qwen38-flash-next/` (named
+`device_name=Radeon_8060S_Graphics`) are not found and the loader falls
+back to defaults. Do NOT just copy them to the AMD_ name: they were tuned
+under the old Triton and measurably regress on 3.8 (decode 12 vs 20 tok/s,
+prefill 457-643 vs 631-635). rocprofv3 on this base attributes ~32% of GPU
+kernel time to `fused_moe_kernel_gptq_awq` during a 66k prefill, so a
+Triton 3.8 retune is the top candidate for closing the remaining gap. The
+AMD_-prefixed copies are parked at `/var/tmp/moe-amd-copies/` and must not
+be deployed. rocprofv3 usage on the server: wrap with
+`SGLANG_COMMAND_PREFIX="rocprofv3 --kernel-trace -o <out> --output-format
+csv --kernel-include-regex (?i)gemm|attn|flash|topk|splitk|fmha --"`; to
+flush the trace, SIGTERM the scheduler and detokenizer children inside the
+container (`kill -TERM <sched_pid> <detok_pid> <tracker_pid>`) — signaling
+the entrypoint alone deadlocks the flush and docker's eventual SIGKILL
+loses the buffers. Bind-mount the output directory.
 
 ## Known limitations
 
