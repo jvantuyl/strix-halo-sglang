@@ -209,7 +209,15 @@ fi
 
 set -x
 
-exec docker run --name "$NAME" \
+# Run the container in the foreground without exec: systemd sends SIGTERM to
+# this script on stop, and the trap forwards it to `docker run`, which proxies
+# it to the server for the same graceful shutdown `exec docker run` gave via
+# the client's signal proxying. SGLang's launcher exits 0 even when a scheduler
+# child segfaulted (it logs "crashed with exit code" and does SIGQUIT cleanup),
+# which made Restart=on-failure never fire — so scan the container log for
+# that marker and exit nonzero on a crash; a deliberate stop has no marker and
+# still exits as success.
+docker run --name "$NAME" \
     --device=/dev/kfd --device=/dev/dri \
     --ipc=host --network=host \
     --security-opt seccomp=unconfined \
@@ -253,4 +261,25 @@ exec docker run --name "$NAME" \
         "${STRICT_THINKING_FLAGS[@]}" \
         "${TEMPLATE_KWARGS[@]}" \
         "${PRESHARDED_FLAGS[@]}" \
-        "$@"
+        "$@" &
+RUN_PID=$!
+STOP_REQUESTED=0
+# A backgrounded `docker run` client does not reliably proxy signals, so stop
+# the container directly through the daemon (SIGTERM to the server, then the
+# 90 s grace; TimeoutStopSec=120 leaves the rest of the budget to the unit).
+trap 'STOP_REQUESTED=1; docker stop -t 90 "$NAME" >/dev/null 2>&1 || true' TERM INT
+RUN_RC=0
+wait "$RUN_PID" || RUN_RC=$?
+# After a forwarded stop signal, docker is still shutting the container down;
+# reap it before reading the log.
+wait "$RUN_PID" 2>/dev/null || RUN_RC=$?
+if [ "$STOP_REQUESTED" = 1 ]; then
+    # Deliberate stop: report success regardless of the signal exit code, so
+    # Restart=on-failure does not undo the stop.
+    exit 0
+fi
+if docker logs "$NAME" 2>&1 | grep -q "crashed with exit code"; then
+    echo "scheduler crash detected in container log; exiting nonzero so systemd restarts" >&2
+    exit 1
+fi
+exit "$RUN_RC"
