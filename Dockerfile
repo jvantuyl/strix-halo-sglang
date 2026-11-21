@@ -475,6 +475,13 @@ RUN python3 /tmp/patch_umem_carve_budget.py && rm /tmp/patch_umem_carve_budget.p
 COPY patches/patch_ple_hit_stats.py /tmp/patch_ple_hit_stats.py
 RUN python3 /tmp/patch_ple_hit_stats.py && rm /tmp/patch_ple_hit_stats.py
 
+# gfx1151 patch 46: PLE hot-set SHADOW cache (SIEVE over row ids) —
+# measurement only, no serving-behavior change; reports what a real
+# read-through cache would hit, on the Prefill status line. See
+# patches/46-ple-hotset-shadow.md.
+COPY patches/patch_ple_hotset_shadow.py /tmp/patch_ple_hotset_shadow.py
+RUN python3 /tmp/patch_ple_hotset_shadow.py && rm /tmp/patch_ple_hotset_shadow.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"
