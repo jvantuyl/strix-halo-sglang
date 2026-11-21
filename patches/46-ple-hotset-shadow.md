@@ -69,10 +69,15 @@ hits on warm traffic. Steady-state gain is small (minor-fault removal,
 ~2-4%; cold-heavy phases ~5-8%); the main value is tail-latency
 predictability and independence from page-cache pressure.
 
-## Follow-ups (scheduled)
+## Order-based overlap (shipped, same commit series)
 
-* Order-based overlap: launch the next batch's gather first, then fill the
-  previous batch's misses during the GPU run (same thread, no races,
-  two-chunk cold lag) — hides the ~5-20 ms fill entirely.
+`prepare()` only probes and records the batch's misses; the caller
+flushes the pending fill after its own output is computed, so the
+~5-20 ms of mmap gather + insert work sits outside the prep critical
+path. Same thread, no races; the lag relative to the missing batch is
+unchanged.
+
+## Follow-up (scheduled)
+
 * Keys-only checksummed snapshot (~5 MiB, atomic rename) to warm-start
   after restart; payloads are a pure function of the read-only table.
