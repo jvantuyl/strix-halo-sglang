@@ -238,7 +238,8 @@ def _ple_stats_msg_suffix() -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("target", help="sglang source tree root (contains python/)")
+    ap.add_argument("target", nargs="?", default="/sgl-workspace/sglang",
+                    help="sglang source tree root (contains python/)")
     args = ap.parse_args()
 
     root = os.path.join(args.target, "python", "sglang", "srt")
