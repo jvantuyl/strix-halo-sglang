@@ -379,7 +379,10 @@ QWEN_IMPORT_ANCHOR = """from sglang.srt.utils.ple_hit_stats import (
 )"""
 
 QWEN_IMPORT_NEW = QWEN_IMPORT_ANCHOR + """
-from sglang.srt.utils.ple_hotset import PleHotsetCache as _PleHotsetCache"""
+from sglang.srt.utils.ple_hotset import (
+    PleHotsetCache as _PleHotsetCache,
+    make_ple_hotset as _make_ple_hotset,
+)"""
 
 # Production runs the CPU gather path on HIP (SGLANG_PLE_UVA_GATHER unset):
 # host_ids -> index_select on the mmap'd table -> bf16 copy. The hot cache
@@ -448,7 +451,9 @@ HOTSET_ATTACH_NEW = """        # gfx1151 patch 46: read-through hot-set cache (R
 
         _hot_rows = int(_os.environ.get("SGLANG_QWEN4_PLE_HOTSET_ROWS", "1048576"))
         self._hotset = (
-            _PleHotsetCache(_hot_rows, host_table.element_size() * host_table.shape[-1])
+            _make_ple_hotset(
+                _hot_rows, host_table.element_size() * host_table.shape[-1]
+            )
             if _hot_rows > 0
             else None
         )
@@ -471,22 +476,34 @@ def main() -> None:
         sys.exit(f"not an sglang tree: {args.target}")
 
     stats_path = os.path.join(root, "utils", "ple_hotset.py")
-    assert not os.path.exists(stats_path), (
-        f"ple_hotset.py already exists at {stats_path}; refusing to clobber"
-    )
     with open(stats_path, "w") as f:
         f.write(HOTSET_MODULE)
 
     qwen = os.path.join(root, "models", "qwen4_exp.py")
     with open(qwen) as f:
         text = f.read()
+    # Idempotent re-apply: if a previous run of this patch is present,
+    # unapply its qwen4_exp.py edits first (the module file is rewritten
+    # from scratch below; the reporter edit is reversed the same way).
+    if "ple_hotset" in text:
+        text = text.replace(NP_IMPORT_NEW, NP_IMPORT_OLD, 1)
+        text = text.replace(QWEN_IMPORT_NEW, QWEN_IMPORT_ANCHOR, 1)
+        text = text.replace(HOTSET_ATTACH_NEW, HOTSET_ATTACH_OLD, 1)
+        text = text.replace(CPU_GATHER_NEW, CPU_GATHER_OLD, 1)
+    rep = os.path.join(root, "managers", "scheduler_components",
+                       "metrics_reporter.py")
+    with open(rep) as f:
+        rtext = f.read()
+    if REPORTER_NEW in rtext:
+        rtext = rtext.replace(REPORTER_NEW, REPORTER_OLD, 1)
+        with open(rep, "w") as f:
+            f.write(rtext)
     for name, anchor in (
         ("import", QWEN_IMPORT_ANCHOR),
         ("cpu-gather", CPU_GATHER_OLD),
         ("attach", HOTSET_ATTACH_OLD),
     ):
         assert anchor in text, f"qwen4_exp.py {name} anchor moved"
-    assert "ple_hotset" not in text, "patch 46 already applied?"
 
     # numpy import: qwen4_exp.py starts `import torch` — add numpy above it.
     # Anchor conservatively on the first occurrence of a bare import torch.
