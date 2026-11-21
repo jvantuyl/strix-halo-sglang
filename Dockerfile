@@ -418,6 +418,55 @@ RUN python3 /tmp/patch_event_stream.py && rm /tmp/patch_event_stream.py
 COPY patches/patch_tool_param_recovery.py /tmp/patch_tool_param_recovery.py
 RUN python3 /tmp/patch_tool_param_recovery.py && rm /tmp/patch_tool_param_recovery.py
 
+# --- QSA opts into seq_lens_cpu: no per-forward device readback in spec (patch 37) ---
+# decide_needs_cpu_seq_lens() ORs the spec-chain backends' opt-out; QSA declared
+# False (mirroring upstream DSA, whose metadata is device-side) while its
+# speculative metadata path consumes the host copy and otherwise falls back to
+# int(sequence_lengths.max()) per forward — 4 syncs+D2H per MTP round. Opting in
+# reuses the per-round host copy the eagle worker already materializes. See
+# patches/37-qsa-cpu-seq-lens.md.
+COPY patches/patch_qsa_cpu_seq_lens.py /tmp/patch_qsa_cpu_seq_lens.py
+RUN python3 /tmp/patch_qsa_cpu_seq_lens.py && rm /tmp/patch_qsa_cpu_seq_lens.py
+
+# Patch 38: split hc-mix down kernel launch config (num_warps 8->2 + pipelining);
+# 56 -> 27 us per down+up pair at the model's shapes, same reduction order.
+# See patches/38-hc-mix-launch-tuning.md.
+COPY patches/patch_hc_mix_tune.py /tmp/patch_hc_mix_tune.py
+RUN python3 /tmp/patch_hc_mix_tune.py && rm /tmp/patch_hc_mix_tune.py
+
+# Patch 39: QSA speculative metadata builds from host-known lengths; removes
+# the per-round plan-stream .item() sync (thread-bound prefill chunks, part
+# of every decode round). See patches/39-qsa-host-metadata.md.
+COPY patches/patch_qsa_host_metadata.py /tmp/patch_qsa_host_metadata.py
+RUN python3 /tmp/patch_qsa_host_metadata.py && rm /tmp/patch_qsa_host_metadata.py
+
+# Patch 40: QSA indexer rope cache grows from a host-side bound; removes the
+# positions.max().item() stream sync per layer per chunk (83% of the
+# scheduler thread during 64k prefill). See patches/40-qsa-rope-host-bound.md.
+COPY patches/patch_qsa_rope_host_bound.py /tmp/patch_qsa_rope_host_bound.py
+RUN python3 /tmp/patch_qsa_rope_host_bound.py && rm /tmp/patch_qsa_rope_host_bound.py
+
+# Patch 41: QSA prefill MQA inputs from host mirrors; drops the per-layer
+# sequence_lengths.tolist() and cu_q max readbacks from the chunk-prefill
+# path. See patches/41-qsa-prefill-host-mirrors.md.
+COPY patches/patch_qsa_prefill_host_mirrors.py /tmp/patch_qsa_prefill_host_mirrors.py
+RUN python3 /tmp/patch_qsa_prefill_host_mirrors.py && rm /tmp/patch_qsa_prefill_host_mirrors.py
+
+# Patch 42: presharded reload reads one file ahead with fadvise(WILLNEED|
+# SEQUENTIAL) so NVMe readahead overlaps the GPU copies (758 MiB/s -> NVMe
+# ceiling). See patches/42-presharded-load-readahead.md.
+COPY patches/patch_presharded_load_readahead.py /tmp/patch_presharded_load_readahead.py
+RUN python3 /tmp/patch_presharded_load_readahead.py && rm /tmp/patch_presharded_load_readahead.py
+
+# gfx1151 patch 43: budget the KV pool from the dedicated VRAM carve (96 GiB
+# on this Strix Halo) instead of Linux MemAvailable. Device allocations live
+# in the carve; the old psutil-based metric measured the 32 GB Linux side,
+# where page-cache noise at load-end moved max_total_num_tokens between load
+# paths (477k mmap vs 270k O_DIRECT for identical device footprints). See
+# patches/43-umem-carve-budget.md.
+COPY patches/patch_umem_carve_budget.py /tmp/patch_umem_carve_budget.py
+RUN python3 /tmp/patch_umem_carve_budget.py && rm /tmp/patch_umem_carve_budget.py
+
 # File-level verification (build host has no GPU; runtime check on container start).
 # The AOT build installs the sgl_kernel package into site-packages.
 RUN python3 -c "import glob, os, sgl_kernel; sos = glob.glob(os.path.join(os.path.dirname(sgl_kernel.__file__), '*.so')); assert sos, 'no built sgl_kernel extensions found'; print(sos)"

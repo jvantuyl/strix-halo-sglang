@@ -284,3 +284,136 @@ missing piece before any performance claim here is meaningful.
 
 The concurrency result (4.76×) does not depend on this caveat: it is a scheduler property, and it
 holds regardless of how either side is quantized.
+
+
+## Decode-step attribution — Qwen3.8-Flash-Next (2026-11-19/20)
+
+Where one MTP round of the 125B model spends its time, measured to decide between
+kernel work and byte-count work on the dense path. Full data and scripts:
+`~/scratch/rocmfp4-port/` (`PROFILE.md`, `analyze_decode.py`, `936_kernel_trace.csv`).
+
+### Method: rocprofv3 wrap-launch, not attach
+
+`rocprofv3 --attach` is unusable on this build: the venv's `_rocm_sdk_core/lib`
+ships no unversioned `.so` symlinks (fixable by symlinking), and once the loader
+gets past that, the attach injection itself segfaults the scheduler at library
+load — before collecting anything. The working method is a **side instance
+launched under the profiler** (`rocprofv3 --kernel-trace --stats -f csv -d <out>
+-- python3 -m sglang.launch_server …`, production flags, presharded load, CUDA
+graphs intact). Two traps worth remembering:
+
+- Every traced process writes its **own** output to `<out>/<hostname>/<pid>_*.csv`.
+  The GPU kernels belong to the `sglang::scheduler` child, not PID 1.
+- Never `docker stop` a profiler-wrapped container. PID 1 *is* the profiler
+  runtime (it execs into the app); it intercepts SIGTERM/SIGINT and waits for
+  children that are themselves intercepted — deadlock, and the 90 s grace
+  SIGKILLs the un-flushed trace. Signal the server's subprocesses with TERM
+  instead; each child then finalizes and writes its own CSV.
+
+Capture: 86-token prompt, 220 generated tokens, temperature 0 — ~81 MTP rounds
+(accept len 2.67–2.80). Profiler overhead roughly doubles wall time per token
+(61 ms/token here vs ~25.6 ms/tok production), so shares are trustworthy,
+absolutes are inflated 10–25%.
+
+### Where an MTP round's GPU-busy time goes (123.6 ms/round)
+
+| Bucket | ms/round | share | effective BW |
+|---|---:|---:|---:|
+| Dense projections (target 48 layers + draft, hipBLASLt `Cijk_*MT128x128x32*`) | 48.7 | 39% | ~177 GB/s (79% of ~225 peak) |
+| lm_head passes — 3 draft + 1 verify × 1.27 GB bf16 | 23.4 | 19% | ~217 GB/s (96%) |
+| MoE (`fused_moe_kernel_gptq_awq`, int4 g32, tuned tiles) | 27.6 | 22% | well below the roof |
+| HyperConnection mix (`_hc_mix_down_split`/`_hc_mix_up_split`, 2/layer) | 13.0 | 10.5% | launch-latency, not bandwidth |
+| GDN recurrent | 1.1 | 0.9% | — |
+| QSA indexer | 0.5 | 0.4% | — |
+| MoE routing top-k + misc | ~9 | 8% | — |
+
+Verdicts: the dense surface (incl. heads, 68% of busy) sits at 79–96% of the
+memory roof — kernel work cannot move it, only fewer bytes (int8 tier,
+quality-gated) or fewer passes. GDN and QSA are confirmed non-targets. The
+HyperConnection mix is ~196 launches/round of near-empty-grid GEMMs (down-split:
+~4 CTAs of 40 CUs, 97 µs for a 16×2560×16 GEMM) — a launch-latency tax with real
+headroom. MoE runs below the roof but its upside is bounded (~10–14 ms/round).
+
+### The profiler's "stalls" are artifacts — measured on production
+
+The trace shows ~25% GPU-idle with 22 gaps over 50 ms (up to 185 ms). The
+production server does **not** stall like that: the patch-35 event stream
+(`step` events, `gap_ms` between consecutive forwards) over one continuous
+220-token decode gives p50 **144 ms**, stdev **15 ms**, max **156 ms** — a
+tight spike, zero outliers. First request after a boot is always ~2 s slower
+than warm state (every first-request measurement on this box has shown it;
+warm up before comparing). Residual picture: ~144 ms production round ≈
+~100–110 ms GPU busy + ~35 ms of diffuse host overhead — spread thin, which is
+why `--num-continuous-decode-steps` never helped on the 35B.
+
+### MTP steps 3→2 is a wash (2026-11-20)
+
+Side instance, identical request, no profiler:
+
+| config | wall (220 tok) | t/s | accept len |
+|---|---:|---:|---:|
+| steps 3 / draft 4 (production) | 13.59 s | 16.2 | 2.47 |
+| steps 2 / draft 3 | 13.80 s | 15.9 | 2.25 |
+
+The acceptance loss from one fewer drafted token cancels the removed draft
+forward. By the same arithmetic, steps 4 adds a full draft round to chase the
+smallest marginal acceptance gain plus a larger verify batch — projected wash;
+not measured. 3/4 stands.
+
+### Follow-ups shipped from this campaign
+
+- Patch 37: QSA declares `needs_cpu_seq_lens` — the per-forward
+  `int(sequence_lengths.max())` device readback in speculative metadata
+  (target-verify + draft-extend, 2× per round) is replaced by the per-round
+  host copy the eagle worker already materialized. Verified in production:
+  the per-boot warning is gone, warm-state round p50 135 ms (≥ baseline).
+- Patch 38: hc-mix split-kernel launch retuning (`num_warps` 8→2,
+  `num_stages=2` on the down kernel; grid constants untouched). The trace's
+  97 µs down-kernel figure was profiler-inflated — back-to-back it is 42 µs,
+  and the chain/occupancy fix takes the down+up pair from 56 to 27 µs with
+  the reduction order untouched. Production A/B: gap p50 135→131 ms,
+  220-token wall 13.78→13.32 s (−3.3%). Lesson: profile shares overstate
+  small-bucket wins ~2.4×; validate against standalone timings before
+  predicting end-to-end gains.
+- `start-qwen38.sh` no longer `exec`s docker run: stop signals are forwarded
+  via an explicit `docker stop` trap, and a scheduler crash (SGLang's SIGQUIT
+  cleanup exits 0) now produces a nonzero exit. The unit is `Restart=always`
+  — the server returns from any exit; `systemctl stop` still wins.
+
+### Prefill de-serialization: patches 39/40/41 (2026-11-20)
+
+The py-spy scheduler-thread profile during a cold 64k-token prefill was a
+sequential chain of device readbacks, each masking the next — removing one
+only exposed the following one, so the wall moved only when the chain
+cleared:
+
+| state | prefill wall (cold 64k) | profile dominator |
+|---|---|---|
+| Nov-14 baseline | 98 s (679 tok/s p50, chunk gaps to 9 s) | `_speculative_row_to_request` (75%) |
+| patch 39 | 82 s (712 tok/s p50, gaps 1–2 s) | `apply_rope` (83%) |
+| patch 40 | 83.0 s | `get_prefill_mqa_inputs` (82%) |
+| patch 41 | 84.0 s | `qsa_ordered_topk` (63%) — no readback |
+
+Patch 39 removed the big structural sync (`_speculative_row_to_request`'s
+device-side row mapping) and took the whole win (−16 s). Patches 40 (host
+position bound for the indexer rope cache) and 41 (host mirror for the
+prefill MQA gather + host grid bound for the chunk kernel) each removed a
+readback and left the wall flat — the exposed next sync paid the same
+wait. After 41 the profile's dominator is `qsa_ordered_topk`, which contains
+no readback at all: the scheduler thread now blocks on kernel-launch
+backpressure, i.e. it finally waits on the GPU itself. The
+de-serialization campaign is complete; further prefill gains must come
+from making the indexer top-k cheaper, not from removing syncs.
+
+Decode is unaffected throughout (13.3–13.9 s / 220 tok, GPU-bound), and the
+64k prefill result was confirmed with the event-probe gap structure
+(1–2 s chunk gaps vs 9 s before patch 39).
+
+Lessons recorded the hard way: (1) `/health` returning 200 is not proof of
+a good boot — the HTTP server answers before warmup completes; gate on the
+journal's ready line. (2) In-image checks must be run against the new
+image in a throwaway container *before* the production restart, and a
+source-assert test must exercise the real method (the first patch-41 draft
+added the mirror field to `QwenSparseAttnMetadata` while
+`get_prefill_mqa_inputs` lives on `QSAIndexerMetadata`; the AttributeError
+surfaced only in the production warmup).
