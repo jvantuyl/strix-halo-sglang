@@ -43,6 +43,11 @@ RETIRED = {
     "patch_wna16_rocm.py": "superseded by patch 16 (patches/16-wna16-rocm-dense.md)",
     # Fixed upstream: compressed_tensors.py dispatches ParallelLMHead itself.
     "patch_lmhead_rocm.py": "fixed upstream (ParallelLMHead dispatch at the pin)",
+    # Drafted 2026-11-21, never applied: fadvise WILLNEED is a no-op on this
+    # kernel, but forensics showed the churn it targets is first-touch of new
+    # rows on pathological probe content, not eviction. Decision parked on a
+    # fair natural-prose re-baseline (patches/44-ple-warm-prefetch.md).
+    "patch_ple_warm_prefetch.py": "drafted, not applied; decision parked on the re-baseline",
 }
 # Patches the base image, not the SGLang tree; only an image build can check it.
 BASE_IMAGE_PATCHES = {"fix_aiter_gfx1151_mxfp4.py"}
