@@ -504,3 +504,11 @@ RUN python3 /tmp/patch_hf_unknown_model_type.py && rm /tmp/patch_hf_unknown_mode
 # validated Triton MQA kernels (patches 24/26). Default stays TileLang.
 COPY patches/patch_qsa_tilelang_gate.py /tmp/patch_qsa_tilelang_gate.py
 RUN python3 /tmp/patch_qsa_tilelang_gate.py && rm /tmp/patch_qsa_tilelang_gate.py
+
+# --- gfx1151 patch 49: flash-attn availability probe without importing it ---
+# The probe's `import flash_attn` pulled in flash_attn_interface -> aiter,
+# and aiter's JIT rebuilt module_aiter_core (~14 s) in EVERY process start
+# (server boot, tuner workers, precompile generations) even with
+# SGLANG_USE_AITER=0. Probe via find_spec + __init__ source instead.
+COPY patches/patch_hf_flash_attn_probe.py /tmp/patch_hf_flash_attn_probe.py
+RUN python3 /tmp/patch_hf_flash_attn_probe.py && rm /tmp/patch_hf_flash_attn_probe.py
