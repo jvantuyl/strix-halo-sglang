@@ -13,7 +13,7 @@
 # registry mirror when Docker Hub is unreachable,
 # e.g. --build-arg BASE_IMAGE=mirror.gcr.io/kyuz0/vllm-therock-gfx1151:stable
 # See docs/BUILDING.md for details.
-ARG BASE_IMAGE=kyuz0/vllm-therock-gfx1151:stable@sha256:f89c8c689ade28877ade980ba0f29b3142af16c6ebb7f3f285311d38bc81a8a2
+ARG BASE_IMAGE=kyuz0/vllm-therock-gfx1151:latest@sha256:f8a7433d662b37b200ca19996d4013288071341ad514e66de69ea4871cfa3966
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
