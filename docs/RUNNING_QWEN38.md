@@ -810,6 +810,32 @@ worst TTFT). `--speculative-num-steps 2
 tok/s, 8 streams 60.0, 12 requests allowed; not better. Not on by default: it
 trades concurrency for single-stream speed.
 
+The draft's own MoE got tuned tiles on 2026-11-22
+(`E=512,N=320,device_name=AMD_Radeon_8060S_Graphics.json`, 12 batch sizes,
+produced by the no-launch precompile pipeline above and the strict-warm
+sweeps). Same server (rocpro10, cap 8, patches ≤ 49), same suite, second
+pass:
+
+| Prompt tokens | TTFT | Prefill | Decode (bs=1) |
+|---:|---:|---:|---:|
+| 228 | 0.6 s | 371 tok/s | 23.8 tok/s |
+| 2,187 | 3.3 s | 658 tok/s | 20.6 tok/s |
+| 8,214 | 11.7 s | 703 tok/s | 21.9 tok/s |
+| 31,988 | 45.5 s | 703 tok/s | 20.5 tok/s |
+
+Against the untiled-draft table above (183→3,372→13,467 rows): decode
++1–3 tok/s at short prompts and roughly flat at long ones; prefill ~1%
+lower at 8k/32k (within run-to-run noise). Mean accept length 2.40 over
+the suite (48 samples) vs 2.3–2.6 historical. Concurrent (128-token
+prompts, cap 8): 4/8 streams 42.7/68.8 tok/s aggregate, per-stream
+11.7/9.4; 16/20 streams queue at the cap (63.6/59.3 aggregate, worst TTFT
+26/50 s — cap behaviour, not a draft effect). Mixed 18×26k: shorts decode
+p50 8.1 tok/s (min 2.2), longs TTFT 93/134 s, minimum VRAM free 3.1 GiB
+(the allocator's high-water mark persists until `/flush_cache`; the mix
+bottoms at 5.8 GiB fresh per the pre-29 note above — the 3.1 here is the
+post-suite high-water reading, not a new low). Data:
+`bench/2026-11-22-bf16-draft-baseline.jsonl`.
+
 Verified end to end: chat with thinking (`reasoning_content` split out),
 structured tool calls (`finish_reason: tool_calls`), vision (exact OCR of
 rendered text plus shape/color identification, 128 image tokens), video
