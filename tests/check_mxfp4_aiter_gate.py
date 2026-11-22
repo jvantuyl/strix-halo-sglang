@@ -1,84 +1,69 @@
 #!/usr/bin/env python3
-"""check_mxfp4_aiter_gate.py — verify patch 50 in the image, no GPU needed.
+"""check_mxfp4_aiter_gate.py — verify patch 50 in the image, no GPU, no import.
 
-With SGLANG_USE_AITER unset (the deployment default), importing the
-quantization package must NOT import aiter (patch 50 gates the module-level
-import; aiter's JIT would otherwise rebuild module_aiter_core ~15 s). With
-SGLANG_USE_AITER=1, the aiter names must bind (real import attempted).
+Patch 50 gates mxfp4.py's module-level aiter import behind SGLANG_USE_AITER.
+The quantization package probes the GPU at import time on this stack, so this
+check inspects the patched source directly instead of importing it. The
+dynamic equivalent is free at every boot: with SGLANG_USE_AITER unset, a boot
+log no longer prints aiter's "start build [module_aiter_core]" line ~9 s in.
 
 Run: python3 tests/check_mxfp4_aiter_gate.py   (inside the image)
 """
 
-import os
-import subprocess
 import sys
 
-PROBE = (
-    "import sys; import sglang.srt.layers.quantization as q; "
-    "print('aiter' in sys.modules)"
+PATH = "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/mxfp4.py"
+NAMES = (
+    "shuffle_scale",
+    "shuffle_scale_a16w4",
+    "shuffle_weight",
+    "shuffle_weight_a16w4",
+    "dynamic_mxfp4_quant",
+    "e8m0_shuffle",
 )
-
-
-def run(env_value):
-    env = dict(os.environ)
-    env.pop("PYTHONPATH", None)
-    if env_value is None:
-        env.pop("SGLANG_USE_AITER", None)
-    else:
-        env["SGLANG_USE_AITER"] = env_value
-    return subprocess.run(
-        [sys.executable, "-c", PROBE], env=env, capture_output=True, text=True
-    )
 
 
 def main():
     failures = []
+    try:
+        src = open(PATH).read()
+    except OSError as e:
+        print(f"FAIL: cannot read {PATH}: {e}")
+        sys.exit(1)
 
-    # 1. Default (unset): aiter must not be imported by the quant package.
-    r = run(None)
-    if r.returncode != 0:
-        failures.append(f"default import failed: {r.stderr[-400:]}")
-    elif r.stdout.strip() != "False":
-        failures.append(
-            f"default: quant package imports aiter (patch 50 not effective):"
-            f" got {r.stdout.strip()!r}"
-        )
-
-    # 2. The gate OPENS with SGLANG_USE_AITER=1: static check that the
-    #    import sits behind `if _use_aiter:` (a dynamic probe would need
-    #    aiter's JIT to import cleanly, which may want a GPU).
-    import sglang.srt.layers.quantization.mxfp4 as _m
-
-    src = open(_m.__file__).read()
+    # 1. The aiter import sits behind `if _use_aiter:`.
     gate = src.find("if _use_aiter:")
     imp = src.find("from aiter.ops.shuffle import")
     if gate == -1 or imp == -1 or not (0 < gate < imp):
-        failures.append("static: aiter import not gated behind `if _use_aiter:`")
+        failures.append("aiter import not gated behind `if _use_aiter:`")
 
-    # 3. The skipped names bind to None, not stay undefined (loud failure at
-    #    use, no NameError from a stale module global).
-    probe_names = (
-        "import sglang.srt.layers.quantization.mxfp4 as m; "
-        "print(all(getattr(m, n, 'MISSING') is None for n in "
-        "('shuffle_scale','shuffle_scale_a16w4','shuffle_weight',"
-        "'shuffle_weight_a16w4','dynamic_mxfp4_quant','e8m0_shuffle'))"
-    )
-    env = dict(os.environ)
-    env.pop("PYTHONPATH", None)
-    env.pop("SGLANG_USE_AITER", None)
-    r = subprocess.run(
-        [sys.executable, "-c", probe_names], env=env, capture_output=True, text=True
-    )
-    if r.returncode != 0 or r.stdout.strip() != "True":
-        failures.append(f"names-not-None check failed: {r.stdout!r} {r.stderr[-300:]}")
+    # 2. All six names are pre-bound to None before the gate (chained
+    #    assignments), so an unguarded use fails loudly (TypeError) instead
+    #    of raising NameError.
+    prelude = src[: gate if gate != -1 else 0]
+    for line in (
+        "shuffle_scale = shuffle_scale_a16w4 = None",
+        "shuffle_weight = shuffle_weight_a16w4 = None",
+        "dynamic_mxfp4_quant = e8m0_shuffle = None",
+    ):
+        if line not in prelude:
+            failures.append(f"prelude missing assignment: {line}")
+    for name in NAMES:
+        if name not in prelude:
+            failures.append(f"{name} not pre-bound to None before the gate")
+
+    # 3. The gate is the patch's own marker (idempotence + provenance).
+    if "gfx1151 patch 50" not in src:
+        failures.append("patch 50 marker comment missing")
 
     if failures:
         print("FAIL:")
         for f in failures:
             print(" -", f)
         sys.exit(1)
-    print("check_mxfp4_aiter_gate: 3/3 OK "
-          "(default: no aiter; enabled: aiter imported; skipped names bind None)")
+    print("check_mxfp4_aiter_gate: 3/3 OK (gate behind _use_aiter, names "
+          "pre-bound None, marker present). Live check: boot with "
+          "SGLANG_USE_AITER=0 prints no aiter 'start build' line.")
 
 
 if __name__ == "__main__":
