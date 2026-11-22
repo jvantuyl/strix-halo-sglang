@@ -71,6 +71,15 @@ temporary copy:
    midpoint is swept in full. ``MOE_TUNE_BISECT=0`` gives the plain ascending
    sweep.
 
+   Known limitation (2026-11-22): the neighbour logic only considers sizes
+   from THIS run's ``--batch-sizes`` list. Partials from earlier runs with
+   the same tag (same model/dtype hash) sit in the same partial directory
+   and are merged into the final config, but their winners are invisible to
+   the quick check — a top-up sweep re-sweeps in full what an already-tuned
+   neighbour could have bracketed cheaply. Improvement candidate: have the
+   neighbour lookup consult any ``M=*.json`` partial in the partial
+   directory, not just this run's sizes.
+
 6. BLOCK_K filter. For int4 group quant the kernel derives the scale index per   element, so BLOCK_K may be any multiple of the group size. Upstream's
    filter only allows divisors.
 
