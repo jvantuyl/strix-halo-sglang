@@ -512,3 +512,12 @@ RUN python3 /tmp/patch_qsa_tilelang_gate.py && rm /tmp/patch_qsa_tilelang_gate.p
 # SGLANG_USE_AITER=0. Probe via find_spec + __init__ source instead.
 COPY patches/patch_hf_flash_attn_probe.py /tmp/patch_hf_flash_attn_probe.py
 RUN python3 /tmp/patch_hf_flash_attn_probe.py && rm /tmp/patch_hf_flash_attn_probe.py
+
+# --- patch 50: gate mxfp4.py's module-level aiter import on SGLANG_USE_AITER ---
+# mxfp4.py imported aiter unconditionally on HIP (the _use_aiter flag only
+# gates kernel USE), so aiter's JIT rebuilt module_aiter_core (~15 s) in
+# every process that imports the quantization package — server boots, tuner
+# workers, precompile generations. Models that are not mxfp4 never call the
+# imported functions.
+COPY patches/patch_mxfp4_aiter_gate.py /tmp/patch_mxfp4_aiter_gate.py
+RUN python3 /tmp/patch_mxfp4_aiter_gate.py && rm /tmp/patch_mxfp4_aiter_gate.py
