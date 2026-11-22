@@ -603,6 +603,99 @@ profile directory (`QWEN38_MOE_CONFIG_DIR=…`) so the two sets of tuning
 data never overwrite each other; see
 [`configs/moe/README.md`](../configs/moe/README.md).
 
+### Precompiling the MoE kernels from scratch
+
+After a Triton-cache wipe (or on a fresh box/image), the server's first boot
+recompiles every MoE kernel it will ever launch (~75 min of compile inside a
+boot). [`tools/moe_precompile.py`](../tools/moe_precompile.py) synthesizes
+the exact launch arguments of both fused-MoE GEMMs (provenance comments in
+the file header) and compiles them via `JITFunction.warmup` — no launch, no
+GPU benchmark — so the cache can be filled offline, per variant, before any
+boot or sweep. The catches learned the hard way (each one silently produced
+thousands of dead cache entries before the strict-warm check caught them):
+
+- `--model-shape`'s `N` is the **intermediate** size (320 here). The tuner's
+  merged-config *file name* says `N=640` because it names the kernel's N arg
+  (2× intermediate). Passing 640 doubles every synthesized weight tensor.
+- The **block-shape constexprs differ per consumer**. The tuner derives
+  `block_shape = [0, group_size]` from the checkpoint's compressed-tensors
+  `quantization_config.config_groups` (`[0, 32]` here) and passes it as
+  `group_n`/`group_k` constexprs even on the generic bf16 kernel; the
+  server's bf16 **draft** MoE has no block quant and passes `(0, 0)`.
+  Constexpr values are part of the cache key, so these are two disjoint sets
+  of entries: precompile BOTH.
+- `MOE_TUNE_STRICT_WARM=1` (tuner knob) verifies a precompile: it snapshots
+  the Triton cache before each config's first launch and raises listing any
+  config that still compiled. If it fires with *every* config cold, the
+  synthesis diverged from the real launch args (see the two items above);
+  do not just re-run.
+
+Common container shape (one worker; `--chunk 2000` keeps a generation to one
+batch size — recycles cost ~15 s of interpreter startup each and buy nothing
+at this worker count; Private_Dirty stays ~1–1.5 GiB):
+
+```
+docker run --rm --name moe-warm-<tag> --device=/dev/kfd --device=/dev/dri \
+  --ipc=host --security-opt seccomp=unconfined \
+  -v /opt/llm/models/Qwen3.8-Flash-Next-AWQ-INT4-ple-fp8:/models/qwen38:ro \
+  -v "$HOME/.cache/strix-halo-sglang-cache:/root/.cache/sglang" \
+  -v ~/strix-halo-sglang/tools:/tools:ro \
+  -v /var/tmp/gfx_space_full.json:/space_full.json:ro \
+  -e SGLANG_USE_AITER=0 -e SGLANG_FORCE_NATIVE_LAYERNORM=1 \
+  -e PYTORCH_TUNABLEOP_TUNING=0 \
+  strix-halo-sglang:rocpro10 \
+  python3 /tools/moe_precompile.py --model-shape '<SHAPE>' \
+    --space-file /space_full.json \
+    --batch-sizes 1 2 4 8 16 32 64 512 1024 4096 --slice 0:1 --chunk 2000 \
+    > /var/tmp/moe-warm-<tag>.log 2>&1
+```
+
+(Redirect the log from the **host** side; a redirect inside the container
+lands in the container's own `/var/tmp` unless that is mounted, and a stale
+or foreign-owned file at the target path can fail the redirect at startup —
+which kills the run before it starts.)
+
+The required runs, all against `~/.cache/strix-halo-sglang-cache`:
+
+| # | Variant | `--model-shape` | Serves |
+|---|---|---|---|
+| 1 | bf16 draft, server-facing | `{"kind":"bf16","E":512,"K":2560,"N":320,"topk":10}` | the server's bf16 draft MoE launches (group 0,0) |
+| 2 | bf16, tuner-facing | same + `,"block_shape":[0,32]` | strict-warm sweeps (the tuner's launches carry the AWQ block shape) |
+| 3 | int4 target | `{"kind":"int4","E":512,"K":2560,"N":320,"topk":10,"group_size":32}` | the deployed int4 target MoE (`int4_w4a16` config files) |
+
+Batch sizes `1 2 4 8 16 32 64 512 1024 4096` are the server's operating
+cover; keys share across M through Triton's specialization classes, so the
+whole set costs roughly 15–25 min per variant (M=64 is the expensive one,
+~10 min of fresh compiles; later Ms are mostly hits). The search-space file
+is the wrapper's 1,560-config gfx1151 space (`gfx1151_configs()` in
+[`tools/tune_moe_gfx1151.py`](../tools/tune_moe_gfx1151.py)); a copy lives
+at `/var/tmp/gfx_space_full.json` on this box, and the wrapper regenerates
+the same list whenever it runs without `--search-space-file`. Before
+sweeping batch sizes the precompile does not cover (e.g. 24, 48, 96, and the
+optional 256 probe), run variants 1 **and** 2 again with `--batch-sizes 24
+48 96 256` — otherwise the strict-warm check fails those sweeps by
+construction.
+
+Arm a watcher instead of polling (see the job-watch skill): `--ok 'M=4096:
+DONE'` (last batch size), `--fail 'FAILED|Traceback'`, `--dead
+'moe_precompile'`, and a generous `--timeout`. A clean run prints one
+`M=<m>: DONE 1560 configs (…ok) in <t>s` per size and zero `FAILED` lines.
+
+For a **sweep** run (`tune_moe_gfx1151.py`), mount the repo's config
+directory and set the container workdir to it (`-w /out -v
+~/strix-halo-sglang/configs/moe/qwen38-flash-next:/out`): the wrapper writes
+its merged `E=…json` to the **current directory** (there is no
+`--output-dir`; passing one is passed through to the inner tuner and fails
+the sweep with rc=2). The inner tuner rewrites that file after each
+completed batch size, and the per-size winners also persist as
+`M=<m>.json` partials under the mounted cache's `moe-tune/<hash>/`
+directory (one hash per run; the same hash recurs for identical
+arguments), so a crashed or lost merged file can always be rebuilt from
+the partials. For the sweep watcher, keep `Traceback` **out** of `--fail`:
+a strict-warm failure prints one and the wrapper's retry-from-checkpoint is
+the expected recovery; `--fail 'giving up on M=|WORKERS FAILED'` catches
+only real failures.
+
 ### Speculative decoding (MTP)
 
 The checkpoint ships one MTP layer; `--speculative-algorithm NEXTN` loads it

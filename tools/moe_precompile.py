@@ -96,6 +96,14 @@ def build_tensors(kind, E, K, N, topk, group_size):
 
     Shapes mirror the tuner harness's benchmark_config (see provenance).
     N here is the per-shard intermediate size; w1 carries 2N (gated).
+
+    CAUTION (2026-11-22, cost the first bf16 run 3112 dead cache entries):
+    the tuner's merged-config FILE NAME uses N = 2*intermediate (the kernel's
+    N arg, e.g. "E=512,N=640" for a model with intermediate 320), but this
+    tool wants the INTERMEDIATE (N=320 for that same model). Passing the
+    file-name value here doubles every weight tensor and silently produces
+    keys no real launch will ever ask for. The strict-warm sweep check is
+    what caught it: every config compiled cold at the tuner.
     """
     t = {"E": E, "K": K, "N": N, "topk": topk}
     if kind == "bf16":
@@ -231,7 +239,7 @@ def warm_generic(cfg, m, t):
         w1.shape[1], A.shape[1], sorted_ids.shape[0], topk_ids.numel(),
         A.stride(0), A.stride(1),
         w1.stride(0), w1.stride(2), w1.stride(1),
-        0, 0,
+        *(t.get("block_shape") or (0, 0)),
         C.stride(-2), C.stride(-1),
         0, 0, 0, 0, 0,
         0, 0,
@@ -252,7 +260,7 @@ def warm_generic(cfg, m, t):
         w2.shape[1], A2.shape[1], sorted_ids.shape[0], topk_ids.numel(),
         A2.stride(0), A2.stride(1),
         w2.stride(0), w2.stride(2), w2.stride(1),
-        0, 0,
+        *(t.get("block_shape") or (0, 0)),
         C2.stride(-2), C2.stride(-1),
         0, 0, 0, 0, 0,
         0, 0,
@@ -265,10 +273,32 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-shape", required=True,
                     help='JSON: {"kind": "bf16"|"int4", "E","K","N","topk"'
-                         ' [,"group_size"]}')
+                         " — N is the INTERMEDIATE size, NOT the tuner"
+                         " file-name N (which is 2N); see build_tensors."
+                         ' Optional "block_shape": [group_n, group_k] — the'
+                         " tuner passes the checkpoint's quant block shape"
+                         " (compressed-tensors config_groups ->"
+                         " [0, group_size]; [0, 32] here) as group_n/group_k"
+                         " constexprs even for the generic bf16 kernel, so"
+                         " precompiles meant to satisfy the tuner's"
+                         " strict-warm check must set it. Omit for the"
+                         " server's bf16-draft launches (no block quant"
+                         ' -> group 0,0). [,"group_size"]}')
     ap.add_argument("--space-file", required=True)
     ap.add_argument("--batch-sizes", type=int, nargs="+", required=True)
     ap.add_argument("--slice", required=True, help="i:K worker slice")
+    ap.add_argument("--skip", type=int, default=0,
+                    help="within-M offset: configs already handled by "
+                         "earlier generations in the FIRST unfinished M")
+    ap.add_argument("--skip-ms", type=lambda s: [int(x) for x in s.split(",")]
+                    if s else [], default=None,
+                    help="comma-separated Ms fully covered by earlier "
+                         "generations")
+    ap.add_argument("--chunk", type=int, default=200,
+                    help="configs per worker generation; the worker re-execs "
+                         "itself (os.execv) at the chunk boundary so Triton's "
+                         "in-process kernel cache and LLVM state are released "
+                         "instead of growing for the whole sweep")
     args = ap.parse_args()
 
     shape = json.loads(args.model_shape)
@@ -282,17 +312,30 @@ def main():
 
     i, k = map(int, args.slice.split(":"))
     mine = space[i::k]
+    # Resume is per-M: --skip is a within-M offset for the FIRST unfinished
+    # M only, and --skip-ms names Ms that earlier generations fully covered.
+    # (A global skip carried into later Ms and silently dropped most of
+    # their config coverage — bug found 2026-11-22 via the strict-warm check.)
+    ms = [m for m in args.batch_sizes if m not in set(args.skip_ms or [])]
+    # `mine` stays UNTRIMMED: --skip selects the absolute starting position
+    # within the first unfinished M, so the displayed total stays 1560 across
+    # generations and the recycle condition compares like with like.
+    if not mine or not ms:
+        return
+
     t = build_tensors(shape["kind"], shape["E"], shape["K"], shape["N"],
                       shape["topk"], shape.get("group_size"))
     warm = warm_gptq if shape["kind"] == "int4" else warm_generic
 
-    # First warmup pays the one-time Triton/LLVM infra cost; report it.
-    t0 = time.perf_counter()
     failed = 0
-    for mi, m in enumerate(args.batch_sizes):
+    done = 0
+    for mi, m in enumerate(ms):
+        skip_here = args.skip if mi == 0 else 0
         slow = 0
         t_m = time.perf_counter()
         for ci, cfg in enumerate(mine):
+            if ci < skip_here:
+                continue
             try:
                 warm(cfg, m, t)
                 slow += 1
@@ -300,8 +343,26 @@ def main():
                 failed += 1
                 print(f"[w{i}] M={m} cfg={cfg} FAILED: {type(e).__name__}: {e}",
                       flush=True)
+            done += 1
             if (ci + 1) % 25 == 0 or ci + 1 == len(mine):
                 print(f"[w{i}] M={m}: {ci + 1}/{len(mine)} compiled", flush=True)
+            if done >= args.chunk and ci + 1 < len(mine):
+                # Recycle: a fresh interpreter drops Triton's in-process
+                # kernel cache and LLVM state; resume this M at its position
+                # (per-M offset, and carry forward already-finished Ms).
+                print(f"[w{i}] recycling after {done} configs", flush=True)
+                prev_ms = list(args.skip_ms or []) + ms[:mi]
+                # Appended flags override earlier ones in argparse, so no
+                # filtering of sys.argv is needed.
+                os.execv(sys.executable,
+                         [sys.executable, os.path.abspath(__file__)]
+                         + sys.argv[1:]
+                         + ["--skip", str(ci + 1),   # ABSOLUTE position in
+                            # mine; do NOT subtract skip_here — the parent's
+                            # skip is already reflected in ci. Subtracting it
+                            # loops forever at the same window (found by
+                            # watching a real run circle 236 recycles).
+                            "--skip-ms", ",".join(str(x) for x in prev_ms)])
         print(f"[w{i}] M={m}: DONE {len(mine)} configs ({slow} ok) "
               f"in {time.perf_counter() - t_m:.0f}s", flush=True)
     if failed:
