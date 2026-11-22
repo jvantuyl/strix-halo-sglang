@@ -103,6 +103,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 TUNER_DIR = os.environ.get(
     "SGLANG_MOE_TUNER_DIR", "/sgl-workspace/sglang/benchmark/kernels/fused_moe_triton"
@@ -255,6 +256,33 @@ replace(
     "    _gfx_eager_last[0] = eager_us\n"
     f"    if eager_us > 2 * {BAIL_FACTOR} * best_eager_us:\n"
     "        _gfx_last_note[0] = f'eager={eager_us:.1f}'\n        return float('inf')\n",
+)
+# Warm-only mode (bulk pre-compilation): return right after the first
+# JIT-compiling launch, before any measurement. Applied after the eager
+# patch above, so the check lands between the warmup sync and the eager
+# instrumentation and skips the eager exec as well. The worker runs the
+# normal --tune path with MOE_TUNE_PARTIAL_DIR pointed at scratch, so no
+# warm-pass "winner" ever reaches the real partial directory.
+replace(
+    "    # JIT compilation & warmup\n    run()\n    torch.cuda.synchronize()\n",
+    "    # JIT compilation & warmup\n    run()\n    torch.cuda.synchronize()\n"
+    "    if os.environ.get('MOE_TUNE_WARM_ONLY') == '1':\n"
+    "        return 0.0\n",
+)
+# Cache-key logging for the pre-compile pass: record every Triton cache
+# entry the launch path resolves to, so the touched set (ground truth for
+# cache quarantine and completeness checks) can be collected per worker.
+replace(
+    "from ray.experimental.tqdm_ray import tqdm\n",
+    "from ray.experimental.tqdm_ray import tqdm\n"
+    "if os.environ.get('MOE_TUNE_KEY_LOG'):\n"
+    "    import triton.compiler.compiler as _tcc\n"
+    "    _gfx_real_gcm = _tcc.get_cache_manager\n"
+    "    def _gfx_logged_gcm(key, *a, **k):\n"
+    "        with open(os.environ['MOE_TUNE_KEY_LOG'], 'a') as _f:\n"
+    "            _f.write(key + '\\n')\n"
+    "        return _gfx_real_gcm(key, *a, **k)\n"
+    "    _tcc.get_cache_manager = _gfx_logged_gcm\n",
 )
 replace(
     "    # Warmup\n    for _ in range(5):\n        graph.replay()\n    torch.cuda.synchronize()\n",
@@ -416,6 +444,13 @@ with open(patched_path, "w") as f:
     f.write(src)
 
 argv = sys.argv[1:]
+PRECOMPILE = "--precompile" in argv
+PRECOMPILE_WORKERS = 4
+if "--precompile-workers" in argv:
+    i = argv.index("--precompile-workers") + 1
+    PRECOMPILE_WORKERS = int(argv[i])
+    argv = argv[:i - 1] + argv[i + 1:]
+argv = [a for a in argv if a != "--precompile"]
 if "--search-space-file" not in argv:
     space_path = os.path.join(work_dir, "gfx1151_search_space.json")
     with open(space_path, "w") as f:
@@ -472,6 +507,73 @@ os.makedirs(partial_dir, exist_ok=True)
 print(f"tune_moe_gfx1151: work dir {work_dir}, partials in {partial_dir}", flush=True)
 if env.get("MOE_TUNE_SEED_FILE"):
     print(f"tune_moe_gfx1151: seeding from {env['MOE_TUNE_SEED_FILE']}", flush=True)
+
+# --precompile: bulk Triton pre-compilation without any measurement. For
+# every requested batch size, K worker processes each warm a disjoint slice
+# of the search space through the tuner's own harness in warm-only mode
+# (one JIT-compiling launch per config, then return). Each worker logs every
+# cache key it resolves; the merged log is the ground-truth "touched" set
+# for cache quarantine and the verify pass. Workers write their (meaningless
+# warm-only) winners into a scratch partial dir so the real one is untouched.
+# Workers are subprocesses, not forks: the tuner's import chain initializes
+# CUDA at import time (fp8 arch detection), and forking after CUDA init is
+# unsupported - so K is bounded by host RAM (~2.5 GB per worker), not CPUs.
+if PRECOMPILE:
+    warm_partial = os.path.join(work_dir, "warm-partial")
+    os.makedirs(warm_partial, exist_ok=True)
+    sizes = sorted(set(batch_sizes))
+    # By this point argv always carries --search-space-file (the wrapper
+    # appends the generated gfx1151 space if the user did not supply one).
+    base_space = argv[argv.index("--search-space-file") + 1]
+    with open(base_space) as f:
+        space = json.load(f)
+
+    def warm_args(slice_path):
+        a = list(argv)
+        a[a.index("--search-space-file") + 1] = slice_path
+        return a
+
+    for m in sizes:
+        t0 = time.time()
+        kids = []
+        for w in range(PRECOMPILE_WORKERS):
+            slice_path = os.path.join(work_dir, f"warm_space_M={m}_w{w}.json")
+            with open(slice_path, "w") as f:
+                json.dump(space[w::PRECOMPILE_WORKERS], f)
+            wenv = dict(env)
+            wenv["MOE_TUNE_WARM_ONLY"] = "1"
+            wenv["MOE_TUNE_KEY_LOG"] = os.path.join(partial_dir, f"keys-M={m}-w{w}.log")
+            wenv["MOE_TUNE_PARTIAL_DIR"] = warm_partial
+            wenv.pop("MOE_TUNE_SEED_FILE", None)  # seeds are irrelevant when not measuring
+            kids.append(
+                subprocess.Popen(
+                    [sys.executable, patched_path]
+                    + warm_args(slice_path)
+                    + ["--batch-sizes", str(m), "--tune"],
+                    env=wenv,
+                    stdout=subprocess.DEVNULL,
+                )
+            )
+        for k in kids:
+            k.wait()
+        bad = [w for w, k in enumerate(kids) if k.returncode != 0]
+        keys = set()
+        for w in range(PRECOMPILE_WORKERS):
+            p = os.path.join(partial_dir, f"keys-M={m}-w{w}.log")
+            if os.path.exists(p):
+                with open(p) as f:
+                    keys |= {l.strip() for l in f if l.strip()}
+        with open(os.path.join(partial_dir, "touched_keys.txt"), "a") as f:
+            f.write("\n".join(sorted(keys)) + "\n")
+        print(
+            f"tune_moe_gfx1151: precompile M={m}: {len(keys)} cache keys, "
+            f"{time.time() - t0:.0f}s"
+            + (f", WORKERS FAILED rc={bad}" if bad else ""),
+            flush=True,
+        )
+        if bad:
+            sys.exit(f"tune_moe_gfx1151: precompile worker failure at M={m}")
+    sys.exit(0)
 
 BISECT = os.environ.get("MOE_TUNE_BISECT", "1") != "0"
 # Widest bracket (in list positions) a quick check may fill in. Adjacent sizes
