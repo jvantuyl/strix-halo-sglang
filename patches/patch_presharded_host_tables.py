@@ -50,7 +50,7 @@ And two things about the cache directory itself:
   6. The load walks 222k tensors, the dump hashes every tensor and writes
      ~70 GB of files, and a later boot copies them back, all without a line
      in the log. Each phase now logs its size up front, a progress line
-     every 15 s (items, GiB, rate, estimated time left) and a summary at the
+     every 5 s (items, GiB, rate, estimated time left) and a summary at the
      end. The load wrapper is in DefaultModelLoader._get_weights_iterator,
      so every load format gets it. Upstream's tqdm shard bars, which redraw
      with carriage returns and turn the surrounding log into "[N blob
@@ -321,7 +321,7 @@ new = """class _LoadProgress:
         total_bytes: int,
         total_items: Optional[int],
         unit: str = "items",
-        every_s: float = 15.0,
+        every_s: float = 5.0,
     ):
         self.phase = phase
         self.total_bytes = total_bytes

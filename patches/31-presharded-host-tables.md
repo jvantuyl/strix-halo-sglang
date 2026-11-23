@@ -87,7 +87,7 @@ And two things about the cache directory itself:
   six minutes: the normal load (222k tensors from 20 shard files; upstream's
   tqdm bar is per file and does not reach the log here), then hashing every
   tensor (4 threads), then writing ~70 GB of files; a later boot's copy-back
-  was silent too. Each phase now logs its size up front, a line every 15 s
+  was silent too. Each phase now logs its size up front, a line every 5 s
   with items, GiB, rate and estimated time left, and a summary with the
   elapsed time: `Weights load (20 shard files): 101352 tensors, 9.8/21.9 GiB
   (45%), 96 MiB/s, 105 s elapsed, ~130 s left`, `Presharded dump rank 0,
