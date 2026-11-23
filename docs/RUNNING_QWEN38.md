@@ -840,6 +840,35 @@ bottoms at 5.8 GiB fresh per the pre-29 note above — the 3.1 here is the
 post-suite high-water reading, not a new low). Data:
 `bench/2026-11-22-bf16-draft-baseline.jsonl`.
 
+Cap raised 8→12 with graph tiers 1..12 (`QWEN38_CUDA_GRAPH_MAX_BS=12`,
+`QWEN38_MAX_RUNNING_REQUESTS=12`, hotsets 2M rows, patches ≤ 52,
+`max_total_num_tokens=358912` after the 60 mamba slots; rocpro10,
+2026-11-23, `bench/2026-11-23-cap12-dev52.jsonl`, same suite, 2 passes):
+
+| Prompt tokens | TTFT (p1/p2) | Prefill (p2) | Decode (p2) |
+|---:|---:|---:|---:|
+| 228 | 0.7 / 0.6 s | 366 tok/s | 23.5 tok/s |
+| 2,187 | 3.9 / 3.3 s | 654 tok/s | 20.5 tok/s |
+| 8,214 | 11.4 / 11.4 s | 718 tok/s | 21.8 tok/s |
+| 31,988 | 47.0 / 45.8 s | 698 tok/s | 20.5 tok/s |
+
+Single-stream is flat vs the cap-8 baseline (p2 within noise); p1
+(cold-cache) rows are *better* than baseline p1 (prefill 330 vs 194 at
+228, 724 vs 600 at 8k) — the 2M hotset catches more of the first-touch
+misses. Concurrent 128-token (p2, cap-8 baseline in parens): 4 → 46.4
+(42.7) agg; 8 → 65.6 (68.8) agg, per-stream 8.9 (9.4) — slight tax at 8;
+12 → **78.9 agg, per-stream 7.2**, no queue (ttft 1.5 s) — the new sweet
+spot, +14% aggregate over the best cap-8 point; 16 → 68.3 (63.6),
+ttft_max 30 s; 20 → 72.2 (59.3), ttft_max 32 s (baseline 50) — the two
+extra slots drain the queue faster even above cap, but aggregate at
+16/20 sits *below* n=12, so raising cap beyond 12 trades per-stream and
+aggregate for queue latency only. Mixed 18×short + 2×26k: shorts p50
+6.6 tok/s with the queued tail at 2.1 (6 shorts wait behind the cap
+while both 26k prefills run; ttft_max 33.5 s, longs 75/118 s), zero
+errors everywhere. Min VRAM free 2.8 GiB after the suite (3.6 before) —
+above the 2 GiB health line but thinner than cap-8's 3.1. **Verdict:
+cap 12 stays; 16 rejected** (aggregate down, VRAM margin down).
+
 Verified end to end: chat with thinking (`reasoning_content` split out),
 structured tool calls (`finish_reason: tool_calls`), vision (exact OCR of
 rendered text plus shape/color identification, 128 image tokens), video
