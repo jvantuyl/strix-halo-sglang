@@ -63,6 +63,24 @@ GROUP = 32
 ZERO_SCALE = 1e-12  # bf16-representable stand-in for all-zero groups only
 
 
+def draft_int4_ignore(ignore):
+    """Keep BF16 projections excluded under both checkpoint and runtime names."""
+    result = [
+        name for name in ignore
+        if name not in ("mtp.layers.0.mlp.experts", r"re:mtp\..*")
+    ]
+    # Qwen4ExpForCausalLMMTP does not declare a packed_modules_mapping.
+    # The three Q/K/V exclusions and the shared expert's gate/up exclusions
+    # therefore do not match the fused linears the draft actually allocates.
+    for name in (
+        "mtp.layers.0.self_attn.qkv_proj",
+        "mtp.layers.0.mlp.shared_expert.gate_up_proj",
+    ):
+        if name not in result:
+            result.append(name)
+    return result
+
+
 def quantize_int4_asym(w):
     """bf16 [N, K] -> (packed I32 [N, K//8], scale BF16 [N, K//32], zp I32 [N//8, K//32]).
 
@@ -274,9 +292,7 @@ def main():
 
     # --- config: un-ignore the draft experts only ---
     before = len(ignore)
-    cfg["quantization_config"]["ignore"] = [
-        e for e in ignore if e not in ("mtp.layers.0.mlp.experts", "re:mtp\\..*")
-    ]
+    cfg["quantization_config"]["ignore"] = draft_int4_ignore(ignore)
     json.dump(cfg, open(cfg_path, "w"), indent=2)
     print(f"ignore list: {before} -> {len(cfg['quantization_config']['ignore'])} entries")
     print("done. Next boot: presharded dump + PLE table regenerate; prune stale dump subfolders first.")
