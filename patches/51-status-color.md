@@ -17,15 +17,27 @@ Wrap five fields in ANSI color (module-level constants, read once at import;
 
 | Field | Color |
 |---|---|
-| `gen throughput (token/s):` (decode) | light green (92) |
-| `input throughput (token/s):` (prefill) | dark green (32) |
+| `gen throughput (token/s):` (decode) | bright green (92) |
+| `input throughput (token/s):` (prefill) | bright cyan (96) |
 | `#pending-token:` | yellow (33) |
-| `#running-req:` (prefill + decode) | magenta (35) |
-| `#queue-req:` | red (31) |
+| `#running-req:` (prefill + decode + flush refusal) | bright magenta (95) |
+| `#queue-req:` (prefill + decode tail + flush refusal) | red (31) |
 
-Six edit sites: five f-string segments in the prefill message, one combined
-f-string in the decode message (`#running-req` lives inside it, split with
-the color constants spliced in around the label+value).
+2026-11-23 tuning after live-journal feedback: dark green 32 was too dark
+on the user's theme and plain magenta 35 read as unhighlighted, so prefill
+moved to bright cyan 96 and `#running-req` to bright magenta 95. The same
+pass extended coverage to every log emitter of the fields: the decode
+tail's `#queue-req` in the metrics reporter, and the flush-cache refusal's
+`#queue-req`/`#running-req` in `managers/scheduler.py` (which imports the
+constants from the metrics reporter — no new import cycle: scheduler
+already imports it at module top, and metrics_reporter imports scheduler
+only under TYPE_CHECKING). The `#queue-req=` / `#running-req=` spellings
+in the attach/detach rejection **API messages are deliberately left
+plain** — they are machine-read response payloads, not log lines.
+
+Ten edit sites: seven in the metrics reporter (five prefill-segment
+f-strings, the decode line's combined f-string, the decode tail), three in
+scheduler.py (import block, two flush-refusal f-strings).
 
 ## Design constraint: parsers keep working
 

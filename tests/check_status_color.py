@@ -16,21 +16,37 @@ import sys
 
 PATH = ("/sgl-workspace/sglang/python/sglang/srt/managers/"
         "scheduler_components/metrics_reporter.py")
+SCHED_PATH = "/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py"
 
-# (wrapped form in the source, color, label) for the six edit sites.
+# (file key, wrapped form in the source, color, label) for the edit sites.
 SITES = [
-    ('f"{_CLR_RUN}#running-req: {prefill_stats.num_running_reqs.total}{_CLR_END}, "',
-     "\x1b[35m", "#running-req"),
-    ('f"{_CLR_QUEUE}#queue-req: {len(self.scheduler.waiting_queue)}{_CLR_END}, "',
+    ("m", 'f"{_CLR_RUN}#running-req: {prefill_stats.num_running_reqs.total}{_CLR_END}, "',
+     "\x1b[95m", "#running-req"),
+    ("m", 'f"{_CLR_QUEUE}#queue-req: {len(self.scheduler.waiting_queue)}{_CLR_END}, "',
      "\x1b[31m", "#queue-req"),
-    ('f"{_CLR_PEND}#pending-token: {prefill_stats.num_pending_tokens}{_CLR_END}, "',
+    ("m", 'f"{_CLR_PEND}#pending-token: {prefill_stats.num_pending_tokens}{_CLR_END}, "',
      "\x1b[33m", "#pending-token"),
-    ('f"{_CLR_PRE}input throughput (token/s): {self.last_input_throughput:.2f}{_CLR_END}"',
-     "\x1b[32m", "input throughput (token/s)"),
-    ('f"Decode batch{iter_msg}, {_CLR_RUN}#running-req: {num_running_reqs}{_CLR_END}, {token_usage_msg}"',
-     "\x1b[35m", "#running-req"),
-    ('f"{_CLR_GEN}gen throughput (token/s): {self.last_gen_throughput:.2f}{_CLR_END}, "',
+    ("m", 'f"{_CLR_PRE}input throughput (token/s): {self.last_input_throughput:.2f}{_CLR_END}"',
+     "\x1b[96m", "input throughput (token/s)"),
+    ("m", 'f"Decode batch{iter_msg}, {_CLR_RUN}#running-req: {num_running_reqs}{_CLR_END}, {token_usage_msg}"',
+     "\x1b[95m", "#running-req"),
+    ("m", 'f"{_CLR_GEN}gen throughput (token/s): {self.last_gen_throughput:.2f}{_CLR_END}, "',
      "\x1b[92m", "gen throughput (token/s)"),
+    ("m", 'f"{_CLR_QUEUE}#queue-req: {len(self.scheduler.waiting_queue)}{_CLR_END}"',
+     "\x1b[31m", "#queue-req (decode tail)"),
+    ("s", 'f"{_CLR_QUEUE}#queue-req: {len(self.waiting_queue)}{_CLR_END}, "',
+     "\x1b[31m", "#queue-req (flush refusal)"),
+    ("s", 'f"{_CLR_RUN}#running-req: {len(self.running_batch.reqs)}{_CLR_END}"',
+     "\x1b[95m", "#running-req (flush refusal)"),
+    ("s", """from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    _CLR_END,
+    _CLR_QUEUE,
+    _CLR_RUN,
+    RECORD_STEP_TIME,
+    PrefillStats,
+    SchedulerMetricsReporter,
+)""",
+     "", "scheduler imports the color constants"),
 ]
 
 # journal_stats.py's two regexes, plus the runbook grep-style extractions.
@@ -45,12 +61,12 @@ PARSER_PATTERNS = [
 
 SAMPLE_PREFILL = (
     "Prefill batch [8], #new-seq: 1, #new-token: 1024, #cached-token: 70144, "
-    "\x1b[35m#running-req: 3\x1b[0m, \x1b[31m#queue-req: 0\x1b[0m, "
+    "\x1b[95m#running-req: 3\x1b[0m, \x1b[31m#queue-req: 0\x1b[0m, "
     "\x1b[33m#pending-token: 1342\x1b[0m, backend: False, "
-    "\x1b[32minput throughput (token/s): 500.26\x1b[0m"
+    "\x1b[96minput throughput (token/s): 500.26\x1b[0m"
 )
 SAMPLE_DECODE = (
-    "Decode batch [7], \x1b[35m#running-req: 4\x1b[0m, token usage: 0.41, "
+    "Decode batch [7], \x1b[95m#running-req: 4\x1b[0m, token usage: 0.41, "
     "\x1b[92mgen throughput (token/s): 2.63\x1b[0m, accept len: 2.91"
 )
 
@@ -58,21 +74,30 @@ SAMPLE_DECODE = (
 def main():
     failures = []
     try:
-        src = open(PATH).read()
+        srcs = {"m": open(PATH).read(), "s": open(SCHED_PATH).read()}
     except OSError as e:
-        print(f"FAIL: cannot read {PATH}: {e}")
+        print(f"FAIL: cannot read source: {e}")
         sys.exit(1)
+    src = srcs["m"]
+    sched = srcs["s"]
 
-    # 1. All six edit sites wrapped, with the right color constant.
-    for wrapped, color, label in SITES:
-        if wrapped not in src:
+    # 1. All edit sites wrapped, with the right color constant.
+    for key, wrapped, color, label in SITES:
+        if wrapped not in srcs[key]:
             failures.append(f"edit site missing: {label} ({color} variant)")
     # 2. Color constants defined once, with the opt-out branch.
     if src.count('_CLR_GEN = "\\033[92m"') != 1:
-        failures.append("light-green constant missing or duplicated")
+        failures.append("bright-green constant missing or duplicated")
+    if src.count('_CLR_RUN = "\\033[95m"') != 1:
+        failures.append("bright-magenta constant missing or duplicated")
+    if src.count('_CLR_PRE = "\\033[96m"') != 1:
+        failures.append("bright-cyan constant missing or duplicated")
     if 'environ.get("SGLANG_QWEN4_STATUS_COLOR", "1") == "0"' not in src:
         failures.append("SGLANG_QWEN4_STATUS_COLOR=0 opt-out missing")
-    # 3. The un-colored originals are gone (all six were unique).
+    # 3. The un-colored log originals are gone (each was unique). The
+    #    API-response "#queue-req=" / "#running-req=" variants (attach/
+    #    detach rejection messages, machine-read by clients) must stay
+    #    plain and untouched.
     for plain in (
         'f"#running-req: {prefill_stats.num_running_reqs.total}, "',
         'f"#queue-req: {len(self.scheduler.waiting_queue)}, "',
@@ -83,6 +108,14 @@ def main():
     ):
         if plain in src:
             failures.append(f"un-wrapped original still present: {plain!r}")
+    for plain in (
+        'f"#queue-req: {len(self.waiting_queue)}, "',
+        'f"#running-req: {len(self.running_batch.reqs)}"',
+    ):
+        if plain in sched:
+            failures.append(f"un-wrapped scheduler original still present: {plain!r}")
+    if sched.count('f"#queue-req={len(self.waiting_queue)} "') != 2:
+        failures.append("API-response #queue-req= variants altered (must stay plain)")
     # 4. Design invariant: parser regexes match through the color wraps.
     expected = {
         (SAMPLE_PREFILL, PARSER_PATTERNS[0]): ("1024", "500.26"),
@@ -106,10 +139,12 @@ def main():
         for f in failures:
             print(" -", f)
         sys.exit(1)
-    print("check_status_color: 5/5 OK (six sites wrapped, opt-out present, "
-          "originals replaced, parser regexes match through the wraps, "
-          "marker present). Live check: a decode status line in the journal "
-          "shows gen tps in light green with `journalctl -a`.")
+    print("check_status_color: 5/5 OK (ten edit sites wrapped across the "
+          "metrics reporter and scheduler, opt-out present, originals "
+          "replaced, API-response variants left plain, parser regexes match "
+          "through the wraps, marker present). Live check: decode gen tps "
+          "bright green, prefill tps bright cyan, #running-req bright "
+          "magenta on `journalctl -a`.")
 
 
 if __name__ == "__main__":
