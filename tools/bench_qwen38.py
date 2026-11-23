@@ -39,6 +39,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -353,6 +354,46 @@ def parse_ints(s):
     return [int(x) for x in s.split(",") if x.strip()] if s else []
 
 
+def journal_accept_stats(t0, t1, unit="qwen38-sglang.service"):
+    """Mean speculative accept length from the scheduler's decode lines
+    logged between t0 and t1 (unix seconds). Returns (mean, n) or (None, 0)."""
+    try:
+        out = subprocess.run(
+            ["journalctl", "--user", "-a", "-o", "cat", "-u", unit,
+             "--since", f"@{t0:.0f}", "--until", f"@{t1:.0f}"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, 0
+    vals = [float(m) for m in re.findall(r"accept len: ([0-9.]+)", out)]
+    if not vals:
+        return None, 0
+    return sum(vals) / len(vals), len(vals)
+
+
+def sanity_check_acceptance(info, t0, t1):
+    """Loud warning when speculative decoding is enabled but the draft
+    obviously never predicts (accept len pinned at 1.0). A healthy NEXTN
+    draft sits around 2-3 at short context; 1.0 means every draft token is
+    rejected, which after a requant usually means the draft weights did not
+    load (wrong key names, unpacked scheme) — see the runbook."""
+    algo = (info.get("speculative_algorithm") or "").upper()
+    if not algo or algo in ("NONE", "NULL"):
+        return
+    mean, n = journal_accept_stats(t0, t1)
+    if n < 5:
+        print("acceptance: no scheduler decode lines sampled (n=0); skipping check", flush=True)
+        return
+    verdict = "OK" if mean > 1.05 else "BUSTED"
+    print(f"acceptance: mean accept len {mean:.2f} over {n} decode samples -> {verdict}", flush=True)
+    if mean <= 1.05:
+        print(f"WARNING: {algo} is enabled but the draft is accepting nothing "
+              f"(accept len {mean:.2f} ~= 1.0). Decode speed is being dragged by "
+              f"pure-overhead speculation. If the draft was just requantized, its "
+              f"weights almost certainly failed to load — grep the boot journal "
+              f"for 'not found in params_dict'.", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", default=os.environ.get("BASE", "http://127.0.0.1:30001"))
@@ -384,6 +425,7 @@ def main():
              ("" if not args.container else "  [container cgroup not found]")), flush=True)
 
     rows = []
+    t_bench0 = time.time()
     for p in range(1, args.passes + 1):
         if args.passes > 1:
             print(f"-- pass {p}", flush=True)
@@ -404,6 +446,7 @@ def main():
     mem.stop()
     print(f"end: vram used {idle1.get('vram_used')}M free {idle1.get('vram_free')}M (driver view keeps the allocator's "
           f"high-water mark until /flush_cache), gtt {idle1.get('gtt_used')}M, host avail {idle1.get('host_avail')}M", flush=True)
+    sanity_check_acceptance(info, t_bench0, time.time())
 
     if args.out:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
