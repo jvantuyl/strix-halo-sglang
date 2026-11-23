@@ -268,6 +268,12 @@ dumps under other keys in place. Check `/opt` free space before starting:
 keeping the old target dump alongside the new one left only 331 MiB free
 after this boot.
 
+**Someday: speed up the first load of a new checkpoint.** Profile shard reads,
+PLE rebuild, and per-tensor post-processing separately before trying to batch
+or parallelize the loader. The 677 s measurement combines those steps, so it
+does not identify the bottleneck. This is only worth revisiting if checkpoint
+turnover increases; restarts that reuse a dump already skip this path.
+
 ### Draft-int4 verification (2026-11-23)
 
 The clean shard regeneration fixed the routed-expert key names, but the
