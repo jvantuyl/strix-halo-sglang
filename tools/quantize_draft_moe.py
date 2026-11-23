@@ -64,15 +64,41 @@ ZERO_SCALE = 1e-12  # bf16-representable stand-in for all-zero groups only
 
 
 def quantize_int4_asym(w):
-    """bf16 [N, K] -> (packed I32 [N, K//8], scale BF16 [N, K//32], zp I32 [N//8, K//32])."""
+    """bf16 [N, K] -> (packed I32 [N, K//8], scale BF16 [N, K//32], zp I32 [N//8, K//32]).
+
+    Matches the checkpoint author's quantizer exactly, including its quirk:
+    scale = bf16((mx-mn)/15), zp = clamp(round(-8 - mn/scale), -8, 7); if the
+    bf16-rounded scale and rounded zp can no longer represent both group
+    endpoints exactly (((7-zp)*scale < mx) or ((-8-zp)*scale > mn)), the
+    divisor shrinks to 14, 13, ... until they can. Reverse-engineered from
+    the target experts: all 707 groups where /15 loses an endpoint use /14
+    (bit-identical), and no other group does. (The naive formula without
+    the retry produces a scale that is 15/14x too small on those groups.)
+    """
     n, k = w.shape
     assert k % GROUP == 0, f"K={k} not divisible by {GROUP}"
     groups = k // GROUP
     g = w.float().reshape(n, groups, GROUP)
     mn, mx = g.amin(dim=-1, keepdim=True), g.amax(dim=-1, keepdim=True)
-    scale = (mx - mn) / 15
-    scale = torch.where(scale == 0, torch.full_like(scale, ZERO_SCALE), scale).to(torch.bfloat16)
-    zp = torch.clamp(torch.round(-8 - mn / scale.float()), -8, 7).to(torch.int8)
+    rng = (mx - mn).clamp(min=0)
+    zp = None
+    d = torch.full_like(rng, 15.0)
+    # constant groups (rng == 0): scale |c|/7 reconstructs c exactly through
+    # the clamped zp (verified: c>0 -> q=-1, zp=-8; c<0 -> q=-8, zp=-1).
+    base = torch.where(
+        rng == 0, mn.abs().clamp(min=ZERO_SCALE) / 7, rng
+    )
+    for _ in range(14):  # per-group divisor retry: 15, then only where needed
+        scale = torch.where(rng == 0, base, base / d).to(torch.bfloat16)
+        sf = scale.float()  # the representability check must run in fp32:
+        # int * bf16 promotes to bf16 and its ulp (1.2e-4 at ~0.03) spuriously
+        # violates groups whose endpoint equals (7-zp)*scale exactly.
+        zp = torch.clamp(torch.round(-8 - mn / sf), -8, 7).to(torch.int8)
+        zpf = zp.float()
+        viol = ((7 - zpf) * sf < mx) | ((-8 - zpf) * sf > mn)
+        if not bool(viol.any()):
+            break
+        d = torch.where(viol, d - 1, d)
     q = torch.clamp(torch.round(g / scale.float()) + zp, -8, 7).to(torch.int8)
     deq = (q - zp).float() * scale.float()
     rel = (deq - g).norm().item() / (g.norm().item() or 1.0)
@@ -120,13 +146,11 @@ def revalidate_against_target(model_dir):
     ).float().mean().item() >= 0.995
     sd = (scale.float() - sc.float()).abs()
     rel = sd.max().item() / sc.float().abs().min().item()
-    # format parity is proven by zp/q exactness; the <=0.5% scale/q/zp
-    # residual comes from (a) our input being the dequantized tensor and
-    # (b) the checkpoint author's quantizer using symmetric-style
-    # max/7 scales for some groups (e.g. experts.0.gate_proj[5,3]:
-    # stored 0.0028992 = 0.0202942/7.0) where we use (mx-mn)/15.
-    # Both are valid min/max int4 quantizations of the same group; the
-    # new tensors we write are exact by construction (original input).
+    # format parity is proven by zp/q exactness; the residual comes only
+    # from our input being the dequantized tensor (the original pre-quant
+    # min/max can differ by one rounding step near group boundaries).
+    # With the representability-retry implemented, scale should now match
+    # the stored values exactly everywhere.
     s_rel_pct = (sd / sc.float().abs()).max().item() * 100
     print(f"revalidate vs target experts.0.gate_proj (dequantized input): "
           f"zp>=99.5% {zp_ok} q>=99.5% {q_ok} worst scale rel diff {s_rel_pct:.1f}%")
