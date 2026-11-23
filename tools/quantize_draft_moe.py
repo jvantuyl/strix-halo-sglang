@@ -102,8 +102,8 @@ def quantize_int4_asym(w):
     q = torch.clamp(torch.round(g / scale.float()) + zp, -8, 7).to(torch.int8)
     deq = (q - zp).float() * scale.float()
     rel = (deq - g).norm().item() / (g.norm().item() or 1.0)
-    packed = pack_to_int32(q.reshape(n, k), 4, packed_dim=1)
-    zp_packed = pack_to_int32(zp.squeeze(-1), 4, packed_dim=0)
+    packed = pack_to_int32(q.reshape(n, k), 4, packed_dim=1).contiguous()
+    zp_packed = pack_to_int32(zp.squeeze(-1), 4, packed_dim=0).contiguous()
     return packed, scale.squeeze(-1), zp_packed, torch.tensor([n, k], dtype=torch.int64), rel
 
 
@@ -196,15 +196,13 @@ def main():
     print(f"draft experts: E={E} N={N} K={K}; quantizing {E} experts x 3 projections")
     for e in range(E):
         for proj, w in (
-            ("gate", gu[e, :N, :]),
-            ("up", gu[e, N:, :]),
-            ("down", dn[e]),
+            ("gate_proj", gu[e, :N, :]),
+            ("up_proj", gu[e, N:, :]),
+            ("down_proj", dn[e]),
         ):
             packed, scale, zp, shape, rel = quantize_int4_asym(w)
-            out["gate" if proj == "gate" else ("up" if proj == "up" else "down")].setdefault(e, {})[
-                proj
-            ] = (packed, scale, zp, shape)
-            rels[proj].append(rel)
+            out[proj.split("_")[0]].setdefault(e, {})[proj] = (packed, scale, zp, shape)
+            rels[proj.split("_")[0]].append(rel)
     for proj, v in rels.items():
         print(f"  {proj}_proj: worst rel dequant error {max(v):.4f}, mean {sum(v)/len(v):.4f}")
     del gu, dn
@@ -249,21 +247,24 @@ def main():
 
     gu_add = {}
     for e in range(E):
-        for proj in ("gate", "up"):
-            gu_add.update(expert_keys(e, proj, out["gate"][e] if proj == "gate" else out["up"][e]))
+        for proj in ("gate_proj", "up_proj"):
+            gu_add.update(expert_keys(e, proj, out["gate"][e] if proj == "gate_proj" else out["up"][e]))
     dn_add = {}
     for e in range(E):
-        dn_add.update(expert_keys(e, "down", out["down"][e]))
+        dn_add.update(expert_keys(e, "down_proj", out["down"][e]))
     del out
 
-    # gate/up live where gate_up lived; down where down lived
+    # gate/up live where gate_up lived; down where down lived.
+    # Key convention MUST match FusedMoE.make_expert_params_mapping, which
+    # maps ckpt "experts.{e}.{gate_proj|up_proj|down_proj}." onto the fused
+    # w13_/w2_ params (verified against the target's per-expert keys).
     rewrite(gu_shard, {gate_up_key}, gu_add)
     rewrite(dn_shard, {down_key}, dn_add)
 
     # --- index ---
     del weight_map[gate_up_key], weight_map[down_key]
     for e in range(E):
-        for proj in ("gate", "up"):
+        for proj in ("gate_proj", "up_proj"):
             for suffix in ("weight_packed", "weight_scale", "weight_zero_point", "weight_shape"):
                 weight_map[f"mtp.layers.0.mlp.experts.{e}.{proj}.{suffix}"] = os.path.basename(gu_shard)
         for suffix in ("weight_packed", "weight_scale", "weight_zero_point", "weight_shape"):
