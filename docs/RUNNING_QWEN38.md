@@ -535,6 +535,15 @@ container, i.e. `~/.cache/strix-halo-sglang-cache/moe-tune/` on the host
 Triton cache the server uses, so a container restart loses nothing. Pass
 `MOE_TUNE_PARTIAL_DIR` to name the directory yourself.
 
+Cross-run partials inventory (host
+`~/.cache/strix-halo-sglang-cache/moe-tune/`, 23 MB total, 2026-11-23):
+`8098bf4581` (Nov 22, 12 M-sizes) is the source of the **deployed draft
+config**; `out-target-int4-tp1` (Oct 25) is the source of the **deployed
+target int4 config**; `draft-bf16`/`out-draft-bf16`/`recheck260`/
+`out-recheck260` (Oct 24–25) are superseded by the Nov 22 draft tuning
+and kept only as history; `f4f8054f6e` is an empty leftover. Nothing is
+safe to delete without checking this table first.
+
 Batch sizes are visited by bisection (smallest, largest, then the midpoint
 of each unresolved interval). When the nearest finished sizes on both sides
 of an M picked the same tile and are adjacent to it in the size list
