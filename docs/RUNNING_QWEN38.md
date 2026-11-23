@@ -850,29 +850,29 @@ post-suite high-water reading, not a new low). Data:
 `bench/2026-11-22-bf16-draft-baseline.jsonl`.
 
 **MoE down-projection A/B** (`tools/moe_ab_spotcheck.py`, 2026-11-23,
-server idle, int4 target shape E=512 K=2560 N=320-packed topk 10
-group 32, `M` = total padded tokens = batch×topk). The `_down`
-candidate (tuned for down only) vs the shared tuned config:
-
-| M | shared | `_down` |
-|---:|---:|---:|
-| 8 | 218 µs | 759 µs |
-| 64 | 1,096 µs | 1,863 µs |
-| 512 | 4,742 µs | 1,629 µs |
-| 2,048 | 2,908 µs | 2,927 µs |
-| 4,096 | 8,947 µs | 9,109 µs |
-
-Decode lives at M≈80–120 where the shared config is 3.5× faster;
-prefill (chunk 1024×topk → M≈10k) is a tie. **The shared config stays;
-`_down` is rejected for this serving profile** (it would only pay off on
-a mid-size prefill-heavy workload). One caveat: the shared config's
-M=512 point (4.7 ms, worse than both neighbors) suggests a bad tile at
-that size — worth a retune pass if prefill ever profiles hot there.
-Tool fix shipped with this: int4 tensors no longer `.normal_()` a uint8
-(NotImplementedError on ROCm); integral weights are `random_(0,255)`.
-The bf16 draft path was also smoked (M=8: 536 µs → M=1024: 4,991 µs,
-server's tuned draft config, requires the server stopped — bf16 weights
-need 2.5 GB and the server leaves only ~0.1 free).
+int4 target shape E=512 K=2560 N=320-packed topk 10 group 32).
+**Correction (same night): the `_down` candidate file is byte-identical
+to the shared config** (md5 `a14c31ad…`, every M entry the same tiles) —
+the separate down-tuning sweep converged to the same winners, so there
+is currently no separate-down candidate at all. The first spotcheck pass
+reported large per-M differences between the "two" configs (218 vs 759
+µs at M=8, 4.7 vs 1.6 ms at M=512) — with identical inputs those were
+**measurement noise, not config effects**: the tool regenerates its
+random tensors and expert-ID draws per config, and at small M the
+`moe_align_block_size` padding depends heavily on which experts the
+draw happens to hit (512 experts, tokens×topk rows), so the padded
+launch can differ several-fold run to run. The tool needs a fixed-seed /
+fixed-tensor mode (or same-config-twice calibration) before any
+per-config A/B it produces can be trusted. Tool fix shipped alongside:
+int4 weights were `.normal_()`-ing a uint8 (NotImplementedError on
+ROCm); integral weights are now `random_(0,255)`. The bf16 draft path
+was also smoked (M=8: 536 µs → M=1024: 4,991 µs with the server's tuned
+draft config; requires the server stopped — bf16 weights need 2.5 GB
+and the server leaves only ~0.1 free). Answer to the original question:
+per-M-keyed tuning means a genuinely separate down config *would* keep
+each M's fastest kernel (small-M entries included), so separation could
+only ever help — it just hasn't produced different tiles yet on this
+shape.
 
 **Draft-head quality dig** (dev53 verify bench decode lines, 2026-11-23,
 20 samples): mean accept length 2.51 of 4 (rate 0.50), but split by
