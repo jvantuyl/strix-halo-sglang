@@ -869,6 +869,14 @@ errors everywhere. Min VRAM free 2.8 GiB after the suite (3.6 before) —
 above the 2 GiB health line but thinner than cap-8's 3.1. **Verdict:
 cap 12 stays; 16 rejected** (aggregate down, VRAM margin down).
 
+Patches ≤ 53 (boot-time work: mlock2 ONFAULT hotsets, keys-only lazy
+warm start, 5-s progress cadence, recolored status lines) approved for
+**permanent rollout** 2026-11-23 after the dev53 verification bench;
+deployed as `strix-halo-sglang:dev53` tagged `rocpro10`, env
+`~/.config/qwen38-sglang.env` unchanged. Boot 15:06→15:07:29 (about one
+minute, restart to ready), both hotsets warm-started 1,071,425 keys
+lazily, reload progress lines at 5-s cadence.
+
 Verified end to end: chat with thinking (`reasoning_content` split out),
 structured tool calls (`finish_reason: tool_calls`), vision (exact OCR of
 rendered text plus shape/color identification, 128 image tokens), video
