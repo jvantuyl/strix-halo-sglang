@@ -531,3 +531,12 @@ RUN python3 /tmp/patch_mxfp4_aiter_gate.py && rm /tmp/patch_mxfp4_aiter_gate.py
 # pipelines) keep matching. SGLANG_QWEN4_STATUS_COLOR=0 disables.
 COPY patches/patch_status_color.py /tmp/patch_status_color.py
 RUN python3 /tmp/patch_status_color.py && rm /tmp/patch_status_color.py
+
+# --- gfx1151 patch 52: mlock2(MLOCK_ONFAULT) for the PLE hot-set ---
+# Patch 46's _mlock used plain mlock on a fresh calloc'd array, faulting
+# every page in at attach: 320 MiB per hotset x 2 per boot at 2M rows =
+# ~4 min of silent boot cost under host-RAM pressure. ONFAULT locks pages
+# as the cache touches them — identical steady state, no boot penalty.
+# Fallbacks: syscall(325), then plain mlock, then unlocked (patch 46).
+COPY patches/patch_ple_hotset_mlock2.py /tmp/patch_ple_hotset_mlock2.py
+RUN python3 /tmp/patch_ple_hotset_mlock2.py && rm /tmp/patch_ple_hotset_mlock2.py
