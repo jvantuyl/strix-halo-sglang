@@ -268,6 +268,39 @@ dumps under other keys in place. Check `/opt` free space before starting:
 keeping the old target dump alongside the new one left only 331 MiB free
 after this boot.
 
+### Draft-int4 verification (2026-11-23)
+
+The clean shard regeneration fixed the routed-expert key names, but the
+draft still accepted zero tokens. The draft model does not declare a packed
+module mapping, so the individual BF16 exclusions did not cover the fused
+attention `qkv_proj` and shared-expert `gate_up_proj`. Those fused parameters
+did not receive their checkpoint weights. The converter now excludes both
+fused names explicitly while leaving the routed experts int4. The live
+verification used a separate draft config so the target dump and PLE table
+could be reused unchanged.
+
+Two 192-token greedy requests accepted 123/207 and 110/243 draft proposals.
+The matching two-pass benchmark reported a mean accept length of 2.54
+over 20 scheduler samples. Warm-pass results:
+
+| Decode scenario | BF16 draft (dev53) | Int4 draft |
+|---|---:|---:|
+| Single, 128 target prompt tokens | 23.82 | 20.12 |
+| Single, 2,048 | 19.36 | 22.33 |
+| Single, 8,192 | 22.01 | 22.27 |
+| Single, 32,000 | 20.54 | 20.83 |
+| 4 streams, aggregate | 45.46 | 39.81 |
+| 8 streams, aggregate | 66.39 | 61.82 |
+| 12 streams, aggregate | 75.30 | 74.80 |
+
+Rates are tokens/s. The worst sampled free VRAM in the int4 run was
+3,971 MiB, versus 2,846 MiB on the corresponding baseline pass. The
+int4 runtime allocated the requested 524,288-token pool. These runs show
+more memory headroom, not a broad throughput gain.
+
+Raw results: [BF16 baseline](../bench/2026-11-23-dev53-lazywarm-verify.jsonl)
+and [corrected int4 draft](../bench/2026-11-23-draft-int4-fused-bf16.jsonl).
+
 **Options that do not help here.** `--load-format npcache` only handles
 `.bin` checkpoints (it asserts `use_safetensors is False`).
 `--model-loader-extra-config` for the default loader only knows
