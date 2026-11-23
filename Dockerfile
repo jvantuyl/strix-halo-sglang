@@ -523,11 +523,12 @@ COPY patches/patch_mxfp4_aiter_gate.py /tmp/patch_mxfp4_aiter_gate.py
 RUN python3 /tmp/patch_mxfp4_aiter_gate.py && rm /tmp/patch_mxfp4_aiter_gate.py
 
 # --- gfx1151 patch 51: color-code scheduler status-line fields ---
-# Five journal status-line fields get ANSI color (gen tps light green,
-# prefill tps dark green, #pending-token yellow, #running-req magenta,
-# #queue-req red) so a live journalctl -a is quicker to wade through.
-# Whole label+value segments are wrapped, keeping the inner text byte-
-# identical so field-extraction regexes (bench/journal_stats.py, grep -o
+# Journal status-line fields get ANSI color (gen tps bright green, prefill
+# tps bright cyan, #pending-token yellow, #running-req bright magenta,
+# #queue-req red) on every log emitter (status lines, decode tail,
+# flush-cache refusal); API-response spellings stay plain. Whole
+# label+value segments are wrapped, keeping the inner text byte-identical
+# so field-extraction regexes (bench/journal_stats.py, grep -o
 # pipelines) keep matching. SGLANG_QWEN4_STATUS_COLOR=0 disables.
 COPY patches/patch_status_color.py /tmp/patch_status_color.py
 RUN python3 /tmp/patch_status_color.py && rm /tmp/patch_status_color.py
@@ -540,3 +541,12 @@ RUN python3 /tmp/patch_status_color.py && rm /tmp/patch_status_color.py
 # Fallbacks: syscall(325), then plain mlock, then unlocked (patch 46).
 COPY patches/patch_ple_hotset_mlock2.py /tmp/patch_ple_hotset_mlock2.py
 RUN python3 /tmp/patch_ple_hotset_mlock2.py && rm /tmp/patch_ple_hotset_mlock2.py
+
+# --- gfx1151 patch 53: keys-only hotset warm start (lazy refill) ---
+# Patch 46's warm start eagerly re-gathered ~160 MiB of payload rows from
+# the 47.7 GiB table mmap at every attach (1:44 on the 2026-11-23 cold-
+# cache boot). Restored keys now occupy slots as SIEVE fodder but probe
+# as MISSES until first touch refills the payload in place; the reads
+# amortize over live traffic and only touched rows become resident.
+COPY patches/patch_ple_lazy_warmstart.py /tmp/patch_ple_lazy_warmstart.py
+RUN python3 /tmp/patch_ple_lazy_warmstart.py && rm /tmp/patch_ple_lazy_warmstart.py
