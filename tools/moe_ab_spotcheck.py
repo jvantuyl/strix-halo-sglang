@@ -48,7 +48,12 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
 def build_tensors(kind, E, K, N, topk, group_size, device):
     """Real (CUDA) tensors mirroring the tuner harness's benchmark_config."""
     def t(*shape, dtype=torch.float32):
-        return torch.empty(*shape, dtype=dtype, device=device).normal_()
+        x = torch.empty(*shape, dtype=dtype, device=device)
+        if x.is_floating_point():
+            x.normal_()
+        else:
+            x.random_(0, 255)  # int4 weights: any bytes exercise the kernel
+        return x
 
     out = {"E": E, "K": K, "N": N, "topk": topk}
     if kind == "bf16":

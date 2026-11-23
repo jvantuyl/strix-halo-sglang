@@ -840,6 +840,31 @@ bottoms at 5.8 GiB fresh per the pre-29 note above — the 3.1 here is the
 post-suite high-water reading, not a new low). Data:
 `bench/2026-11-22-bf16-draft-baseline.jsonl`.
 
+**MoE down-projection A/B** (`tools/moe_ab_spotcheck.py`, 2026-11-23,
+server idle, int4 target shape E=512 K=2560 N=320-packed topk 10
+group 32, `M` = total padded tokens = batch×topk). The `_down`
+candidate (tuned for down only) vs the shared tuned config:
+
+| M | shared | `_down` |
+|---:|---:|---:|
+| 8 | 218 µs | 759 µs |
+| 64 | 1,096 µs | 1,863 µs |
+| 512 | 4,742 µs | 1,629 µs |
+| 2,048 | 2,908 µs | 2,927 µs |
+| 4,096 | 8,947 µs | 9,109 µs |
+
+Decode lives at M≈80–120 where the shared config is 3.5× faster;
+prefill (chunk 1024×topk → M≈10k) is a tie. **The shared config stays;
+`_down` is rejected for this serving profile** (it would only pay off on
+a mid-size prefill-heavy workload). One caveat: the shared config's
+M=512 point (4.7 ms, worse than both neighbors) suggests a bad tile at
+that size — worth a retune pass if prefill ever profiles hot there.
+Tool fix shipped with this: int4 tensors no longer `.normal_()` a uint8
+(NotImplementedError on ROCm); integral weights are `random_(0,255)`.
+The bf16 draft path was also smoked (M=8: 536 µs → M=1024: 4,991 µs,
+server's tuned draft config, requires the server stopped — bf16 weights
+need 2.5 GB and the server leaves only ~0.1 free).
+
 Cap raised 8→12 with graph tiers 1..12 (`QWEN38_CUDA_GRAPH_MAX_BS=12`,
 `QWEN38_MAX_RUNNING_REQUESTS=12`, hotsets 2M rows, patches ≤ 52,
 `max_total_num_tokens=358912` after the 60 mamba slots; rocpro10,
