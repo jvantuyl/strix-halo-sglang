@@ -875,7 +875,14 @@ warm start, 5-s progress cadence, recolored status lines) approved for
 deployed as `strix-halo-sglang:dev53` tagged `rocpro10`, env
 `~/.config/qwen38-sglang.env` unchanged. Boot 15:06→15:07:29 (about one
 minute, restart to ready), both hotsets warm-started 1,071,425 keys
-lazily, reload progress lines at 5-s cadence.
+lazily, reload progress lines at 5-s cadence. Verification bench
+(`bench/2026-11-23-dev53-lazywarm-verify.jsonl`, same suite, dev52 in
+parens): single-stream p2 decode 23.8/19.4/22.0/20.5 tok/s (23.5/20.5/
+21.8/20.5), prefill 373/664/724/707 (366/654/718/698); concurrent n=12
+agg 75.3 (74.3–78.9 pass-to-pass band), per-stream 7.0 (7.2); zero
+errors, min VRAM free 2.8 GiB. Lazy warm start costs nothing measurable
+— even pass 1 matches dev52's, so the hotset converges from live
+traffic fast enough to be invisible to this suite.
 
 Verified end to end: chat with thinking (`reasoning_content` split out),
 structured tool calls (`finish_reason: tool_calls`), vision (exact OCR of
