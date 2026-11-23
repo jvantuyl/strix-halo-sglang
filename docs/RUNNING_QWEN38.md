@@ -244,6 +244,31 @@ had no `weight_files_to_skip`; patch 30 reads the index and skips the 31
 shards with no `mtp` key (the 3 `model-mtp-merged-rest*` shards hold all 31
 draft tensors).
 
+### First boot after a checkpoint change (measured 2026-11-23, draft-int4 conversion)
+
+What a full regeneration costs, for planning swaps and conversions. The
+presharded key is `sha1(config.json content + mtime)` and the PLE fingerprint
+includes the index file's mtime — **touching either file forces a full
+regeneration even when the content is identical** (restoring a backup with
+plain `cp` instead of `cp -a` is enough to trigger it).
+
+| Phase | Time | Notes |
+|---|---|---|
+| First-time load, PLE table reused | 924 s (`load_weight`) | 124.3 GiB over the 38 shards at ~150-190 MiB/s; the rate is per-tensor postprocess-bound (12k big + 150k small expert tensors, ~13 ms each), not I/O — the NVMe sustains 365 MB/s at 0.05 ms await |
+| Dump hashing | ~40 s | 75.7 GiB at ~4.7 GiB/s (page cache is hot from the load) |
+| Target dump write | ~3 min | 75.1 GiB / 91 items at 400-540 MiB/s |
+| Draft dump write | seconds | ~5 GiB int4 draft (bf16 draft was 7.3 GiB) |
+| Graphs + pools + ready | ~15 s | verify 7 s + draft decode 2.3 s |
+| **Whole boot** | **~17 min** | `docker run` to `fired up` |
+| Warm reload (dump + PLE reused) | ~1 min | copy-back 75.1 GiB at ~2.5 GB/s; draft 2 shards 2.7 GiB |
+| First-time load with PLE regeneration concurrent | ~20 min | the 48 GiB table write shares the NVMe with the load's reads: 99 MiB/s vs 150-190; add the dump write after, ~25 min total |
+
+Also worth knowing: patch 31's reload skips only when its own key matches; a
+stale dump under a *different* key (e.g. after a `VERSION` bump or config
+touch) is left in place and must be pruned by hand (`/opt/llm/presharded-*/`).
+Deleting a dump you no longer need before a regen boot saves 76 GiB of
+headroom but does not speed the new dump up.
+
 **Options that do not help here.** `--load-format npcache` only handles
 `.bin` checkpoints (it asserts `use_safetensors is False`).
 `--model-loader-extra-config` for the default loader only knows
