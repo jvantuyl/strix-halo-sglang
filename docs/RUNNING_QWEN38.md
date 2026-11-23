@@ -865,6 +865,15 @@ The bf16 draft path was also smoked (M=8: 536 µs → M=1024: 4,991 µs,
 server's tuned draft config, requires the server stopped — bf16 weights
 need 2.5 GB and the server leaves only ~0.1 free).
 
+**Draft-head quality dig** (dev53 verify bench decode lines, 2026-11-23,
+20 samples): mean accept length 2.51 of 4 (rate 0.50), but split by
+context: ~2.75–2.95 at 128-token prompts vs ~1.83–1.92 at the 32k
+prompt. The NEXTN draft degrades with context length — at 32k the
+speculation buys only ~1.9 tokens/step instead of ~2.9. Relevant when
+evaluating n-gram vs NEXTN (n-gram quality is length-independent for
+repeated substrings) and when weighing a draft-head retune for long
+contexts.
+
 Cap raised 8→12 with graph tiers 1..12 (`QWEN38_CUDA_GRAPH_MAX_BS=12`,
 `QWEN38_MAX_RUNNING_REQUESTS=12`, hotsets 2M rows, patches ≤ 52,
 `max_total_num_tokens=358912` after the 60 mamba slots; rocpro10,
