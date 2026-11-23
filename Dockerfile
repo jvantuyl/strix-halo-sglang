@@ -521,3 +521,13 @@ RUN python3 /tmp/patch_hf_flash_attn_probe.py && rm /tmp/patch_hf_flash_attn_pro
 # imported functions.
 COPY patches/patch_mxfp4_aiter_gate.py /tmp/patch_mxfp4_aiter_gate.py
 RUN python3 /tmp/patch_mxfp4_aiter_gate.py && rm /tmp/patch_mxfp4_aiter_gate.py
+
+# --- gfx1151 patch 51: color-code scheduler status-line fields ---
+# Five journal status-line fields get ANSI color (gen tps light green,
+# prefill tps dark green, #pending-token yellow, #running-req magenta,
+# #queue-req red) so a live journalctl -a is quicker to wade through.
+# Whole label+value segments are wrapped, keeping the inner text byte-
+# identical so field-extraction regexes (bench/journal_stats.py, grep -o
+# pipelines) keep matching. SGLANG_QWEN4_STATUS_COLOR=0 disables.
+COPY patches/patch_status_color.py /tmp/patch_status_color.py
+RUN python3 /tmp/patch_status_color.py && rm /tmp/patch_status_color.py
