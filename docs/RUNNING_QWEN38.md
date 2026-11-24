@@ -307,6 +307,21 @@ more memory headroom, not a broad throughput gain.
 Raw results: [BF16 baseline](../bench/2026-11-23-dev53-lazywarm-verify.jsonl)
 and [corrected int4 draft](../bench/2026-11-23-draft-int4-fused-bf16.jsonl).
 
+**TunableOp on rocBLAS 5.6.** Keep a separate `TUNABLE_DIR` per ROCm/PyTorch
+stack. The old `:dev` cache had a rocBLAS 5.4 validator. `:rocpro10`
+rejected it, but tuning still appended results without replacing the old
+header. Do not relabel that mixed file.
+
+A clean sweep on `:rocpro10` spent 801 s on target verify graph capture and
+450 s on draft capture before tuning the seven request scenarios. After
+restarting with tuning off, PyTorch accepted 338 saved GEMM signatures.
+Graph capture took 9.27 s target and 2.38 s draft, and mean acceptance length
+was 2.55 over 20 decode samples. Warm single-request decode stayed within
+6% of the earlier int4 baseline; 4/8/12-stream throughput was 42.5/62.7/76.7
+tok/s versus 39.8/61.8/74.8. That suggests a small concurrent gain, not a
+broad speedup from this one comparison. Keep tuning off during serving.
+See [the cache replay benchmark](../bench/2026-11-23-tunableop-rocblas56.jsonl).
+
 **Options that do not help here.** `--load-format npcache` only handles
 `.bin` checkpoints (it asserts `use_safetensors is False`).
 `--model-loader-extra-config` for the default loader only knows
