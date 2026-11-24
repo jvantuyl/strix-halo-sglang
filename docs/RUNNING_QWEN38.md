@@ -935,19 +935,28 @@ post-suite high-water reading, not a new low). Data:
 
 **MoE down-projection A/B** (`tools/moe_ab_spotcheck.py`, 2026-11-23,
 int4 target shape E=512 K=2560 N=320-packed topk 10 group 32).
+
+**Fixed-seed retune:** the spotcheck now shares weights, activations, and
+routing across candidates. The asymmetric int4 calibration compared the
+identical configs at M=1/4/12/48/128, with at most 0.9% between files and
+3.1% between repeats of the baseline. The down-only sweep screened 228
+tiles per size, held the production up row tile at 16, and retimed five
+finalists and the baseline in alternating order. Best median times were
+57.5/228.7/634.1/1744.0/2795.7 µs versus baseline
+58.8/233.3/634.1/1744.0/2795.7 µs. The small apparent gains did not clear
+the calibration noise floor. No serving tiles changed.
+
 **Correction (same night): the `_down` candidate file is byte-identical
 to the shared config** (md5 `a14c31ad…`, every M entry the same tiles) —
 the separate down-tuning sweep converged to the same winners, so there
-is currently no separate-down candidate at all. The first spotcheck pass
+was no separate-down candidate. The first spotcheck pass
 reported large per-M differences between the "two" configs (218 vs 759
 µs at M=8, 4.7 vs 1.6 ms at M=512) — with identical inputs those were
-**measurement noise, not config effects**: the tool regenerates its
+**measurement noise, not config effects**: the tool regenerated its
 random tensors and expert-ID draws per config, and at small M the
 `moe_align_block_size` padding depends heavily on which experts the
 draw happens to hit (512 experts, tokens×topk rows), so the padded
-launch can differ several-fold run to run. The tool needs a fixed-seed /
-fixed-tensor mode (or same-config-twice calibration) before any
-per-config A/B it produces can be trusted. Tool fix shipped alongside:
+launch can differ several-fold run to run. Tool fix shipped alongside:
 int4 weights were `.normal_()`-ing a uint8 (NotImplementedError on
 ROCm); integral weights are now `random_(0,255)`. The bf16 draft path
 was also smoked (M=8: 536 µs → M=1024: 4,991 µs with the server's tuned
