@@ -322,6 +322,12 @@ tok/s versus 39.8/61.8/74.8. That suggests a small concurrent gain, not a
 broad speedup from this one comparison. Keep tuning off during serving.
 See [the cache replay benchmark](../bench/2026-11-23-tunableop-rocblas56.jsonl).
 
+**NEXTN vs. n-gram (2026-11-23).** Keep NEXTN. With the current 64-token
+pages, Triton attention rejects n-gram's default branch breadth of 10.
+Breadth 1 passed that check, but the target failed during graph capture:
+`Qwen4 PLE does not support NGRAM speculation`. No n-gram throughput
+was measured. NEXTN was restored and reached readiness after both attempts.
+
 **Options that do not help here.** `--load-format npcache` only handles
 `.bin` checkpoints (it asserts `use_safetensors is False`).
 `--model-loader-extra-config` for the default loader only knows
