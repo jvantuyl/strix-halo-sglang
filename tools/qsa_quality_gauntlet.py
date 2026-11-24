@@ -75,6 +75,42 @@ PASSAGES = {
 }
 
 
+def extended_cases():
+    examples = (
+        ("x = [1, 2]\ny = x\ny.append(3)\nprint(len(x))", 3),
+        ("x = [1, 2]\ny = x[:]\ny.append(3)\nprint(len(x))", 2),
+        ("d = {'a': 2}\nd['a'] += 3\nprint(d.get('a', 0))", 5),
+        ("x = [3, 1, 2]\nx.sort()\nprint(x[-1] - x[0])", 2),
+        ("x = 0\nfor i in range(5):\n    if i % 2:\n        x += i\nprint(x)", 4),
+        ("x = [2, 3, 5, 7, 11]\nprint(sum(x[1::2]))", 10),
+        ("x = 1\nfor i in range(1, 5):\n    x *= i\nprint(x - 1)", 23),
+        ("def f(n):\n    return 1 if n < 2 else n + f(n - 2)\nprint(f(7))", 16),
+        ("x = [[0]] * 3\nx[1].append(4)\nprint(sum(x[0] + x[2]))", 8),
+        ("x = [4, 6, 8]\ny = iter(x)\nnext(y)\nprint(next(y) + next(y))", 14),
+        ("d = dict.fromkeys(range(3), [])\nd[1].append(7)\nprint(len(d[2]))", 1),
+        ("x = [1, 2, 3, 4]\nx[1:3] = x[:1]\nprint(sum(x))", 6),
+    )
+    for i, (source, expected) in enumerate(examples):
+        yield f"extended-code-{i}", "extended-code", (
+            "What integer does this Python 3 program print? Reply with only that integer.\n"
+            f"```python\n{source}\n```"
+        ), expected
+    rng = random.Random(92853)
+    for n in (512, 1536, 2560):
+        ids = rng.sample(range(10000, 99999), n)
+        rows = [f"Record {i:04}: site {rng.randrange(101, 900)}, state provisional, crate {ident}."
+                for i, ident in enumerate(ids)]
+        left, right = n // 8, 7 * n // 8
+        rows[left] = f"Record {left:04}: site Cedar, state approved, crate {ids[left]}."
+        rows[right] = f"Record {right:04}: site Birch, state approved, crate {ids[right]}."
+        rows.insert(n // 4, "Site Cedar was assigned crate 11111 in a provisional draft.")
+        rows.insert(n // 2, "Site Birch was assigned crate 22222 in a provisional draft.")
+        yield f"extended-retrieval-{n}", "extended-retrieval", (
+            "\n".join(rows) + "\nReturn only a JSON object with integer keys' values: "
+            "'cedar' and 'birch', the respective approved crate numbers, not provisional drafts."
+        ), {"cedar": ids[left], "birch": ids[right]}
+
+
 def score(text, expected):
     text = text.strip()
     if isinstance(expected, dict):
@@ -124,9 +160,9 @@ def logprob_case(base, name, prefix, suffix):
                 logprobs=[x[0] for x in rows], top1=[x[0][1] for x in tops])
 
 
-def run(base, label, out, smoke=False):
+def run(base, label, out, smoke=False, extended=False):
     with out.open("x") as f:
-        task_cases = list(cases())
+        task_cases = list(cases()) + (list(extended_cases()) if extended else [])
         selected = task_cases[:1] if smoke else task_cases
         for row in (generate_case(base, case) for case in selected):
             print(row["name"], row["input_tokens"], row["correct"], flush=True)
@@ -139,10 +175,13 @@ def run(base, label, out, smoke=False):
             f.flush()
 
 
-def compare(baseline, candidate):
+def compare(baseline, candidate, extended=False):
     a, b = ({r["name"]: r for r in map(json.loads, p.read_text().splitlines())}
             for p in (baseline, candidate))
-    if a.keys() != b.keys() or len(a) != len(list(cases())) + len(PASSAGES):
+    expected = {c[0] for c in cases()} | set(PASSAGES)
+    if extended:
+        expected.update(c[0] for c in extended_cases())
+    if a.keys() != expected or b.keys() != expected:
         raise ValueError("Incomplete or unmatched paired gauntlet")
     groups = {}
     log_a, log_b, top_agree = [], [], []
@@ -177,14 +216,16 @@ def main():
     collect.add_argument("--label", required=True)
     collect.add_argument("--out", type=Path, required=True)
     collect.add_argument("--smoke", action="store_true")
+    collect.add_argument("--extended", action="store_true")
     paired = sub.add_parser("compare")
     paired.add_argument("baseline", type=Path)
     paired.add_argument("candidate", type=Path)
+    paired.add_argument("--extended", action="store_true")
     args = ap.parse_args()
     if args.action == "run":
-        run(args.base, args.label, args.out, args.smoke)
+        run(args.base, args.label, args.out, args.smoke, args.extended)
     else:
-        print(json.dumps(compare(args.baseline, args.candidate), indent=2))
+        print(json.dumps(compare(args.baseline, args.candidate, args.extended), indent=2))
 
 
 if __name__ == "__main__":

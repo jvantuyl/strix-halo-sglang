@@ -550,3 +550,7 @@ RUN python3 /tmp/patch_ple_hotset_mlock2.py && rm /tmp/patch_ple_hotset_mlock2.p
 # amortize over live traffic and only touched rows become resident.
 COPY patches/patch_ple_lazy_warmstart.py /tmp/patch_ple_lazy_warmstart.py
 RUN python3 /tmp/patch_ple_lazy_warmstart.py && rm /tmp/patch_ple_lazy_warmstart.py
+
+# --- gfx1151 patch 54: opt-in native Q8 target QSA QKV ---
+COPY patches/patch_qsa_native_q8.py /tmp/patch_qsa_native_q8.py
+RUN python3 /tmp/patch_qsa_native_q8.py && rm /tmp/patch_qsa_native_q8.py

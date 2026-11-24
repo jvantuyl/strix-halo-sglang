@@ -69,6 +69,9 @@ def reference(upstream, out):
 #include <stdint.h>
 #include "rocmfp4.c"
 #include "rocmfpx.h"
+void pack_q8(const float *x, void *q, int64_t k) {
+    rocmfpx_quantize_row_fp8_ref(x, q, k);
+}
 void roundtrip_q8(const float *x, void *q, float *y, int64_t k) {
     rocmfpx_quantize_row_fp8_ref(x, q, k);
     rocmfpx_dequantize_row_fp8(q, y, k);
@@ -86,7 +89,7 @@ void roundtrip_fp4_weighted(const float *x, block_rocmfp4_fast *q, float *y,
 }
 """)
     exports = out / "reference.exports"
-    exports.write_text("{ global: roundtrip_q8; roundtrip_fp4; roundtrip_fp4_weighted; local: *; };\n")
+    exports.write_text("{ global: pack_q8; roundtrip_q8; roundtrip_fp4; roundtrip_fp4_weighted; local: *; };\n")
     lib = out / "reference.so"
     ggml = upstream / "ggml"
     subprocess.run([
@@ -97,6 +100,8 @@ void roundtrip_fp4_weighted(const float *x, block_rocmfp4_fast *q, float *y,
         "-o", str(lib)
     ], check=True)
     result = ctypes.CDLL(str(lib))
+    result.pack_q8.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int64]
+    result.pack_q8.restype = None
     for variant in ("q8", "fp4"):
         fn = getattr(result, f"roundtrip_{variant}")
         fn.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int64]
