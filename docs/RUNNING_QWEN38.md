@@ -1078,6 +1078,13 @@ position 6–7, a token flip at 79 in one run, `spec_verify_ct` 40–42).
 
 ### Scheduling: prefill against decode
 
+On the deployed Q8 QSA stack, the
+[2026-11-25 isolated HTTPS trial](../bench/2026-11-25-prefill-blocks.md)
+kept 1,024-token chunks. The 16,384-token arm fell below 1 GiB free VRAM,
+tripping the 2 GiB guard, and took 69.4 s vs. 49.0 s on the isolated 32k
+prompt. Mixed chunk remains unverified at runtime with this deployment's
+NEXTN path.
+
 SGLang's scheduler is prefill-first: while anything is waiting to prefill it
 runs prefill chunks back to back and the running decode batch gets no step.
 With `--chunked-prefill-size 1024` a chunk is ~1.3 s here, so one 40k
