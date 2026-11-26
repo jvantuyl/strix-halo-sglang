@@ -13,6 +13,40 @@ group 32, asymmetric; vision tower unquantized). MTP is optional (see
 [Speculative decoding](#speculative-decoding-mtp)); the launcher leaves it
 off.
 
+## Current scheduling trial on cerebro
+
+The operator-selected trial for `qwen38-flash-next` on port 8000 is
+[fsched](../patches/57-fsched.md), with fixed **2:1 prefill:generation
+service time** during contention and a **0.5× switch band**. Adaptive
+feedback and per-forward debug tracing are off. There is no expiry timer.
+The generic launcher defaults are unchanged.
+
+The user-unit drop-in `96-fsched57.conf` loads `~/.config/qwen38-sglang.env.fsched57`
+after the existing draft, TunableOp and native-Q8 settings. Only two values
+are overridden:
+
+* `SGLANG_IMAGE` pins the tested local image by ID:
+  `sha256:6501a084b5c4bb8a605c13ef3092748ae5a3615592ea4e393c95d1afe0b8f165`
+  (`strix-halo-sglang:fsched-57-trial` on this host).
+* `QWEN38_EXTRA_ARGS` keeps NEXTN 3/1/4, the presharded draft path and cache
+  reporting. Scheduling flags are `--schedule-policy fsched --enable-mixed-chunk
+  --chunked-prefill-size 2048 --prefill-decode-interval 0`. Read these back
+  from `/get_server_info`; the image tag alone does not select the policy.
+
+Use [the isolated control measurements](../bench/2026-11-26-fsched-server.md)
+to interpret live traffic. In the 18+2 benchmark short-request median TTFT
+**increased** from 1.48 s to 1.68 s. Compare TTFT, streaming gaps and long
+prefill latency separately; an average decode rate cannot distinguish them.
+
+**Rollback:** after checking for connected clients, in-flight requests and
+jobs inside `sglang-qwen38`, arrange an approved restart. Archive only
+`~/.config/systemd/user/qwen38-sglang.service.d/96-fsched57.conf` outside
+the drop-in directory, run `systemctl --user daemon-reload`, then restart
+`qwen38-sglang.service`. Leave `10`, `89` and `95` in place. Check
+`/health` and verify `shortest-prefill-first`, chunk 1024, mixed off and
+interval 1 in `/get_server_info`. No cache rebuild or checkpoint swap is
+part of the rollback.
+
 ## What the image adds
 
 | Patch | What | Why on gfx1151 |
@@ -60,7 +94,7 @@ off.
 | [54](../patches/54-qsa-native-q8.md) | Opt-in native ROCmFPX Q8 for the 12 target QSA QKV projections on gfx1151 TP=1 | Read-only sidecar, in-register dequant on small batches, transient BF16 unpack for large batches. The draft and all other weights are unchanged. `tests/check_qsa_native_q8.py` |
 | [55](../patches/55-qsa-cross-prefix.md) | Complete ratio-4 QSA groups across unaligned eager MIXED/EXTEND prefixes | Reuses pending prefix keys and original group-start RoPE, including single-token MIXED decode rows; leaves aligned, paged and graph compression paths intact. Backport of closed-unmerged SGLang #39575. `tests/check_qsa_cross_prefix.py` |
 | [56](../patches/56-mixed-mamba-checkpoint.md) | Preserve non-lazy Mamba prefill checkpoint metadata in MIXED forwards | Keeps checkpoint destinations for prefill rows and masks decode tails off. `tests/check_mixed_mamba_checkpoint.py` |
-| [57](../patches/57-fsched.md) | Opt-in `--schedule-policy fsched` | Selects the forward profile by measured cohort debt, then packs feasible rows by request lag. Fixed 2:1 service time, 0.5× switch band. Not the production policy. `tests/check_fsched_server.py` |
+| [57](../patches/57-fsched.md) | Opt-in `--schedule-policy fsched` | Selects the forward profile by measured cohort debt, then packs feasible rows by request lag. Fixed 2:1 service time, 0.5× switch band. Enabled for the cerebro trial. `tests/check_fsched_server.py` |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
