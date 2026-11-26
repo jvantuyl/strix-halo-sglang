@@ -562,3 +562,8 @@ RUN python3 /tmp/patch_qsa_cross_prefix.py && rm /tmp/patch_qsa_cross_prefix.py
 # --- patch 56: preserve non-lazy Mamba checkpoints in MIXED forwards ---
 COPY patches/patch_mixed_mamba_checkpoint.py /tmp/patch_mixed_mamba_checkpoint.py
 RUN python3 /tmp/patch_mixed_mamba_checkpoint.py && rm /tmp/patch_mixed_mamba_checkpoint.py
+
+# --- patch 57: opt-in measured-service cohort scheduler ---
+COPY patches/fsched/runtime.py /tmp/fsched/runtime.py
+COPY patches/patch_fsched_scheduler.py /tmp/patch_fsched_scheduler.py
+RUN python3 /tmp/patch_fsched_scheduler.py && rm /tmp/patch_fsched_scheduler.py /tmp/fsched/runtime.py

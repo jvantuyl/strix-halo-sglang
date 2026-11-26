@@ -60,6 +60,7 @@ off.
 | [54](../patches/54-qsa-native-q8.md) | Opt-in native ROCmFPX Q8 for the 12 target QSA QKV projections on gfx1151 TP=1 | Read-only sidecar, in-register dequant on small batches, transient BF16 unpack for large batches. The draft and all other weights are unchanged. `tests/check_qsa_native_q8.py` |
 | [55](../patches/55-qsa-cross-prefix.md) | Complete ratio-4 QSA groups across unaligned eager MIXED/EXTEND prefixes | Reuses pending prefix keys and original group-start RoPE, including single-token MIXED decode rows; leaves aligned, paged and graph compression paths intact. Backport of closed-unmerged SGLang #39575. `tests/check_qsa_cross_prefix.py` |
 | [56](../patches/56-mixed-mamba-checkpoint.md) | Preserve non-lazy Mamba prefill checkpoint metadata in MIXED forwards | Keeps checkpoint destinations for prefill rows and masks decode tails off. `tests/check_mixed_mamba_checkpoint.py` |
+| [57](../patches/57-fsched.md) | Opt-in `--schedule-policy fsched` | Selects the forward profile by measured cohort debt, then packs feasible rows by request lag. Fixed 2:1 service time, 0.5× switch band. Not the production policy. `tests/check_fsched_server.py` |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 

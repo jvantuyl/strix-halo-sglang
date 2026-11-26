@@ -97,6 +97,10 @@ Build takes ~10 min on first run; details in [docs/BUILDING.md](docs/BUILDING.md
 
 ## Patches applied
 
+For later Qwen3.8 patches, see the [serving runbook](docs/RUNNING_QWEN38.md),
+including [QSA compression across cached prefixes in mixed prefill](patches/55-qsa-cross-prefix.md)
+and the [opt-in service-time scheduler](patches/57-fsched.md).
+
 Four small patches let SGLang run on gfx1151:
 
 1. **`sgl-kernel/setup_rocm.py`** — allow `gfx1151` in the arch list (upstream guards against anything but `gfx942`/`gfx950`).
