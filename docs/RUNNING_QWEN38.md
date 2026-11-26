@@ -58,6 +58,8 @@ off.
 | [52](../patches/52-ple-hotset-mlock-onfault.md) | Hotset `_mlock` uses `mlock2(MLOCK_ONFAULT)` (fallbacks: raw syscall, plain mlock, unlocked) | Plain mlock on the fresh calloc'd payload faulted every page in at attach: 320 MiB × 2 hotsets at 2M rows = two silent ~2-min windows per boot (measured 2026-11-23: 8 s/0 s at 1M rows vs 2:00/1:48 at 2M; boot 65 s → 5m45s). ONFAULT locks pages as the cache touches them — identical steady-state protection, boot cost ~0. Verified in-image by mincore: only the 1 glibc chunk-header page resident at construction (plain mlock faults in all), a far-row write adds its page. `tests/check_ple_hotset_mlock2.py` |
 | [53](../patches/53-ple-lazy-warmstart.md) | Hotset warm start restores keys only; payload bytes refill in place on first touch (invalid-bit gate in `prepare`; refill via `_insert_batch`'s resident-key path, no dupes) | Even after patch 52, the first attach window cost 1:44 (2026-11-23): the eager warm start re-gathered ~160 MiB of snapshot rows from the table mmap before serving. Mapping/locking never required those pages — restored keys now act as SIEVE fodder and probe as misses until touched, so the reads amortize over live traffic and only touched rows become resident. Correctness rule (never serve an invalid slot) enforced at the single serving path; bit-exact refill verified against the fill source. `tests/check_ple_lazy_warmstart.py` |
 | [54](../patches/54-qsa-native-q8.md) | Opt-in native ROCmFPX Q8 for the 12 target QSA QKV projections on gfx1151 TP=1 | Read-only sidecar, in-register dequant on small batches, transient BF16 unpack for large batches. The draft and all other weights are unchanged. `tests/check_qsa_native_q8.py` |
+| [55](../patches/55-qsa-cross-prefix.md) | Complete ratio-4 QSA groups across unaligned eager MIXED/EXTEND prefixes | Reuses pending prefix keys and original group-start RoPE, including single-token MIXED decode rows; leaves aligned, paged and graph compression paths intact. Backport of closed-unmerged SGLang #39575. `tests/check_qsa_cross_prefix.py` |
+| [56](../patches/56-mixed-mamba-checkpoint.md) | Preserve non-lazy Mamba prefill checkpoint metadata in MIXED forwards | Keeps checkpoint destinations for prefill rows and masks decode tails off. `tests/check_mixed_mamba_checkpoint.py` |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
@@ -1082,8 +1084,9 @@ On the deployed Q8 QSA stack, the
 [2026-11-25 isolated HTTPS trial](../bench/2026-11-25-prefill-blocks.md)
 kept 1,024-token chunks. The 16,384-token arm fell below 1 GiB free VRAM,
 tripping the 2 GiB guard, and took 69.4 s vs. 49.0 s on the isolated 32k
-prompt. Mixed chunk remains unverified at runtime with this deployment's
-NEXTN path.
+prompt. A follow-up trial with patches 55 and 56 completed real mixed
+forwards with NEXTN at 2,048 and 4,096 tokens. Neither arm cleared the
+15% prefill throughput gate, so no new serving configuration was selected.
 
 SGLang's scheduler is prefill-first: while anything is waiting to prefill it
 runs prefill chunks back to back and the running decode batch gets no step.

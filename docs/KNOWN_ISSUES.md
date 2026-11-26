@@ -1,5 +1,11 @@
 # Known issues
 
+## Qwen3.8 QSA assert with unaligned mixed-prefill prefixes
+
+[Patch 55](../patches/55-qsa-cross-prefix.md) handles the ratio-4 QSA write-plan
+assert when an eager mixed batch or a private chunk-cache tail starts
+mid-group. It does not change speculative-paged or decode-graph compression.
+
 ## AWQ MoE inference page-faults — RESOLVED
 
 **Resolved by [patch 4](../patches/04-warp-size-wave32.md)** (host/device `WARP_SIZE` mismatch in the sgl-kernel topk gating kernels), which is baked into the default image build. AWQ MoE inference now works end-to-end — see [`RUNNING_AWQ_MOE.md`](RUNNING_AWQ_MOE.md).

@@ -92,3 +92,40 @@ layer; maximum relative L2 across matmul outputs was 0.000028 and
 graph replay was exact. No serving gauntlet was run for the fused path
 because it failed the speed gate. Keep the current sidecar and BF16
 prefill compute. [Raw microbenchmark results](2026-11-25-prefill-q8.jsonl).
+
+## Follow-up: 2,048 and 4,096 with mixed chunk and NEXTN
+
+The original 2,048-token arm failed with an HSA queue exception at the
+first four-stream workload. A bounded replay reached the target's first
+MIXED forward (three 52-token prefill rows and one decode token) but
+never returned from it. The pinned compressed QSA planner assumes all
+extend prefixes are ratio-aligned, which need not hold for a decode row
+in a mixed batch. [Patch 55](../patches/55-qsa-cross-prefix.md) handles
+groups that cross that boundary. [Patch 56](../patches/56-mixed-mamba-checkpoint.md)
+separately preserves non-lazy Mamba checkpoint writes across the merge.
+The instrumented four-stream replay on the candidate image finished
+all 800 generated tokens and confirmed actual MIXED execution.
+
+The candidate image then completed three full HTTPS passes at each size
+without request errors. NEXTN, context, pool, KV dtype, and cap were
+unchanged. These are serving comparisons to the original 1,024 baseline,
+not an isolated estimate of the effect of either patch.
+
+| Metric | 1,024, mixed off | 2,048, mixed on | 4,096, mixed on |
+| --- | ---: | ---: | ---: |
+| 32k prefill, median tok/s (3 runs) | 713.32 | 758.09 (+6.3%) | 478.11 (−33.0%) |
+| Mixed short decode, pooled p50 tok/s (54 streams) | 5.79 | 6.22 (+7.4%) | 5.34 (−7.8%) |
+| Longest client delivery gap in forced overlap | 1.72 s | 2.75 s | 8.90 s |
+| Minimum sampled free VRAM | 4,118 MiB | 4,117 MiB | 3,693 MiB |
+| Quality score / NLL delta vs BF16 | 40/51 / +0.002522 | 40/51 / +0.002522 | 40/51 / +0.002522 |
+
+Decode-only acceptance matched the baseline on all three probes in both
+arms. The longest 32k scheduler gap ending in prefill was 2.80 s at 2k
+and 9.14 s at 4k; these post-step gaps are proxies, not kernel timings.
+Both arms passed the headroom and quality gates, but neither met the
+15% throughput gate. The 4k arm also missed the mixed-short throughput
+target. No serving settings or tuning changed, and production was left
+offline as requested. The quality gauntlet is not a dedicated mixed
+prefix-cache state equivalence test.
+
+[Raw follow-up timing and gate records](2026-11-25-prefill-mixed.jsonl).

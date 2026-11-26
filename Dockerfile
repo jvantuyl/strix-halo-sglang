@@ -554,3 +554,11 @@ RUN python3 /tmp/patch_ple_lazy_warmstart.py && rm /tmp/patch_ple_lazy_warmstart
 # --- gfx1151 patch 54: opt-in native Q8 target QSA QKV ---
 COPY patches/patch_qsa_native_q8.py /tmp/patch_qsa_native_q8.py
 RUN python3 /tmp/patch_qsa_native_q8.py && rm /tmp/patch_qsa_native_q8.py
+
+# --- gfx1151 patch 55: QSA compression across an unaligned extend prefix ---
+COPY patches/patch_qsa_cross_prefix.py /tmp/patch_qsa_cross_prefix.py
+RUN python3 /tmp/patch_qsa_cross_prefix.py && rm /tmp/patch_qsa_cross_prefix.py
+
+# --- patch 56: preserve non-lazy Mamba checkpoints in MIXED forwards ---
+COPY patches/patch_mixed_mamba_checkpoint.py /tmp/patch_mixed_mamba_checkpoint.py
+RUN python3 /tmp/patch_mixed_mamba_checkpoint.py && rm /tmp/patch_mixed_mamba_checkpoint.py
