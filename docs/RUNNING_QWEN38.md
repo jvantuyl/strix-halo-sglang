@@ -15,13 +15,26 @@ off.
 
 ## Current production release and scheduling trial on cerebro
 
-Port 8000 runs the patch 61 **production** profile. The final drop-in
-`97-release61-production.conf` loads `~/.config/qwen38-sglang.env.release61-production`,
-which sets **only** `SGLANG_IMAGE`, to
+Port 8000 runs the patch 62 **production** profile. The final drop-in
+`98-release62.conf` loads `~/.config/qwen38-sglang.env.release62`. It pins
+`SGLANG_IMAGE` to `sha256:cae33c79680def8adeef028e7f334cc7972a3f37bd1ff28d3c19e60f86c0f2c4`
+and preserves the native-Q8 `SGLANG_DOCKER_ARGS` except for
+`SGLANG_QWEN4_PLE_HOTSET_ROWS=4194304` (previously 2097152). This is the
+host embedding cache, not KV: 640 MiB of row payload plus 72 MiB of index,
+keys and flags in the scheduler's shared hotset. The two HiCache restore
+backports are still absent. Native prefix caching stays on; HiCache and
+forward-pass metrics stay off.
+
+Watch `journalctl --user -a -u qwen38-sglang.service -f` for
+`Scheduler idle: no requests in flight or waiting.` The whole message is
+gray (ANSI 90) unless `SGLANG_QWEN4_STATUS_COLOR=0`. It appears once
+after five seconds fully idle. Short gaps between requests or tool calls
+produce no notice; the next request is served immediately. See
+[patch 62 and its production smoke](../patches/62-scheduler-idle-log.md).
+
+The previous drop-in, `97-release61-production.conf`, still pins the
+[patch 61 release](../bench/2026-11-26-release61.md) to
 `sha256:fc57d75afcf74e607d2e6846a5365f7e9b12229d9a00b282ff55cb4788cd8c38`.
-The two HiCache restore backports are absent. Native prefix caching stays on;
-HiCache and forward-pass metrics stay off. See the
-[release checks and production smoke results](../bench/2026-11-26-release61.md).
 
 The operator-selected trial for `qwen38-flash-next` on port 8000 is
 [fsched](../patches/57-fsched.md), with fixed **2:1 prefill:generation
@@ -46,7 +59,16 @@ to interpret live traffic. In the 18+2 benchmark short-request median TTFT
 **increased** from 1.48 s to 1.68 s. Compare TTFT, streaming gaps and long
 prefill latency separately; an average decode rate cannot distinguish them.
 
-**Roll back this release to patch 57:** check for connected clients, running
+**Roll back patch 62 and the cache resize:** check for connected clients,
+running or waiting requests and jobs inside `sglang-qwen38`. After approval
+for an idle restart, archive **only** `98-release62.conf` outside the drop-in
+directory. Run `systemctl --user daemon-reload` and restart the unit. Leave
+`97` and all earlier drop-ins in place. Verify the running image matches
+the patch 61 ID above, the container environment reports
+`SGLANG_QWEN4_PLE_HOTSET_ROWS=2097152`, and native generation and chat
+both succeed. No cache file deletion is required.
+
+**Roll back patch 61 to patch 57 (after removing `98`):** check for connected clients, running
 or waiting requests, and jobs inside `sglang-qwen38`. After an approved
 idle restart is arranged, archive **only** `97-release61-production.conf`
 outside the drop-in directory. Run `systemctl --user daemon-reload` and
@@ -118,6 +140,7 @@ part of the rollback.
 | [59](../patches/59-upstream-backports.md) | Mixed-step KV capacity guard, structured Qwen tool arguments and opt-in result-owned forward timing | These three backports are live; metrics collection is off. The PLE and QSA HiCache checkpoint restores are excluded from the production image. |
 | [60](../patches/60-gigachat35-parser-names.md) | Accept `gigachat35` for both `--tool-call-parser` and `--reasoning-parser` | Both CLI choices are live. No detector or default changes. |
 | [61](../patches/61-ple-hotset-eviction.md) | Bound PLE hotset replacement to 4,096 rows per fill, reuse the selected slots and count actual fills | Live in the host-side embedding cache, not KV. `tests/check_ple_hotset_eviction.py`. |
+| [62](../patches/62-scheduler-idle-log.md) | Emit one INFO line after five seconds fully idle | Waiting, chunked and overlapping work must drain first. A new request cancels the pending notice. Health probes and control polling alone do not trigger it. `tests/check_scheduler_idle_log.py`. |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
