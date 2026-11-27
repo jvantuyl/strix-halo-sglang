@@ -567,3 +567,7 @@ RUN python3 /tmp/patch_mixed_mamba_checkpoint.py && rm /tmp/patch_mixed_mamba_ch
 COPY patches/fsched/runtime.py /tmp/fsched/runtime.py
 COPY patches/patch_fsched_scheduler.py /tmp/patch_fsched_scheduler.py
 RUN python3 /tmp/patch_fsched_scheduler.py && rm /tmp/patch_fsched_scheduler.py /tmp/fsched/runtime.py
+
+# --- patch 58: distinguish mixed forwards in scheduler status reports ---
+COPY patches/patch_mixed_batch_logging.py /tmp/patch_mixed_batch_logging.py
+RUN python3 /tmp/patch_mixed_batch_logging.py && rm /tmp/patch_mixed_batch_logging.py

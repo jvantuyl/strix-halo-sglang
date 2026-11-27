@@ -3,8 +3,9 @@
 Splits the journal into epochs (one per boot, keyed on the server's ready
 line) and reports, per epoch:
 
-* prefill: percentiles of the per-chunk `input throughput` from
-  "Prefill batch" lines, plus total chunked-prefill tokens
+* prefill: percentiles of `input throughput` from "Prefill batch" and
+  "Mixed batch" lines, plus their total `#new-token` count. The rate uses
+  the time between prefill-bearing reports, not GPU forward time.
 * generation: percentiles of `gen throughput` from "Decode batch" lines
 * accept len / accept rate: percentiles from the same lines
 
@@ -26,7 +27,7 @@ import sys
 
 READY = "The server is fired up and ready to roll!"
 PREFILL_RE = re.compile(
-    r"Prefill batch.*?#new-token: (\d+).*?input throughput \(token/s\): ([0-9.]+)"
+    r"(?:Prefill|Mixed) batch.*?#new-token: (\d+).*?input throughput \(token/s\): ([0-9.]+)"
 )
 DECODE_RE = re.compile(
     r"Decode batch.*?"
