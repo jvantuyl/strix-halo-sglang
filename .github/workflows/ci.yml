@@ -38,5 +38,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Verify patches apply to the pinned SGLang and the fix is intact
-        run: python3 tests/check_patches.py
+      - name: Install CPU hotset test dependency
+        run: python3 -m pip install numpy
+
+      - name: Replay patches and test PLE eviction against the pinned SGLang
+        run: python3 tests/check_patches.py --test-ple-hotset

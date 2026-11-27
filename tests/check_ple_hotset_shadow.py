@@ -1,6 +1,6 @@
 """Checks for patch 46: PLE read-through hot-set cache (RAM MVP, gfx1151).
 
-Runs inside the image (needs numpy; the numerics test needs a GPU):
+Runs inside the image (CPU tensors, no GPU needed):
     PYTHONPATH=/sgl-workspace/sglang/python python3 tests/check_ple_hotset_shadow.py
 
 Covers: probe/payload round-trip, one-chunk-lag fills, SIEVE eviction with
@@ -256,10 +256,18 @@ def test_numerics():
 def main():
     global np
     import numpy as np
+    import torch
+    from unittest.mock import patch
 
     test_cache_semantics()
     test_snapshot()
-    test_numerics()
+    if torch.cuda.is_available():
+        test_numerics()
+    else:
+        # ROCm builds ask the driver about graph capture even for a CPU
+        # tensor. With no device there can be no stream being captured.
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=False):
+            test_numerics()
     print(f"\n{'FAILED: ' + ', '.join(FAILURES) if FAILURES else 'ALL PASS'}")
     sys.exit(1 if FAILURES else 0)
 

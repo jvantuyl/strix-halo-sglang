@@ -583,6 +583,10 @@ RUN python3 /tmp/patch_upstream_backports.py && rm /tmp/patch_upstream_backports
 COPY patches/patch_gigachat35_parser_names.py /tmp/patch_gigachat35_parser_names.py
 RUN python3 /tmp/patch_gigachat35_parser_names.py && rm /tmp/patch_gigachat35_parser_names.py
 
+# --- patch 61: bounded PLE hotset replacement and accurate fill counts ---
+COPY patches/patch_ple_hotset_eviction.py /tmp/patch_ple_hotset_eviction.py
+RUN python3 /tmp/patch_ple_hotset_eviction.py && rm /tmp/patch_ple_hotset_eviction.py
+
 # The HiCache file backend JITs its CPU hash extension on first use.
 RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev \
     && rm -rf /var/lib/apt/lists/*

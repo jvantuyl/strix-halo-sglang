@@ -206,6 +206,13 @@ def check_pinned_tree(src: Path, steps: list[tuple[str, str]]) -> int:
             bad.append(f"{rel}: {e.msg.splitlines()[-1]}")
     check(f"{len(py_files)} patched .py files compile", not bad, "; ".join(bad))
 
+    if "--test-ple-hotset" in sys.argv:
+        # Exercise the replayed source before the temporary checkout is removed.
+        test = ROOT / "tests/check_ple_hotset_eviction.py"
+        env = dict(os.environ, PLE_HOTSET_SRC=str(src / "python/sglang/srt/utils/ple_hotset.py"))
+        result = subprocess.run([sys.executable, str(test), "-v"], env=env)
+        check("PLE hotset eviction regressions", result.returncode == 0)
+
     profile = os.environ.get("SGLANG_BACKPORT_PROFILE", "production")
     check("Dockerfile defaults to the production backport profile",
           arg_default("SGLANG_BACKPORT_PROFILE") == "production")

@@ -98,6 +98,7 @@ part of the rollback.
 | [58](../patches/58-mixed-batch-logging.md) | Label `Mixed batch` and split its rows and input positions by prefill/decode | Pure prefill and decode lines are unchanged. Pending-token counts use bright yellow (93). `tests/check_mixed_batch_logging.py` |
 | [59](../patches/59-upstream-backports.md) | Selected upstream backports | Mixed KV guard, Qwen tool arguments and opt-in timing by default; paired HiCache checkpoint restores only in a trial build. |
 | [60](../patches/60-gigachat35-parser-names.md) | Accept `gigachat35` for both `--tool-call-parser` and `--reasoning-parser` | No detector or default changes. |
+| [61](../patches/61-ple-hotset-eviction.md) | Bound PLE hotset replacement to 4,096 rows per fill, reuse the selected slots and count actual fills | Host-side embedding cache, not KV. `tests/check_ple_hotset_eviction.py`. |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
