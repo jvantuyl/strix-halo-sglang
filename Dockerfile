@@ -571,3 +571,8 @@ RUN python3 /tmp/patch_fsched_scheduler.py && rm /tmp/patch_fsched_scheduler.py 
 # --- patch 58: distinguish mixed forwards in scheduler status reports ---
 COPY patches/patch_mixed_batch_logging.py /tmp/patch_mixed_batch_logging.py
 RUN python3 /tmp/patch_mixed_batch_logging.py && rm /tmp/patch_mixed_batch_logging.py
+
+# --- patch 59: backport selected upstream fixes ---
+COPY patches/backports59/ /tmp/backports59/
+COPY patches/patch_upstream_backports.py /tmp/patch_upstream_backports.py
+RUN python3 /tmp/patch_upstream_backports.py && rm /tmp/patch_upstream_backports.py /tmp/backports59/*.patch && rmdir /tmp/backports59
