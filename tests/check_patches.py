@@ -206,6 +206,11 @@ def check_pinned_tree(src: Path, steps: list[tuple[str, str]]) -> int:
             bad.append(f"{rel}: {e.msg.splitlines()[-1]}")
     check(f"{len(py_files)} patched .py files compile", not bad, "; ".join(bad))
 
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tests/check_scheduler_idle_log.py"), str(src)]
+    )
+    check("scheduler idle transition regressions", result.returncode == 0)
+
     if "--test-ple-hotset" in sys.argv:
         # Exercise the replayed source before the temporary checkout is removed.
         test = ROOT / "tests/check_ple_hotset_eviction.py"

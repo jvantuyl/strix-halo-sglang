@@ -591,3 +591,7 @@ RUN python3 /tmp/patch_ple_hotset_eviction.py && rm /tmp/patch_ple_hotset_evicti
 RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 RUN python3 -c 'from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash; import hashlib, struct; assert get_native_hash([11,22], None) == hashlib.sha256(struct.pack("<II",11,22)).hexdigest()'
+
+# --- patch 62: log the fully-idle transition after real inference work ---
+COPY patches/patch_scheduler_idle_log.py /tmp/patch_scheduler_idle_log.py
+RUN python3 /tmp/patch_scheduler_idle_log.py && rm /tmp/patch_scheduler_idle_log.py
