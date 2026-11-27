@@ -58,3 +58,76 @@ CPU tests use synthetic event completions and CPU tensors: they cover overlappin
 results, the actual file-store hit/miss and payload paths, and a refused mixed
 step followed by one that fits. They do **not** measure GPU timing accuracy or
 exercise native DMA kernels.
+
+### Results on the pinned stack
+
+- Clean Dockerfile patch replay: **117/117** checks passed; all **68** changed
+  Python files compiled. The fork's scheduler suite passed **33/33**.
+- In a disposable CPU-only copy of the patch 57 image with patches 58 and 59
+  applied, the focused suite passed **89 tests and 145 subtests**. The fork's
+  argument-recovery checks passed **137/137**; its control-token parser checks
+  passed **148/148** using the real Qwen tokenizer.
+- The first network-isolated run lacked the DeepSeek-V3.2 tokenizer, so 15
+  DeepSeek tests failed in setup. With that tokenizer cached locally, all 15
+  passed. The broader CPU run covering all tool detectors, timing and cache
+  tests reported **303 passed, 190 subtests passed, 1 failed**. The failing test,
+  `TestToolCallParserNames::test_matches_registry`, also failed on the
+  unchanged patch 57 image: `gigachat35` is registered in the implementation
+  but missing from the CLI parser-name list. Neither list was changed by this
+  backport. The test remains enabled; [patch 60](60-gigachat35-parser-names.md)
+  addresses this separately.
+
+**Before rollout:** use an isolated GPU server for the tight-pool mixed workload,
+opt-in FPM under NEXTN overlap, and cold versus host/file-restored retrieval
+with reused slots and the real draft. Upstream's hardware regressions are
+`test/registered/chunked_prefill/test_scripted_swa_1gpu.py` and
+`test/registered/kernels/ops/attention/qsa/test_qsa_hicache.py`.
+Do not enable HiCache on the live service just to validate the patch.
+
+### Isolated gfx1151 trial, 2026-11-26: promotion blocked
+
+The six native QSA transfer/file tests passed. The upstream tight-SWA test
+also passed with the unchanged hold-back assertion and allocator parameters,
+using a small local GPT-OSS dummy-weight fixture with sliding window 128 and
+the upstream sleep-on-idle default (its scripted tokenizer proxy is not a
+pollable socket). The host PLE embedding hotset is distinct from this cache.
+
+The real target + draft test used `shortest-prefill-first`, NEXTN 3/1/4,
+8,192 KV tokens, and a private file backend. `fsched` deliberately rejects
+HiCache. File storage also needs `libssl-dev` in the image: the native hash
+extension includes `openssl/sha.h` and links `-lcrypto`. The Dockerfile
+checks an actual two-token digest against `hashlib.sha256` at build time.
+HiCache's staging-only mode on this pin rejects the model's Mamba tree.
+
+| Fixed-seed greedy run (24 output tokens) | Prefix attribution | Result |
+|---|---|---|
+| Two independent cold runs of the same 1,985-token input | 0 cached | Identical |
+| Immediate repeat | 1,984 device | Differs from cold at output token 0 |
+| After unrelated requests recycled device slots | 1,984 host, 0 device | Identical to device hit |
+| After flushing the in-memory tiers, preserving private test storage | 1,984 storage, 0 host/device | Identical to device and host hits |
+
+This separates transport from model-level correctness: the three cache tiers
+agreed, but none matched recomputation. There is no evidence here that disk
+I/O caused the discrepancy. Do not promote on this evidence or bypass the
+host memory reserve. These results do not establish whether the normal patch
+57 native radix path has the same issue.
+
+In a separate `fsched` run with HiCache off and NEXTN overlap on, all four
+requests finished. The in-container FPM subscriber received 1 prefill, 67
+decode, 5 mixed and 1 idle frame. Active frames had finite positive spans;
+the idle heartbeat had a zero span. The socket was root-owned, so an
+unprivileged host subscriber was not a valid test of publication.
+
+Production returned to its original patch 57 image and all 18 saved settings
+matched. Health, 32-token native generation (10 verify steps), OpenAI chat,
+the native Q8 path, presharded draft and PLE reuse were verified. FLM was
+also restored and answered an inference request for `qwen3.5:9b`.
+
+### Production release without the restore pair
+
+The [subsequent rollout](../bench/2026-11-26-release61.md) deployed the KV
+guard, parser fix and timing implementation with patch 57's native prefix
+path. Patch 57, the private candidate and the final production deployment
+all gave identical cold and device-hit outputs on the prompt above. This
+resolves the native-path question for this case; it does not validate
+the unified HiCache path. The two restore diffs remain trial-only.

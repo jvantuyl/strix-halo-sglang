@@ -13,7 +13,15 @@ group 32, asymmetric; vision tower unquantized). MTP is optional (see
 [Speculative decoding](#speculative-decoding-mtp)); the launcher leaves it
 off.
 
-## Current scheduling trial on cerebro
+## Current production release and scheduling trial on cerebro
+
+Port 8000 runs the patch 61 **production** profile. The final drop-in
+`97-release61-production.conf` loads `~/.config/qwen38-sglang.env.release61-production`,
+which sets **only** `SGLANG_IMAGE`, to
+`sha256:fc57d75afcf74e607d2e6846a5365f7e9b12229d9a00b282ff55cb4788cd8c38`.
+The two HiCache restore backports are absent. Native prefix caching stays on;
+HiCache and forward-pass metrics stay off. See the
+[release checks and production smoke results](../bench/2026-11-26-release61.md).
 
 The operator-selected trial for `qwen38-flash-next` on port 8000 is
 [fsched](../patches/57-fsched.md), with fixed **2:1 prefill:generation
@@ -21,11 +29,11 @@ service time** during contention and a **0.5× switch band**. Adaptive
 feedback and per-forward debug tracing are off. There is no expiry timer.
 The generic launcher defaults are unchanged.
 
-The user-unit drop-in `96-fsched57.conf` loads `~/.config/qwen38-sglang.env.fsched57`
-after the existing draft, TunableOp and native-Q8 settings. Only two values
-are overridden:
+The preceding user-unit drop-in `96-fsched57.conf` still loads
+`~/.config/qwen38-sglang.env.fsched57` after the draft, TunableOp and
+native-Q8 settings. It supplies two values:
 
-* `SGLANG_IMAGE` pins the tested local image by ID:
+* `SGLANG_IMAGE` pins the previous production image (superseded by `97`):
   `sha256:6501a084b5c4bb8a605c13ef3092748ae5a3615592ea4e393c95d1afe0b8f165`
   (`strix-halo-sglang:fsched-57-trial` on this host).
 * `QWEN38_EXTRA_ARGS` keeps NEXTN 3/1/4, the presharded draft path and cache
@@ -38,8 +46,19 @@ to interpret live traffic. In the 18+2 benchmark short-request median TTFT
 **increased** from 1.48 s to 1.68 s. Compare TTFT, streaming gaps and long
 prefill latency separately; an average decode rate cannot distinguish them.
 
-**Rollback:** after checking for connected clients, in-flight requests and
-jobs inside `sglang-qwen38`, arrange an approved restart. Archive only
+**Roll back this release to patch 57:** check for connected clients, running
+or waiting requests, and jobs inside `sglang-qwen38`. After an approved
+idle restart is arranged, archive **only** `97-release61-production.conf`
+outside the drop-in directory. Run `systemctl --user daemon-reload` and
+restart `qwen38-sglang.service`. Leave `96`, `95`, `89`, and `10` in place.
+Verify `docker inspect --format '{{.Image}}' sglang-qwen38` returns the
+patch 57 ID above, `/health` returns 200, `/get_server_info` still shows
+`fsched`, and both native generation and OpenAI chat work. No model, PLE
+table or presharded files need to move.
+
+**Historical pre-fsched rollback:** only if patch 57 has already been restored
+and reverting the scheduling trial is separately intended, arrange another
+approved idle restart. Archive
 `~/.config/systemd/user/qwen38-sglang.service.d/96-fsched57.conf` outside
 the drop-in directory, run `systemctl --user daemon-reload`, then restart
 `qwen38-sglang.service`. Leave `10`, `89` and `95` in place. Check
@@ -95,10 +114,10 @@ part of the rollback.
 | [55](../patches/55-qsa-cross-prefix.md) | Complete ratio-4 QSA groups across unaligned eager MIXED/EXTEND prefixes | Reuses pending prefix keys and original group-start RoPE, including single-token MIXED decode rows; leaves aligned, paged and graph compression paths intact. Backport of closed-unmerged SGLang #39575. `tests/check_qsa_cross_prefix.py` |
 | [56](../patches/56-mixed-mamba-checkpoint.md) | Preserve non-lazy Mamba prefill checkpoint metadata in MIXED forwards | Keeps checkpoint destinations for prefill rows and masks decode tails off. `tests/check_mixed_mamba_checkpoint.py` |
 | [57](../patches/57-fsched.md) | Opt-in `--schedule-policy fsched` | Selects the forward profile by measured cohort debt, then packs feasible rows by request lag. Fixed 2:1 service time, 0.5× switch band. Enabled for the cerebro trial. `tests/check_fsched_server.py` |
-| [58](../patches/58-mixed-batch-logging.md) | Label `Mixed batch` and split its rows and input positions by prefill/decode | Pure prefill and decode lines are unchanged. Pending-token counts use bright yellow (93). `tests/check_mixed_batch_logging.py` |
-| [59](../patches/59-upstream-backports.md) | Selected upstream backports | Mixed KV guard, Qwen tool arguments and opt-in timing by default; paired HiCache checkpoint restores only in a trial build. |
-| [60](../patches/60-gigachat35-parser-names.md) | Accept `gigachat35` for both `--tool-call-parser` and `--reasoning-parser` | No detector or default changes. |
-| [61](../patches/61-ple-hotset-eviction.md) | Bound PLE hotset replacement to 4,096 rows per fill, reuse the selected slots and count actual fills | Host-side embedding cache, not KV. `tests/check_ple_hotset_eviction.py`. |
+| [58](../patches/58-mixed-batch-logging.md) | Label `Mixed batch` and split its rows and input positions by prefill/decode | Live. Pure prefill and decode lines are unchanged. Pending-token counts use bright yellow (93). `tests/check_mixed_batch_logging.py` |
+| [59](../patches/59-upstream-backports.md) | Mixed-step KV capacity guard, structured Qwen tool arguments and opt-in result-owned forward timing | These three backports are live; metrics collection is off. The PLE and QSA HiCache checkpoint restores are excluded from the production image. |
+| [60](../patches/60-gigachat35-parser-names.md) | Accept `gigachat35` for both `--tool-call-parser` and `--reasoning-parser` | Both CLI choices are live. No detector or default changes. |
+| [61](../patches/61-ple-hotset-eviction.md) | Bound PLE hotset replacement to 4,096 rows per fill, reuse the selected slots and count actual fills | Live in the host-side embedding cache, not KV. `tests/check_ple_hotset_eviction.py`. |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 
