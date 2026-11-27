@@ -96,7 +96,7 @@ part of the rollback.
 | [56](../patches/56-mixed-mamba-checkpoint.md) | Preserve non-lazy Mamba prefill checkpoint metadata in MIXED forwards | Keeps checkpoint destinations for prefill rows and masks decode tails off. `tests/check_mixed_mamba_checkpoint.py` |
 | [57](../patches/57-fsched.md) | Opt-in `--schedule-policy fsched` | Selects the forward profile by measured cohort debt, then packs feasible rows by request lag. Fixed 2:1 service time, 0.5× switch band. Enabled for the cerebro trial. `tests/check_fsched_server.py` |
 | [58](../patches/58-mixed-batch-logging.md) | Label `Mixed batch` and split its rows and input positions by prefill/decode | Pure prefill and decode lines are unchanged. Pending-token counts use bright yellow (93). `tests/check_mixed_batch_logging.py` |
-| [59](../patches/59-upstream-backports.md) | Selected upstream backports | Mixed KV guard and schema-validated Qwen tool arguments. |
+| [59](../patches/59-upstream-backports.md) | Selected upstream backports | Mixed KV guard, schema-validated Qwen tool arguments and opt-in forward timing. |
 | [10](../patches/10-sleep-on-idle-default.md) | Idle scheduler sleeps | unchanged, re-anchored to the new `arg_groups` layout |
 | [configs/moe](../configs/moe/) | Tuned fused-MoE Triton tiles for `E=512,N=320,int4_w4a16`, mounted at `/moe-configs` by the launchers | Upstream has no `Radeon_8060S_Graphics` configs; the generic tile is 2.2× slower at decode. See MoE tile tuning below |
 

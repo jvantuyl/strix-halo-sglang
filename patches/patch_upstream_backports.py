@@ -8,6 +8,7 @@ from pathlib import Path
 PRODUCTION = (
     "43290-mixed-kv.patch",
     "44124-qwen-parser.patch",
+    "38711-forward-metrics.patch",
 )
 
 
