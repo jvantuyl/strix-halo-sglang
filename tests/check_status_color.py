@@ -25,7 +25,7 @@ SITES = [
     ("m", 'f"{_CLR_QUEUE}#queue-req: {len(self.scheduler.waiting_queue)}{_CLR_END}, "',
      "\x1b[31m", "#queue-req"),
     ("m", 'f"{_CLR_PEND}#pending-token: {prefill_stats.num_pending_tokens}{_CLR_END}, "',
-     "\x1b[33m", "#pending-token"),
+     "\x1b[93m", "#pending-token"),
     ("m", 'f"{_CLR_PRE}input throughput (token/s): {self.last_input_throughput:.2f}{_CLR_END}"',
      "\x1b[96m", "input throughput (token/s)"),
     ("m", 'f"Decode batch{iter_msg}, {_CLR_RUN}#running-req: {num_running_reqs}{_CLR_END}, {token_usage_msg}"',
@@ -62,7 +62,7 @@ PARSER_PATTERNS = [
 SAMPLE_PREFILL = (
     "Prefill batch [8], #new-seq: 1, #new-token: 1024, #cached-token: 70144, "
     "\x1b[95m#running-req: 3\x1b[0m, \x1b[31m#queue-req: 0\x1b[0m, "
-    "\x1b[33m#pending-token: 1342\x1b[0m, backend: False, "
+    "\x1b[93m#pending-token: 1342\x1b[0m, backend: False, "
     "\x1b[96minput throughput (token/s): 500.26\x1b[0m"
 )
 SAMPLE_DECODE = (
@@ -92,6 +92,8 @@ def main():
         failures.append("bright-magenta constant missing or duplicated")
     if src.count('_CLR_PRE = "\\033[96m"') != 1:
         failures.append("bright-cyan constant missing or duplicated")
+    if src.count('_CLR_PEND = "\\033[93m"') != 1:
+        failures.append("bright-yellow constant missing or duplicated")
     if 'environ.get("SGLANG_QWEN4_STATUS_COLOR", "1") == "0"' not in src:
         failures.append("SGLANG_QWEN4_STATUS_COLOR=0 opt-out missing")
     # 3. The un-colored log originals are gone (each was unique). The

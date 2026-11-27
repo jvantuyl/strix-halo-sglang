@@ -524,7 +524,7 @@ RUN python3 /tmp/patch_mxfp4_aiter_gate.py && rm /tmp/patch_mxfp4_aiter_gate.py
 
 # --- gfx1151 patch 51: color-code scheduler status-line fields ---
 # Journal status-line fields get ANSI color (gen tps bright green, prefill
-# tps bright cyan, #pending-token yellow, #running-req bright magenta,
+# tps bright cyan, #pending-token bright yellow, #running-req bright magenta,
 # #queue-req red) on every log emitter (status lines, decode tail,
 # flush-cache refusal); API-response spellings stay plain. Whole
 # label+value segments are wrapped, keeping the inner text byte-identical

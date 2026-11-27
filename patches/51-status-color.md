@@ -19,7 +19,7 @@ Wrap five fields in ANSI color (module-level constants, read once at import;
 |---|---|
 | `gen throughput (token/s):` (decode) | bright green (92) |
 | `input throughput (token/s):` (prefill) | bright cyan (96) |
-| `#pending-token:` | yellow (33) |
+| `#pending-token:` (prefill + mixed) | bright yellow (93) |
 | `#running-req:` (prefill + decode + flush refusal) | bright magenta (95) |
 | `#queue-req:` (prefill + decode tail + flush refusal) | red (31) |
 

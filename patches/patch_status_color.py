@@ -9,7 +9,7 @@ eye can triage a live `journalctl --user -a -u qwen38-sglang.service -f`:
 
     gen throughput (token/s):  bright green   (92)  decode speed
     input throughput (token/s): bright cyan    (96)  prefill speed
-    #pending-token:            yellow         (33)  waiting work
+    #pending-token:            bright yellow  (93)  waiting work
     #running-req:              bright magenta (95)  in-flight
     #queue-req:                red            (31)  queued at the cap
 
@@ -67,7 +67,7 @@ if _os51.environ.get("SGLANG_QWEN4_STATUS_COLOR", "1") == "0":
 else:
     _CLR_GEN = "\\033[92m"  # bright green  - gen throughput
     _CLR_PRE = "\\033[96m"  # bright cyan   - input (prefill) throughput
-    _CLR_PEND = "\\033[33m"  # yellow       - #pending-token
+    _CLR_PEND = "\\033[93m"  # bright yellow - #pending-token
     _CLR_RUN = "\\033[95m"  # bright magenta - #running-req
     _CLR_QUEUE = "\\033[31m"  # red         - #queue-req
     _CLR_END = "\\033[0m"
@@ -88,7 +88,7 @@ EDITS = [
         '            f"#queue-req: {len(self.scheduler.waiting_queue)}, "',
         '            f"{_CLR_QUEUE}#queue-req: {len(self.scheduler.waiting_queue)}{_CLR_END}, "',
     ),
-    # Prefill line: #pending-token -> yellow
+    # Prefill line: #pending-token -> bright yellow
     (
         TARGET,
         '            f"#pending-token: {prefill_stats.num_pending_tokens}, "',
@@ -180,7 +180,7 @@ def main():
             f.write(text)
     print("patch 51 applied: status-line fields color-coded on every "
           "emitter (gen bright green 92, prefill bright cyan 96, pending "
-          "yellow 33, running bright magenta 95, queue red 31; "
+          "bright yellow 93, running bright magenta 95, queue red 31; "
           "SGLANG_QWEN4_STATUS_COLOR=0 off)")
 
 
