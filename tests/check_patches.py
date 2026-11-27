@@ -206,6 +206,14 @@ def check_pinned_tree(src: Path, steps: list[tuple[str, str]]) -> int:
             bad.append(f"{rel}: {e.msg.splitlines()[-1]}")
     check(f"{len(py_files)} patched .py files compile", not bad, "; ".join(bad))
 
+    profile = os.environ.get("SGLANG_BACKPORT_PROFILE", "production")
+    check("Dockerfile defaults to the production backport profile",
+          arg_default("SGLANG_BACKPORT_PROFILE") == "production")
+    for path in ("test/registered/unit/mem_cache/test_hicache_mamba_slot_side_states.py",
+                 "python/sglang/srt/mem_cache/pool_host/qsa.py"):
+        check(f"{profile} restore selection: {path}",
+              (src / path).is_file() == (profile == "hicache-trial"))
+
     print(f"\n{checks - len(failures)}/{checks} checks passed.")
     if failures:
         print("FAILED:\n  - " + "\n  - ".join(failures))

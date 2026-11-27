@@ -572,7 +572,14 @@ RUN python3 /tmp/patch_fsched_scheduler.py && rm /tmp/patch_fsched_scheduler.py 
 COPY patches/patch_mixed_batch_logging.py /tmp/patch_mixed_batch_logging.py
 RUN python3 /tmp/patch_mixed_batch_logging.py && rm /tmp/patch_mixed_batch_logging.py
 
-# --- patch 59: backport selected upstream fixes ---
+# --- patch 59: scheduler/parser/timing by default; restore pair in trial images only ---
+ARG SGLANG_BACKPORT_PROFILE=production
+LABEL org.strix-halo.sglang.backport-profile=${SGLANG_BACKPORT_PROFILE}
 COPY patches/backports59/ /tmp/backports59/
 COPY patches/patch_upstream_backports.py /tmp/patch_upstream_backports.py
 RUN python3 /tmp/patch_upstream_backports.py && rm /tmp/patch_upstream_backports.py /tmp/backports59/*.patch && rmdir /tmp/backports59
+
+# The HiCache file backend JITs its CPU hash extension on first use.
+RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN python3 -c 'from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash; import hashlib, struct; assert get_native_hash([11,22], None) == hashlib.sha256(struct.pack("<II",11,22)).hexdigest()'

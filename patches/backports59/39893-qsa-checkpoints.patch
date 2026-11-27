@@ -1,0 +1,494 @@
+diff --git a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
+index 1e91f0364447faf949c4897da0f6684781ca0141..87011b7eaf83d637127338dff1b16c002287dbc3 100644
+--- a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
++++ b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
+@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
+     get_mha_host_pool_cls,
+ )
+ from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
++from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
+ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+ from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
+ 
+@@ -1051,6 +1052,7 @@ def build_hybrid_mamba_stack(
+     load_cache_event,
+     storage_backend: Optional[str],
+     use_mla: bool,
++    qsa_pool: Any = None,
+     host_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
+     device_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
+     prefetch_threshold: int = 256,
+@@ -1064,6 +1066,7 @@ def build_hybrid_mamba_stack(
+     mamba_allocator = params.req_to_token_pool.mamba_allocator
+     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+ 
++    qsa_draft_pools = params.mtp_draft_device_pools if qsa_pool is not None else ()
+     mtp_draft_device_pools = tuple(
+         pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+         for pool in params.mtp_draft_device_pools
+@@ -1073,6 +1076,14 @@ def build_hybrid_mamba_stack(
+         kv_host_size, mamba_host_size = _split_hicache_size(
+             get_memory().hicache_size, (kv_pool, mamba_pool)
+         )
++    if qsa_pool is not None and kv_host_size is not None:
++        kv_bytes = sum(kv_pool.get_kv_size_bytes())
++        index_bytes = sum(
++            b.nbytes
++            for pool in (qsa_pool, *qsa_draft_pools)
++            for b in pool.qsa_compressed_k_buffer_pool
++        )
++        kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
+     kv_host_pool = build_kv_host_pool(
+         kv_pool=kv_pool,
+         page_size=params.page_size,
+@@ -1125,6 +1136,22 @@ def build_hybrid_mamba_stack(
+             device_free_fn=mamba_allocator.free,
+         ),
+     ]
++    if qsa_pool is not None:
++        entries.append(
++            build_pool_entry(
++                name=PoolName.INDEXER,
++                host_pool=QSAIndexerPoolHost(
++                    qsa_pool,
++                    kv_host_pool,
++                    allocator_type=_get_allocator_type(),
++                    mtp_draft_device_pools=qsa_draft_pools,
++                ),
++                device_pool=qsa_pool,
++                layer_mapping=full_layer_mapping,
++                transfer_layer_id_max=transfer_layer_id_max + len(qsa_draft_pools),
++                packed_draft_device_pools=qsa_draft_pools,
++            )
++        )
+     host_pool_group = HostPoolGroup(entries)
+     cache_controller = HybridCacheController(
+         params.token_to_kv_pool_allocator,
+@@ -1383,6 +1410,7 @@ def build_full_draft_pools(
+ ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
+     """Build draft KV/DSA sidecars whose indices follow target full KV."""
+     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
++    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+ 
+     pool = draft_kv_pool
+     if isinstance(pool, HybridLinearKVPool):
+@@ -1445,6 +1473,22 @@ def build_full_draft_pools(
+             )
+         )
+ 
++    if isinstance(draft_kv_pool, QSATokenToKVPool):
++        specs.append(SidecarPoolSpec(PoolName.DRAFT_INDEXER, PoolName.KV))
++        entries.append(
++            build_pool_entry(
++                name=PoolName.DRAFT_INDEXER,
++                host_pool=QSAIndexerPoolHost(
++                    draft_kv_pool,
++                    draft_host_pool,
++                    allocator_type=_get_allocator_type(),
++                ),
++                device_pool=draft_kv_pool,
++                layer_mapping=draft_layer_mapping,
++                transfer_layer_id_max=draft_host_pool.layer_num,
++            )
++        )
++
+     return specs, entries
+ 
+ 
+@@ -1724,6 +1768,9 @@ class _MambaStrategy(StackStrategy):
+         model_name=None,
+         enable_storage_metrics=False,
+     ):
++        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
++
++        qsa_pool = kvcache if isinstance(kvcache, QSATokenToKVPool) else None
+         full_layer_mapping = _stage_local_layer_mapping(
+             kvcache.full_attention_layer_id_mapping, kvcache.start_layer
+         )
+@@ -1739,6 +1786,7 @@ class _MambaStrategy(StackStrategy):
+             load_cache_event=load_cache_event,
+             storage_backend=storage_backend,
+             use_mla=kvcache.use_mla,
++            qsa_pool=qsa_pool,
+             host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
+             device_mamba_evict_fn=lambda n: _evict_mamba_for_device_alloc(cache, n),
+             prefetch_threshold=prefetch_threshold,
+@@ -1753,8 +1801,13 @@ class _MambaStrategy(StackStrategy):
+                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
+             },
++            sidecars=(
++                [SidecarPoolSpec(PoolName.INDEXER, PoolName.KV)]
++                if qsa_pool is not None
++                else []
++            ),
+             register_req_to_token_counter=True,
+-            pools_desc="KV + MAMBA",
++            pools_desc="KV + MAMBA + INDEXER" if qsa_pool is not None else "KV + MAMBA",
+         )
+ 
+ 
+diff --git a/python/sglang/srt/mem_cache/pool_host/qsa.py b/python/sglang/srt/mem_cache/pool_host/qsa.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e6ff217054827e646a8fbe3af7db910807e4a0f
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/pool_host/qsa.py
+@@ -0,0 +1,64 @@
++from __future__ import annotations
++
++import torch
++
++from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
++from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
++
++
++class QSAIndexerPoolHost(DeepSeekV4PagedHostPool):
++    """Page-row mirror of QSA compressed keys, indexed by full-KV token slots."""
++
++    def __init__(
++        self,
++        device_pool: QSATokenToKVPool,
++        anchor_host,
++        *,
++        allocator_type: str = "default",
++        mtp_draft_device_pools: tuple[QSATokenToKVPool, ...] = (),
++    ):
++        page_size = anchor_host.page_size
++        ratio = device_pool.qsa_compress_ratio
++        if page_size % ratio:
++            raise ValueError(
++                "QSA HiCache pages must be divisible by the compress ratio"
++            )
++        self.device_pool = device_pool
++        pools = (device_pool, *mtp_draft_device_pools)
++        buffers = [b for pool in pools for b in pool.qsa_compressed_k_buffer_pool]
++        if not buffers:
++            raise ValueError("QSA HiCache requires at least one local indexer layer")
++        item_bytes = buffers[0][0].nbytes * (page_size // ratio)
++        if any(
++            pool.qsa_compress_ratio != ratio
++            or any(
++                b[0].nbytes * (page_size // ratio) != item_bytes
++                for b in pool.qsa_compressed_k_buffer_pool
++            )
++            for pool in pools
++        ):
++            raise ValueError("Packed QSA indexer pools must share the same page shape")
++        # A full-KV page and its compressed groups share ownership. Packing the
++        # groups into a byte row lets the existing whole-page kernels move both
++        # coordinate spaces using the same full-KV page number.
++        super().__init__(
++            pool_name="qsa_indexer",
++            device_buffers=[
++                b.view(torch.uint8).reshape(-1, item_bytes) for b in buffers
++            ],
++            item_bytes=item_bytes,
++            num_host_pages=anchor_host.page_num,
++            slot_page_size=page_size,
++            layout=anchor_host.layout,
++            device=anchor_host.device,
++            pin_memory=anchor_host.pin_memory,
++            allocator_type=allocator_type,
++            page_aligned_only=True,
++        )
++        self.size_per_token = self.get_size_per_token()
++
++    def get_size_per_token(self):
++        return self.layer_num * self.item_bytes // self.slot_page_size
++
++    def get_ksize_per_token(self):
++        return self.get_size_per_token()
+diff --git a/python/sglang/srt/mem_cache/qsa_kv_pool.py b/python/sglang/srt/mem_cache/qsa_kv_pool.py
+index b3e4f6010d29d33f5e7ceb7f888f7df22571c8e2..cf90a4d57e4c221a806ce31fcc866f3582c19536 100644
+--- a/python/sglang/srt/mem_cache/qsa_kv_pool.py
++++ b/python/sglang/srt/mem_cache/qsa_kv_pool.py
+@@ -213,6 +213,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
+         return self.qsa_rope_position_buffer[loc.long()]
+ 
+     def get_qsa_compressed_k_buffer(self, layer_id: int) -> torch.Tensor:
++        # The indexer reads compressed keys before attention reads the full KV.
++        self._wait_for_layer(layer_id)
+         return self.qsa_compressed_k_buffer_pool[
+             self._transfer_full_attention_id(layer_id)
+         ]
+diff --git a/test/registered/kernels/ops/attention/qsa/test_qsa_hicache.py b/test/registered/kernels/ops/attention/qsa/test_qsa_hicache.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4dd83a5fcbf653f8daa8e36996474aeebb5c211b
+--- /dev/null
++++ b/test/registered/kernels/ops/attention/qsa/test_qsa_hicache.py
+@@ -0,0 +1,239 @@
++"""Exercise real QSA host transfers and File L3 with reordered physical pages."""
++
++import tempfile
++
++import pytest
++import torch
++
++from sglang.srt.managers.cache_controller import LayerDoneCounter
++from sglang.srt.mem_cache.hicache_storage import (
++    HiCacheFile,
++    HiCacheStorageConfig,
++    PoolName,
++    PoolTransfer,
++)
++from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
++from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
++from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
++from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
++from sglang.srt.runtime_context import publish, reset_context
++from sglang.srt.server_args import ServerArgs
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
++
++PAGE = 64
++RATIO = 4
++
++
++def make_device_pool(layers, start_layer=0):
++    return QSATokenToKVPool(
++        size=PAGE * 8,
++        dtype=torch.bfloat16,
++        page_size=PAGE,
++        head_num=1,
++        head_dim=128,
++        full_attention_layer_ids=layers,
++        start_layer=start_layer,
++        device="cuda",
++        mamba_pool=None,
++        qsa_index_kv_heads=1,
++        qsa_index_head_dim=128,
++        qsa_compress_ratio=RATIO,
++        qsa_token_topk=128,
++        num_request_slots=4,
++    )
++
++
++@pytest.fixture
++def pools(request):
++    layout, backend = request.param
++    publish(ServerArgs(model_path="dummy"), role="test")
++    device = make_device_pool([7, 11], start_layer=4)
++    anchor = MHATokenToKVPoolHost(device.full_kv_pool, 2, 0, PAGE, layout)
++    host = QSAIndexerPoolHost(device, anchor)
++    try:
++        yield device, anchor, host, backend
++    finally:
++        torch.cuda.synchronize()
++        host.destroy()
++        anchor.destroy()
++        reset_context()
++
++
++def slots(pages, device="cpu"):
++    return (
++        torch.tensor(pages, device=device)[:, None] * PAGE
++        + torch.arange(PAGE, device=device)
++    ).reshape(-1)
++
++
++def compressed_slots(indices):
++    return indices[::RATIO] // RATIO
++
++
++@pytest.mark.parametrize(
++    "pools",
++    [
++        ("layer_first", "kernel"),
++        ("page_first", "kernel"),
++        ("layer_first", "direct"),
++        ("page_first_direct", "direct"),
++    ],
++    indirect=True,
++)
++def test_qsa_host_roundtrip_and_consumer_fence(pools):
++    device, anchor, host, backend = pools
++    source = slots([3, 1], "cuda")
++    destination = slots([4, 2], "cuda")
++    host_indices = slots([2, 0])
++    if backend == "kernel" and not host.can_use_write_back_jit:
++        host_indices = host_indices.cuda()
++    torch.manual_seed(42)
++    device.qsa_compressed_flat.normal_()
++    expected = [
++        b[compressed_slots(source)].clone() for b in device.qsa_compressed_k_buffer_pool
++    ]
++    engine = L2TransferEngine(backend)
++    transfer = L2Transfer(
++        host,
++        device,
++        host_indices,
++        source.cpu() if backend == "direct" else source,
++        {3: 0, 7: 1}.get,
++    )
++    engine.submit_device_to_host([transfer]).finish_event.synchronize()
++    device.qsa_compressed_flat.fill_(-99)
++    counter = LayerDoneCounter(8)
++    producer = counter.update_producer()
++    counter.set_consumer(producer)
++    device.register_layer_transfer_counter(counter)
++    with torch.cuda.stream(engine.host_to_device_stream):
++        torch.cuda._sleep(20_000_000)
++    engine.submit_host_to_device(
++        [
++            transfer._replace(
++                host_indices=(
++                    host_indices.cuda() if backend == "kernel" else host_indices
++                ),
++                device_indices=(
++                    destination.cpu() if backend == "direct" else destination
++                ),
++            )
++        ],
++        transfer_layer_id_max=8,
++        on_layer_done=counter.events[producer].complete,
++    )
++    # Read through the production accessor without a global synchronize. The
++    # indexer must wait for the stage-local layer event before reading its keys.
++    actual = [
++        device.get_qsa_compressed_k_buffer(layer)[compressed_slots(destination)]
++        for layer in (7, 11)
++    ]
++    for restored, saved in zip(actual, expected):
++        torch.testing.assert_close(restored, saved, rtol=0, atol=0)
++    assert host.size == anchor.size
++    assert host.size_per_token * PAGE == sum(x[0].nbytes for x in host.device_buffers)
++
++
++@pytest.mark.parametrize("pools", [("page_first_direct", "direct")], indirect=True)
++def test_qsa_file_restart_and_missing_sidecar(pools):
++    device, anchor, host, backend = pools
++    source, host_indices = slots([1, 3], "cuda"), slots([0, 2])
++    device.qsa_compressed_flat.normal_()
++    expected = [
++        b[compressed_slots(source)].clone() for b in device.qsa_compressed_k_buffer_pool
++    ]
++    engine = L2TransferEngine(backend)
++    engine.submit_device_to_host(
++        [L2Transfer(host, device, host_indices, source.cpu())]
++    ).finish_event.synchronize()
++    config = HiCacheStorageConfig(
++        tp_rank=0,
++        tp_size=1,
++        pp_rank=0,
++        pp_size=1,
++        attn_cp_rank=0,
++        attn_cp_size=1,
++        is_mla_model=False,
++        enable_storage_metrics=False,
++        is_page_first_layout=True,
++        model_name="qsa-roundtrip",
++    )
++    keys = ["first", "second"]
++    transfer = PoolTransfer(PoolName.INDEXER, host_indices=host_indices, keys=keys)
++    with tempfile.TemporaryDirectory() as directory:
++        writer = HiCacheFile(config, file_path=directory)
++        writer.register_mem_host_pool_v2(host, PoolName.INDEXER)
++        for key in keys:
++            assert writer.set(key, anchor.get_data_page(0))
++        # Existing KV without compressed keys must never count as a usable hit.
++        assert writer.batch_exists_v2(keys, [transfer]).kv_hit_pages == 0
++        assert all(writer.batch_set_v2([transfer])[PoolName.INDEXER])
++        reader = HiCacheFile(config, file_path=directory)
++        reader.register_mem_host_pool_v2(host, PoolName.INDEXER)
++        assert reader.batch_exists_v2(keys, [transfer]).kv_hit_pages == len(keys)
++        host.kv_buffer.zero_()
++        device.qsa_compressed_flat.fill_(-99)
++        transfer.host_indices = slots([1, 3])
++        assert all(reader.batch_get_v2([transfer])[PoolName.INDEXER])
++        destination = slots([4, 2], "cuda")
++        engine.submit_host_to_device(
++            [L2Transfer(host, device, transfer.host_indices, destination.cpu())],
++            transfer_layer_id_max=2,
++        ).finish_event.synchronize()
++        for restored, saved in zip(device.qsa_compressed_k_buffer_pool, expected):
++            torch.testing.assert_close(
++                restored[compressed_slots(destination)], saved, rtol=0, atol=0
++            )
++        pointers, sizes = host.get_page_buffer_meta(transfer.host_indices)
++        assert len(pointers) == len(keys)
++        assert sizes == [host.get_data_page(0).nbytes] * len(keys)
++
++
++@pytest.mark.parametrize("pools", [("page_first_direct", "direct")], indirect=True)
++def test_packed_mtp_indexer_roundtrip(pools):
++    device, anchor, _, backend = pools
++    draft = make_device_pool([0])
++    host = QSAIndexerPoolHost(device, anchor, mtp_draft_device_pools=(draft,))
++    try:
++        source, destination, host_indices = slots([3, 1]), slots([4, 2]), slots([0, 2])
++        all_buffers = [
++            *device.qsa_compressed_k_buffer_pool,
++            *draft.qsa_compressed_k_buffer_pool,
++        ]
++        for buffer in all_buffers:
++            buffer.normal_()
++        expected = [b[compressed_slots(source).cuda()].clone() for b in all_buffers]
++        engine = L2TransferEngine(backend)
++        engine.submit_device_to_host(
++            [L2Transfer(host, device, host_indices, source)]
++        ).finish_event.synchronize()
++        # Whole-page storage payload must include the draft as well as target.
++        pages = [host.get_data_page(i).clone() for i in (0, 2 * PAGE)]
++        host.kv_buffer.zero_()
++        for i, page in zip((0, 2 * PAGE), pages):
++            host.set_from_flat_data_page(i, page)
++        for buffer in all_buffers:
++            buffer.fill_(-99)
++        engine.submit_host_to_device(
++            [
++                L2Transfer(host, device, host_indices, destination, {3: 0, 7: 1}.get),
++                L2Transfer(
++                    host, draft, host_indices, destination, {0: 2}.get, is_draft=True
++                ),
++            ],
++            transfer_layer_id_max=8,
++        ).finish_event.synchronize()
++        for buffer, saved in zip(all_buffers, expected):
++            torch.testing.assert_close(
++                buffer[compressed_slots(destination).cuda()], saved, rtol=0, atol=0
++            )
++    finally:
++        host.destroy()
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/test/registered/kernels/ops/qsa/test_qsa_indexer.py b/test/registered/kernels/ops/qsa/test_qsa_indexer.py
+index 9664b83f9c5abca3f258e4a92b299d5355d5d568..b171c4f76cd5c6b52cdfb52fcb6cf03b2ce7ea27 100644
+--- a/test/registered/kernels/ops/qsa/test_qsa_indexer.py
++++ b/test/registered/kernels/ops/qsa/test_qsa_indexer.py
+@@ -17,14 +17,9 @@ from sglang.srt.layers.attention.qsa.kernel import (
+ )
+ from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+ from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
+-
+-# MRotaryEmbedding reads the exec config bag at init; publish a minimal
+-# process context for the bare pytest process.
+-from sglang.srt.runtime_context import publish
++from sglang.srt.runtime_context import publish, reset_context
+ from sglang.srt.server_args import ServerArgs
+ 
+-publish(ServerArgs(model_path="dummy"), role="test")
+-
+ HEAD_DIM = 128
+ NUM_Q_HEADS = 4
+ RATIO = 4
+@@ -32,6 +27,15 @@ HIDDEN = 2560
+ EPS = 1e-6
+ 
+ 
++@pytest.fixture(autouse=True)
++def runtime_context():
++    publish(ServerArgs(model_path="dummy"), role="test")
++    try:
++        yield
++    finally:
++        reset_context()
++
++
+ def _make_config():
+     return SimpleNamespace(
+         indexer_n_heads=NUM_Q_HEADS,
