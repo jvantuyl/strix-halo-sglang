@@ -579,6 +579,10 @@ COPY patches/backports59/ /tmp/backports59/
 COPY patches/patch_upstream_backports.py /tmp/patch_upstream_backports.py
 RUN python3 /tmp/patch_upstream_backports.py && rm /tmp/patch_upstream_backports.py /tmp/backports59/*.patch && rmdir /tmp/backports59
 
+# --- patch 60: advertise the registered GigaChat 3.5 parsers in the CLI ---
+COPY patches/patch_gigachat35_parser_names.py /tmp/patch_gigachat35_parser_names.py
+RUN python3 /tmp/patch_gigachat35_parser_names.py && rm /tmp/patch_gigachat35_parser_names.py
+
 # The HiCache file backend JITs its CPU hash extension on first use.
 RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev \
     && rm -rf /var/lib/apt/lists/*
